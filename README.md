@@ -61,7 +61,47 @@ https://<你的电脑IP>:48322
 
 如果浏览器提示证书不安全，先接受证书。然后进入 immersive VR session。只有头显真正进入 VR session 后，OpenXR 才能拿到可用的 XR system。
 
-### 3. 启动 VR 输出栈
+### 3. 准备 camera_streamer lite 镜像
+
+VR 输出默认使用本仓库从 `zhangbt@192.168.8.109:~/Teleop` 迁移来的 lite camera_streamer 镜像：
+
+```text
+harness-camera-streamer-lite:latest
+```
+
+这个镜像已经包含对端当前使用的 `xr_plane_renderer` 3D hand skeleton overlay。先检查本机是否已经有镜像：
+
+```bash
+docker images | grep harness-camera-streamer-lite
+```
+
+如果没有，不要走上游 `camera_streamer.sh build`。优先从对端工作站导入现成镜像：
+
+```bash
+sshpass -p 'zhangbt' ssh zhangbt@192.168.8.109 \
+  'docker save teleop-stack-camera-realsense:frame-tap-hand-log-v1' \
+  | docker load
+
+docker tag \
+  teleop-stack-camera-realsense:frame-tap-hand-log-v1 \
+  harness-camera-streamer-lite:latest
+```
+
+导入成功后应该能看到：
+
+```bash
+docker images | grep -E 'harness-camera-streamer-lite|teleop-stack-camera-realsense'
+```
+
+如果你确实要本机重新构建 lite 镜像，也可以运行：
+
+```bash
+scripts/build_camera_streamer_lite.sh
+```
+
+但这会依赖 `nvcr.io/nvidia/clara-holoscan/holoscan:v3.11.0-cuda12-dgpu`，网络不稳定时容易失败。能从对端导入时，优先导入。
+
+### 4. 启动 VR 输出栈
 
 打开第二个终端。先检查依赖和路径：
 
@@ -79,13 +119,7 @@ scripts/run_add_scene_vr_output.sh --display :0 --check-only
 scripts/run_add_scene_vr_output.sh --display :0
 ```
 
-第一次启动时，如果本机还没有 `harness-camera-streamer-lite:latest`，脚本会自动构建一个从 `zhangbt@192.168.8.109:~/Teleop` 迁移来的 V4L2-only camera_streamer lite image。这条路线会生成临时 Dockerfile，跳过上游 `docker/dockerfile:1` BuildKit frontend 和 ZED SDK 安装，并把 3D hand skeleton overlay 编进 `xr_plane_renderer`。
-
-也可以提前手动构建：
-
-```bash
-scripts/build_camera_streamer_lite.sh
-```
+如果本机没有 `harness-camera-streamer-lite:latest`，脚本会尝试自动构建 lite image。由于自动构建仍需要拉取 NVIDIA Holoscan 基础镜像，网络不稳时建议先按上一节从对端导入现成镜像。
 
 默认行为：
 
@@ -113,7 +147,7 @@ scripts/run_add_scene_vr_output.sh \
   --plane-width 1.2
 ```
 
-### 4. 启动 Genesis 场景并接入 VR 输入
+### 5. 启动 Genesis 场景并接入 VR 输入
 
 打开第三个终端：
 
@@ -149,6 +183,25 @@ python add_scene_glb.py --backend gpu --enable-vr-teleop --vr-markers-only --vr-
 ```
 
 ## 常见报错
+
+`docker daemon is not accessible by the current user`：当前终端还没有 Docker socket 权限。先确认：
+
+```bash
+groups
+docker ps
+```
+
+如果 `groups` 里没有 `docker`，运行：
+
+```bash
+sudo usermod -aG docker $USER
+newgrp docker
+conda activate genesis
+```
+
+如果已经在 `/etc/group` 里但当前终端没刷新，直接 `newgrp docker` 或重新打开终端即可。
+
+`nvcr.io/nvidia/clara-holoscan/... connection reset by peer`：这是本机重新构建 lite image 时拉 NVIDIA Holoscan 基础镜像失败。优先按“准备 camera_streamer lite 镜像”一节，从 `zhangbt@192.168.8.109` 导入已经构建好的镜像。
 
 `Environment variable NV_CXR_RUNTIME_DIR is not set`：CloudXR 环境变量没有加载。通常重新运行 CloudXR runtime 即可；也可以手动执行：
 
