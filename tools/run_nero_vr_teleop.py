@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import socket
 import sys
 from pathlib import Path
 
@@ -38,6 +40,43 @@ def _arm_pose_command_mode(*, pose_input_mode: str, use_teleop_orientation: bool
     return "raw_wrist_position_full_orientation" if use_teleop_orientation else "raw_wrist_position_fixed_orientation"
 
 
+def _load_export_env_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return True
+
+
+def _check_cloudxr_runtime() -> tuple[bool, str]:
+    runtime_dir = os.environ.get("NV_CXR_RUNTIME_DIR")
+    if not runtime_dir:
+        return False, "NV_CXR_RUNTIME_DIR is not set. Run: source ~/.cloudxr/run/cloudxr.env"
+    socket_path = Path(runtime_dir) / "ipc_cloudxr"
+    if not socket_path.exists():
+        return False, f"CloudXR IPC socket does not exist: {socket_path}"
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(1.0)
+        client.connect(str(socket_path))
+    except OSError as exc:
+        return False, f"CloudXR IPC socket is not accepting connections: {socket_path} ({exc})"
+    finally:
+        client.close()
+    return True, f"CloudXR IPC socket is ready: {socket_path}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Quest/OpenXR VR teleop into the local Genesis Nero runtime.")
     parser.add_argument("--duration", type=float, default=0.0, help="Seconds to run. 0 means run until interrupted.")
@@ -49,8 +88,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loop-hz", type=float, default=60.0)
     parser.add_argument("--print-every", type=int, default=30)
     parser.add_argument("--isaac-teleop-root", default=None, help="Override IsaacTeleop root. Also supports ISAAC_TELEOP_ROOT.")
-    parser.add_argument("--startup-timeout-s", type=float, default=30.0)
+    parser.add_argument("--startup-timeout-s", type=float, default=300.0)
     parser.add_argument("--teleop-trace-path", default=None, help="Optional JSONL trace path.")
+    parser.add_argument(
+        "--cloudxr-env-path",
+        type=Path,
+        default=Path.home() / ".cloudxr" / "run" / "cloudxr.env",
+        help="CloudXR env file to auto-load before starting OpenXR.",
+    )
+    parser.add_argument("--no-auto-cloudxr-env", action="store_true", help="Do not auto-load ~/.cloudxr/run/cloudxr.env.")
+    parser.add_argument("--no-cloudxr-preflight", action="store_true", help="Skip the CloudXR IPC socket check before building Genesis.")
     parser.add_argument("--translation-scale-xyz", default="0.15,0.15,0.15")
     parser.add_argument("--workspace-origin-xyz", default="0,0,0")
     parser.add_argument("--input-axis-map", type=_parse_axis_map, default="z,x,y")
@@ -64,6 +111,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if not args.no_auto_cloudxr_env:
+        loaded = _load_export_env_file(args.cloudxr_env_path.expanduser())
+        if loaded and "NV_CXR_RUNTIME_DIR" in os.environ:
+            print(f"[nero-vr] loaded CloudXR env: {args.cloudxr_env_path.expanduser()}")
+    if not args.no_cloudxr_preflight:
+        ok, message = _check_cloudxr_runtime()
+        if not ok:
+            raise SystemExit(
+                "[nero-vr] CloudXR runtime is not ready.\n"
+                f"  {message}\n"
+                "  Start it in another terminal and keep that terminal open:\n"
+                "    conda activate genesis\n"
+                "    python -m isaacteleop.cloudxr --accept-eula\n"
+                "  Then rerun this command."
+            )
+        print(f"[nero-vr] {message}")
     mapping = NeroTeleopMappingConfig(
         translation_scale_xyz=_parse_vec3(args.translation_scale_xyz, name="--translation-scale-xyz"),
         workspace_origin_xyz=_parse_vec3(args.workspace_origin_xyz, name="--workspace-origin-xyz"),

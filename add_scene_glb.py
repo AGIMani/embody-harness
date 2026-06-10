@@ -5,8 +5,10 @@ import json
 import math
 import multiprocessing
 import os
+import socket
 import time
 from pathlib import Path
+from types import SimpleNamespace
 import xml.etree.ElementTree as ET
 
 import genesis as gs
@@ -826,6 +828,226 @@ def _apply_assembly_debug_pose(
     _mount_assembly_attached_parts(assembly)
 
 
+def _load_export_env_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+    return True
+
+
+def _check_cloudxr_runtime() -> tuple[bool, str]:
+    runtime_dir = os.environ.get("NV_CXR_RUNTIME_DIR")
+    if not runtime_dir:
+        return False, "NV_CXR_RUNTIME_DIR is not set. Run: source ~/.cloudxr/run/cloudxr.env"
+    socket_path = Path(runtime_dir) / "ipc_cloudxr"
+    if not socket_path.exists():
+        return False, f"CloudXR IPC socket does not exist: {socket_path}"
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        client.settimeout(1.0)
+        client.connect(str(socket_path))
+    except OSError as exc:
+        return False, f"CloudXR IPC socket is not accepting connections: {socket_path} ({exc})"
+    finally:
+        client.close()
+    return True, f"CloudXR IPC socket is ready: {socket_path}"
+
+
+def _axis_value(values_xyz: tuple[float, float, float], token: str) -> float:
+    token = token.strip().lower()
+    sign = -1.0 if token.startswith("-") else 1.0
+    axis = token[-1]
+    return sign * float(values_xyz[{"x": 0, "y": 1, "z": 2}[axis]])
+
+
+def _map_vec3_axes(values_xyz: tuple[float, float, float], axis_map: tuple[str, str, str]) -> tuple[float, float, float]:
+    return tuple(_axis_value(values_xyz, token) for token in axis_map)  # type: ignore[return-value]
+
+
+def _xyzw_to_wxyz(quat_xyzw: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    x, y, z, w = quat_xyzw
+    return (float(w), float(x), float(y), float(z))
+
+
+def _parse_axis_map(text: str) -> tuple[str, str, str]:
+    values = tuple(part.strip().lower() for part in text.split(",") if part.strip())
+    if len(values) != 3:
+        raise argparse.ArgumentTypeError("axis map must contain 3 comma-separated tokens")
+    valid = {"x", "y", "z", "+x", "+y", "+z", "-x", "-y", "-z"}
+    invalid = [value for value in values if value not in valid]
+    if invalid:
+        raise argparse.ArgumentTypeError(f"invalid axis map token(s): {', '.join(invalid)}")
+    return values  # type: ignore[return-value]
+
+
+def _vr_arm_pose_command_mode(*, pose_input_mode: str, use_teleop_orientation: bool) -> str:
+    if pose_input_mode != "hand_abs":
+        return "legacy_retargeted_ee"
+    return "raw_wrist_position_full_orientation" if use_teleop_orientation else "raw_wrist_position_fixed_orientation"
+
+
+class _AddSceneNeroTeleopRobot:
+    def __init__(
+        self,
+        scene: gs.Scene,
+        *,
+        arm_side: str,
+        translation_scale_xyz: tuple[float, float, float],
+        workspace_origin_xyz: tuple[float, float, float],
+        input_axis_map: tuple[str, str, str],
+        use_teleop_orientation: bool,
+        relative_control: bool,
+        drive_ik: bool,
+        print_every_n: int,
+        max_solver_iters: int = 32,
+        ik_damping: float = 0.02,
+        pos_tol: float = 1e-3,
+        max_joint_step: float = 0.045,
+        min_joint_step: float = 0.001,
+    ) -> None:
+        self.scene = scene
+        self.arm_side = "left" if arm_side == "left" else "right"
+        self.translation_scale_xyz = tuple(float(v) for v in translation_scale_xyz)
+        self.workspace_origin_xyz = tuple(float(v) for v in workspace_origin_xyz)
+        self.input_axis_map = input_axis_map
+        self.use_teleop_orientation = bool(use_teleop_orientation)
+        self.relative_control = bool(relative_control)
+        self.drive_ik = bool(drive_ik)
+        self.print_every_n = max(1, int(print_every_n))
+        self.solver_args = SimpleNamespace(
+            max_solver_iters=int(max_solver_iters),
+            ik_damping=float(ik_damping),
+            pos_tol=float(pos_tol),
+            max_joint_step=float(max_joint_step),
+        )
+        self.min_joint_step = max(float(min_joint_step), 0.0)
+        self.connected = False
+        self.command_count = 0
+        self.arm = None
+        self.eef_link = None
+        self.arm_dofs: list[int] = []
+        self.q_state: np.ndarray | None = None
+        self.human_anchor_xyz: tuple[float, float, float] | None = None
+        self.target_anchor_xyz: tuple[float, float, float] | None = None
+
+    def connect(self) -> None:
+        assembly = getattr(self.scene, "nero_assembly_info", None)
+        if not isinstance(assembly, dict):
+            raise RuntimeError("add_scene_glb scene does not contain a Nero assembly. Remove --no-arm-assembly.")
+        self.arm = assembly[self.arm_side]
+        self.eef_link = self.arm.get_link(str(assembly.get("eef_link", DEFAULT_EEF_LINK)))
+        self.arm_dofs = _arm_dofs(self.arm)
+        self.q_state = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
+        self.connected = True
+        print(
+            f"[add-scene-vr] connected side={self.arm_side} "
+            f"drive_ik={'on' if self.drive_ik else 'off'} relative={'on' if self.relative_control else 'off'}",
+            flush=True,
+        )
+
+    def _ensure_connected(self) -> None:
+        if not self.connected or self.arm is None or self.eef_link is None or self.q_state is None:
+            raise RuntimeError("VR teleop robot is not connected")
+
+    def _map_delta(self, delta_xyz: tuple[float, float, float]) -> tuple[float, float, float]:
+        mapped = _map_vec3_axes(delta_xyz, self.input_axis_map)
+        return tuple(float(self.translation_scale_xyz[i]) * float(mapped[i]) for i in range(3))  # type: ignore[return-value]
+
+    def _target_position(self, pose) -> tuple[float, float, float]:
+        if not self.relative_control:
+            mapped = _map_vec3_axes(tuple(float(v) for v in pose.position_xyz), self.input_axis_map)
+            return tuple(
+                float(self.workspace_origin_xyz[i]) + float(self.translation_scale_xyz[i]) * float(mapped[i])
+                for i in range(3)
+            )  # type: ignore[return-value]
+        if self.human_anchor_xyz is None or self.target_anchor_xyz is None:
+            current_target = _tensor_to_np(self.eef_link.get_pos()).reshape(3).astype(np.float64)
+            self.human_anchor_xyz = tuple(float(v) for v in pose.position_xyz)
+            self.target_anchor_xyz = tuple(float(v) for v in current_target)
+            print(
+                f"[add-scene-vr] anchor side={self.arm_side} "
+                f"human={tuple(round(v, 4) for v in self.human_anchor_xyz)} "
+                f"target={tuple(round(v, 4) for v in self.target_anchor_xyz)}",
+                flush=True,
+            )
+        delta = tuple(float(pose.position_xyz[i]) - float(self.human_anchor_xyz[i]) for i in range(3))
+        mapped_delta = self._map_delta(delta)  # type: ignore[arg-type]
+        return tuple(float(self.target_anchor_xyz[i]) + float(mapped_delta[i]) for i in range(3))  # type: ignore[return-value]
+
+    def update_hand_debug(self, hand_debug: dict[str, object] | None, *, timestamp_s: float) -> None:
+        # The current add_scene_glb scene keeps the physical L10 hand mounted via the scene step hook.
+        return
+
+    def send_command(self, command) -> None:
+        self._ensure_connected()
+        target_pos = np.asarray(self._target_position(command.ee_target), dtype=np.float32)
+        if self.use_teleop_orientation:
+            target_quat = np.asarray(_xyzw_to_wxyz(command.ee_target.quaternion_xyzw), dtype=np.float32)
+        else:
+            target_quat = _tensor_to_np(self.eef_link.get_quat()).reshape(4).astype(np.float32)
+
+        if self.drive_ik:
+            qpos_init = _tensor_to_np(self.arm.get_qpos()).reshape(-1).astype(np.float32)
+            qpos, error = self.arm.inverse_kinematics(
+                link=self.eef_link,
+                pos=target_pos,
+                quat=target_quat,
+                init_qpos=qpos_init,
+                dofs_idx_local=self.arm_dofs,
+                max_samples=1,
+                max_solver_iters=int(self.solver_args.max_solver_iters),
+                damping=float(self.solver_args.ik_damping),
+                pos_tol=float(self.solver_args.pos_tol),
+                max_step_size=float(self.solver_args.max_joint_step),
+                return_error=True,
+            )
+            solved = _tensor_to_np(qpos).reshape(-1)[self.arm_dofs].astype(np.float32)
+            dq = np.clip(
+                solved - self.q_state,
+                -float(self.solver_args.max_joint_step),
+                float(self.solver_args.max_joint_step),
+            )
+            if self.min_joint_step > 0.0:
+                dq = np.where(np.abs(dq) < self.min_joint_step, 0.0, dq)
+            self.q_state = self.q_state + dq
+            self.arm.set_dofs_position(self.q_state, self.arm_dofs, zero_velocity=True)
+            self.arm.control_dofs_position(self.q_state, self.arm_dofs)
+            error_vec = _tensor_to_np(error).reshape(-1)
+        else:
+            error_vec = np.zeros(3, dtype=np.float32)
+
+        _step_scene_with_attached_parts(self.scene)
+        self.command_count += 1
+        if self.command_count == 1 or self.command_count % self.print_every_n == 0:
+            eef_pos = _tensor_to_np(self.eef_link.get_pos()).reshape(3)
+            print(
+                f"[add-scene-vr] frame={command.frame_id} side={self.arm_side} "
+                f"target={tuple(round(float(v), 4) for v in target_pos)} "
+                f"eef={tuple(round(float(v), 4) for v in eef_pos)} "
+                f"ik_error={tuple(round(float(v), 5) for v in error_vec)} "
+                f"gripper={command.gripper.normalized_position:.3f}",
+                flush=True,
+            )
+
+    def stop(self) -> None:
+        return
+
+    def disconnect(self) -> None:
+        self.connected = False
+
+
 def _random_bottle_pose(
     rng: np.random.Generator,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
@@ -1543,6 +1765,30 @@ def main() -> None:
     parser.add_argument("--arm-collision", action="store_true")
     parser.add_argument("--no-revo2-flange", action="store_true")
     parser.add_argument("--show-hole-markers", action="store_true")
+    parser.add_argument("--enable-vr-teleop", action="store_true", help="Drive this add_scene_glb Nero assembly from Quest/OpenXR.")
+    parser.add_argument("--vr-arm-side", choices=("left", "right"), default="right")
+    parser.add_argument("--vr-pose-input-mode", choices=("controller_abs", "hand_abs"), default="hand_abs")
+    parser.add_argument("--vr-markers-only", action="store_true", help="Receive VR targets but do not solve IK or move the arm.")
+    parser.add_argument("--vr-loop-hz", type=float, default=60.0)
+    parser.add_argument("--vr-print-every", type=int, default=30)
+    parser.add_argument("--vr-isaac-teleop-root", default=None)
+    parser.add_argument("--vr-startup-timeout-s", type=float, default=300.0)
+    parser.add_argument("--vr-teleop-trace-path", default=None)
+    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(0.15, 0.15, 0.15))
+    parser.add_argument("--vr-workspace-origin-xyz", type=_vec3, default=(0.0, 0.0, 0.0))
+    parser.add_argument("--vr-input-axis-map", type=_parse_axis_map, default="z,x,y")
+    parser.add_argument("--vr-use-teleop-orientation", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--vr-palm-plane-wrist-orientation-blend-alpha", type=float, default=1.0)
+    parser.add_argument("--vr-disable-synthetic-hands-plugin", action="store_true")
+    parser.add_argument(
+        "--vr-cloudxr-env-path",
+        type=Path,
+        default=Path.home() / ".cloudxr" / "run" / "cloudxr.env",
+        help="CloudXR env file to auto-load before starting OpenXR.",
+    )
+    parser.add_argument("--vr-no-auto-cloudxr-env", action="store_true")
+    parser.add_argument("--vr-no-cloudxr-preflight", action="store_true")
+    parser.add_argument("--vr-absolute-control", action="store_true", help="Map raw Quest position directly instead of using a relative anchor.")
     parser.add_argument("--headless", action="store_true", help="Build the scene without opening the viewer.")
     parser.add_argument("--steps", type=int, default=0, help="Simulation steps to run in headless mode.")
     args = parser.parse_args()
@@ -1550,6 +1796,27 @@ def main() -> None:
         print("[scene] --no-collision ignored: scene.glb is visual-only; table collision uses --no-table-collider.", flush=True)
     if args.dynamic:
         print("[scene] --dynamic ignored: scene.glb stays fixed as the support surface.", flush=True)
+    if args.enable_vr_teleop:
+        if args.no_arm_assembly:
+            raise SystemExit("--enable-vr-teleop requires the Nero arm assembly. Remove --no-arm-assembly.")
+        if args.headless:
+            raise SystemExit("--enable-vr-teleop currently requires the Genesis viewer. Remove --headless.")
+        if not args.vr_no_auto_cloudxr_env:
+            loaded = _load_export_env_file(args.vr_cloudxr_env_path.expanduser())
+            if loaded and "NV_CXR_RUNTIME_DIR" in os.environ:
+                print(f"[add-scene-vr] loaded CloudXR env: {args.vr_cloudxr_env_path.expanduser()}", flush=True)
+        if not args.vr_no_cloudxr_preflight:
+            ok, message = _check_cloudxr_runtime()
+            if not ok:
+                raise SystemExit(
+                    "[add-scene-vr] CloudXR runtime is not ready.\n"
+                    f"  {message}\n"
+                    "  Start it in another terminal and keep that terminal open:\n"
+                    "    conda activate genesis\n"
+                    "    python -m isaacteleop.cloudxr --accept-eula\n"
+                    "  Then rerun add_scene_glb.py with --enable-vr-teleop."
+                )
+            print(f"[add-scene-vr] {message}", flush=True)
 
     scene, _ = create_scene(
         args.glb,
@@ -1601,7 +1868,7 @@ def main() -> None:
         return
 
     base_pose_panel = _create_base_pose_panel(
-        not args.no_arm_assembly and not args.no_base_pose_panel,
+        not args.enable_vr_teleop and not args.no_arm_assembly and not args.no_base_pose_panel,
         FIXED_ASSEMBLY_TRANSLATION,
         FIXED_ASSEMBLY_EULER,
     )
@@ -1611,11 +1878,56 @@ def main() -> None:
     last_reset_counter = 0
     ego_view_enabled = bool(args.d455_rgb_gui and not args.no_d455)
     d405_view_enabled = bool(args.d405_camera_gui and not args.no_d405)
+    vr_session = None
     try:
+        if args.enable_vr_teleop:
+            from teleop_stack.session import QuestRobotSession, QuestRobotSessionConfig
+
+            vr_robot = _AddSceneNeroTeleopRobot(
+                scene,
+                arm_side=args.vr_arm_side,
+                translation_scale_xyz=args.vr_translation_scale_xyz,
+                workspace_origin_xyz=args.vr_workspace_origin_xyz,
+                input_axis_map=args.vr_input_axis_map,
+                use_teleop_orientation=bool(args.vr_use_teleop_orientation),
+                relative_control=not args.vr_absolute_control,
+                drive_ik=not args.vr_markers_only,
+                print_every_n=args.vr_print_every,
+            )
+            vr_session = QuestRobotSession(
+                QuestRobotSessionConfig(
+                    arm_side=args.vr_arm_side,
+                    pose_input_mode=args.vr_pose_input_mode,
+                    arm_pose_command_mode=_vr_arm_pose_command_mode(
+                        pose_input_mode=args.vr_pose_input_mode,
+                        use_teleop_orientation=bool(args.vr_use_teleop_orientation),
+                    ),
+                    use_wrist_position_for_hand=args.vr_pose_input_mode == "hand_abs",
+                    use_wrist_rotation_for_hand=bool(args.vr_use_teleop_orientation),
+                    palm_plane_wrist_orientation_blend_alpha=float(
+                        args.vr_palm_plane_wrist_orientation_blend_alpha
+                    ),
+                    loop_hz=float(args.vr_loop_hz),
+                    print_every_n_frames=int(args.vr_print_every),
+                    enable_synthetic_hands_plugin=not args.vr_disable_synthetic_hands_plugin,
+                    isaac_teleop_root=args.vr_isaac_teleop_root,
+                    startup_timeout_s=float(args.vr_startup_timeout_s),
+                    teleop_trace_path=args.vr_teleop_trace_path,
+                ),
+                vr_robot,
+            )
+            vr_session.__enter__()
+            print(
+                "[add-scene-vr] Quest teleop is driving the add_scene_glb assembly. "
+                "Use --vr-markers-only for target debug only.",
+                flush=True,
+            )
         _render_ego_view(scene, ego_view_enabled)
         _render_d405_view(scene, d405_view_enabled)
         while scene.viewer.is_alive():
-            if base_pose_panel:
+            if vr_session is not None:
+                vr_session.step()
+            elif base_pose_panel:
                 panel_translation, panel_euler, running, reset_counter, stop_requested = _read_base_pose_panel(
                     base_pose_panel
                 )
@@ -1652,6 +1964,8 @@ def main() -> None:
             _render_d405_view(scene, d405_view_enabled)
             time.sleep(1.0 / 60.0)
     finally:
+        if vr_session is not None:
+            vr_session.__exit__(None, None, None)
         _shutdown_base_pose_panel(base_pose_panel)
 
 

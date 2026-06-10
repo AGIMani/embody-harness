@@ -141,8 +141,15 @@ class QuestRobotSession:
                     except Exception:
                         pass
                     self._session = None
-                    if not _is_retryable_openxr_startup_error(exc) or time.monotonic() >= deadline:
+                    if not _is_retryable_openxr_startup_error(exc):
                         raise
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "OpenXR runtime is available, but no active Quest/WebXR session was found before "
+                            f"startup_timeout_s={self.config.startup_timeout_s:.1f}. "
+                            "Keep `python -m isaacteleop.cloudxr --accept-eula` running, open the CloudXR/WebXR "
+                            "client in the headset, accept the certificate if prompted, and enter the immersive VR session."
+                        ) from exc
                     remaining = max(0.0, deadline - time.monotonic())
                     print(
                         "[quest-session] OpenXR runtime found but no active Quest session yet; "
