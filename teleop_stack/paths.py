@@ -25,6 +25,15 @@ def resolve_isaac_teleop_root(explicit: str | os.PathLike[str] | None = None) ->
     )
 
 
+def resolve_cloudxr_env_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    env_value = os.environ.get("CLOUDXR_ENV_PATH")
+    if env_value:
+        return Path(env_value).expanduser().resolve()
+    return (Path.home() / ".cloudxr" / "run" / "cloudxr.env").resolve()
+
+
 def resolve_plugin_root_dir(isaac_teleop_root: str | os.PathLike[str] | None = None) -> Path | None:
     root = resolve_isaac_teleop_root(isaac_teleop_root)
     plugin_dir = root / "plugins"
