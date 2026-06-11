@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import logging
 from math import sqrt
 from typing import Any, Literal
 
-from teleop_stack.models import ArmSide, GripperCommand, Pose7, SingleArmTeleopCommand
+import numpy as np
+
+from teleop_stack.models import ArmSide, GripperCommand, NamedJointValues, Pose7, SingleArmTeleopCommand
+from teleop_stack.retargeting.linker_hand_heuristic import retarget_openxr_joint_positions_to_linker_l10_right
+
+
+logger = logging.getLogger(__name__)
+_LINKER_HAND_SPEC_WARNING_EMITTED = False
 
 
 ArmPoseCommandMode = Literal[
@@ -22,14 +30,59 @@ def _first_tensor(result: dict[str, Any], key: str):
 
 
 def _tensor_value_to_numpy(value: Any, *, dtype: Any):
-    import numpy as np
-
     if isinstance(value, np.ndarray):
         return value.astype(dtype, copy=False)
     try:
         return np.from_dlpack(value).astype(dtype, copy=False)
     except Exception:
         return np.asarray(value, dtype=dtype)
+
+
+def _optional_linker_hand_target(result: dict[str, Any], *, arm_side: ArmSide) -> NamedJointValues | None:
+    global _LINKER_HAND_SPEC_WARNING_EMITTED
+
+    if arm_side != "right":
+        return None
+    hand_group = result.get("raw_hand")
+    if hand_group is None or getattr(hand_group, "is_none", False):
+        return None
+
+    try:
+        from isaacteleop.retargeting_engine.tensor_types.indices import HandInputIndex
+    except ModuleNotFoundError:
+        return None
+
+    try:
+        joint_positions = _tensor_value_to_numpy(hand_group[HandInputIndex.JOINT_POSITIONS], dtype=np.float32)
+        joint_valid = _tensor_value_to_numpy(hand_group[HandInputIndex.JOINT_VALID], dtype=np.uint8)
+        try:
+            joint_orientations = _tensor_value_to_numpy(hand_group[HandInputIndex.JOINT_ORIENTATIONS], dtype=np.float32)
+        except (KeyError, IndexError, TypeError):
+            joint_orientations = None
+    except Exception:
+        return None
+
+    if joint_positions.shape != (26, 3) or joint_valid.shape != (26,):
+        return None
+    if int(joint_valid.sum()) < 10:
+        return None
+    if joint_orientations is not None and joint_orientations.shape != (26, 4):
+        joint_orientations = None
+
+    try:
+        return retarget_openxr_joint_positions_to_linker_l10_right(
+            joint_positions,
+            joint_orientations_xyzw=joint_orientations,
+            joint_valid=joint_valid,
+        )
+    except FileNotFoundError as exc:
+        if not _LINKER_HAND_SPEC_WARNING_EMITTED:
+            logger.warning("Linker Hand retargeting assets are unavailable; continuing without hand_target. %s", exc)
+            _LINKER_HAND_SPEC_WARNING_EMITTED = True
+        return None
+    except Exception as exc:
+        logger.debug("Failed to retarget OpenXR hand to Linker L10 target: %s", exc)
+        return None
 
 
 def _normalize_quaternion_xyzw(quaternion_xyzw: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -160,5 +213,5 @@ def session_result_to_single_arm_command(
         source_name=source_name,
         timestamp_s=timestamp_s,
         frame_id=frame_id,
-        hand_target=None,
+        hand_target=_optional_linker_hand_target(result, arm_side=arm_side),
     )

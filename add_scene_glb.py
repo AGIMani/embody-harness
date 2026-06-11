@@ -77,6 +77,7 @@ BOTTLE_YAW_RANGE_DEG = (0.0, 360.0)
 DEFAULT_GRAVITY = (0.0, 0.0, -9.81)
 DEFAULT_TABLE_COLLIDER_POS = (-0.07, 0.305, 0.02)
 DEFAULT_TABLE_COLLIDER_SIZE = (0.36, 0.36, 0.04)
+DEFAULT_OVERLAY_HAND_TRACE_PATH = ROOT_DIR / "logs" / "xr_debug" / "camera_overlay_hand.jsonl"
 RIGHT_SUPPORT_HOLE_Z_MM = -109.0
 SUPPORT_HOLES_MM = np.asarray(
     (
@@ -591,6 +592,140 @@ def _initialize_linker_hand_open_pose(linker_hand: object | None) -> None:
     linker_hand.control_dofs_position(open_pose, dofs)
 
 
+def _load_linker_hand_mimic_specs(urdf_path: Path | None) -> dict[str, tuple[str, float, float]]:
+    if urdf_path is None:
+        return {}
+    try:
+        root = ET.parse(urdf_path.expanduser().resolve()).getroot()
+    except Exception:
+        return {}
+    mimic_by_name: dict[str, tuple[str, float, float]] = {}
+    for joint in root.findall("joint"):
+        joint_name = joint.attrib.get("name")
+        mimic = joint.find("mimic")
+        if not joint_name or mimic is None:
+            continue
+        source_name = mimic.attrib.get("joint")
+        if not source_name:
+            continue
+        mimic_by_name[joint_name] = (
+            source_name,
+            float(mimic.attrib.get("multiplier", "1.0")),
+            float(mimic.attrib.get("offset", "0.0")),
+        )
+    return mimic_by_name
+
+
+def _load_linker_hand_joint_limits(urdf_path: Path | None) -> dict[str, tuple[float, float]]:
+    if urdf_path is None:
+        return {}
+    try:
+        root = ET.parse(urdf_path.expanduser().resolve()).getroot()
+    except Exception:
+        return {}
+    limits_by_name: dict[str, tuple[float, float]] = {}
+    for joint in root.findall("joint"):
+        joint_name = joint.attrib.get("name")
+        limit = joint.find("limit")
+        if not joint_name or limit is None:
+            continue
+        limits_by_name[joint_name] = (
+            float(limit.attrib.get("lower", "0.0")),
+            float(limit.attrib.get("upper", "0.0")),
+        )
+    return limits_by_name
+
+
+def _initialize_linker_hand_control_info(assembly: dict[str, object]) -> None:
+    linker_hand = assembly.get("linker_hand")
+    if linker_hand is None:
+        assembly["linker_hand_joint_names"] = []
+        assembly["linker_hand_dofs"] = []
+        assembly["linker_hand_mimic_by_name"] = {}
+        assembly["linker_hand_joint_limits_by_name"] = {}
+        assembly["pending_linker_hand_target"] = None
+        return
+
+    urdf_value = assembly.get("linker_hand_urdf")
+    urdf_path = Path(urdf_value) if urdf_value is not None else None
+    mimic_by_name = _load_linker_hand_mimic_specs(urdf_path)
+    limits_by_name = _load_linker_hand_joint_limits(urdf_path)
+    joint_names = list(ACTIVE_LINKER_L10_JOINTS)
+    for mimic_joint_name in mimic_by_name:
+        if mimic_joint_name not in joint_names:
+            joint_names.append(mimic_joint_name)
+
+    names: list[str] = []
+    dofs: list[int] = []
+    for joint_name in joint_names:
+        joint_dofs = _get_joint_dofs(linker_hand, joint_name)
+        if not joint_dofs:
+            continue
+        names.append(str(joint_name))
+        dofs.append(int(joint_dofs[0]))
+
+    assembly["linker_hand_joint_names"] = names
+    assembly["linker_hand_dofs"] = dofs
+    assembly["linker_hand_mimic_by_name"] = mimic_by_name
+    assembly["linker_hand_joint_limits_by_name"] = limits_by_name
+    assembly["pending_linker_hand_target"] = None
+
+    if dofs:
+        open_pose = np.zeros(len(dofs), dtype=np.float32)
+        linker_hand.set_dofs_position(open_pose, dofs, zero_velocity=True)
+        linker_hand.control_dofs_position(open_pose, dofs)
+    print(
+        "[add-scene-linker] hand control ready "
+        f"side={assembly.get('linker_hand_side', 'right')} "
+        f"active_dofs={len(dofs)}",
+        flush=True,
+    )
+
+
+def _set_linker_hand_target(assembly: dict[str, object], side: str, joint_values: object | None) -> None:
+    if side != str(assembly.get("linker_hand_side", "right")):
+        return
+    assembly["pending_linker_hand_target"] = joint_values
+
+
+def _apply_linker_hand_target(assembly: dict[str, object]) -> None:
+    linker_hand = assembly.get("linker_hand")
+    if linker_hand is None:
+        return
+    target = assembly.get("pending_linker_hand_target")
+    joint_names = list(assembly.get("linker_hand_joint_names", ()))
+    dofs = list(assembly.get("linker_hand_dofs", ()))
+    if target is None or not joint_names or not dofs:
+        return
+
+    target_names = tuple(getattr(target, "joint_names", ()))
+    target_positions = tuple(getattr(target, "joint_positions", ()))
+    values_by_name = dict(zip(target_names, target_positions, strict=False))
+    mimic_by_name = assembly.get("linker_hand_mimic_by_name", {})
+    if isinstance(mimic_by_name, dict):
+        for mimic_name, spec in mimic_by_name.items():
+            source_name, multiplier, offset = spec
+            if mimic_name not in values_by_name and source_name in values_by_name:
+                values_by_name[str(mimic_name)] = multiplier * float(values_by_name[source_name]) + offset
+
+    limits_by_name = assembly.get("linker_hand_joint_limits_by_name", {})
+    default_limits = (-np.inf, np.inf)
+    values = np.asarray(
+        [
+            float(
+                np.clip(
+                    values_by_name.get(name, 0.0),
+                    *(limits_by_name.get(name, default_limits) if isinstance(limits_by_name, dict) else default_limits),
+                )
+            )
+            for name in joint_names
+        ],
+        dtype=np.float32,
+    )
+    linker_hand.set_dofs_position(values, dofs, zero_velocity=True)
+    linker_hand.control_dofs_position(values, dofs)
+
+
 def _mount_linker_hand_to_arm(
     linker_hand: object | None,
     arm: object,
@@ -668,6 +803,7 @@ def _mount_assembly_attached_parts(assembly: dict[str, object], *, print_linker_
         mount_offset_xyz=tuple(float(v) for v in assembly.get("linker_hand_mount_offset_xyz", (0.0, 0.0, 0.0))),
         mount_quat_wxyz=tuple(float(v) for v in assembly.get("linker_hand_mount_quat_wxyz", (1.0, 0.0, 0.0, 0.0))),
     )
+    _apply_linker_hand_target(assembly)
     linker_hand = assembly.get("linker_hand")
     if print_linker_status and linker_hand is not None:
         hand_pos = _tensor_to_np(linker_hand.get_pos()).reshape(3)
@@ -809,7 +945,7 @@ def _initialize_nero_linker_assembly(scene: gs.Scene, assembly: dict[str, object
     right_arm = assembly["right"]
     _set_arm_initial_pose(left_arm, INITIAL_LEFT_ARM_Q)
     _set_arm_initial_pose(right_arm, INITIAL_RIGHT_ARM_Q)
-    _initialize_linker_hand_open_pose(assembly.get("linker_hand"))
+    _initialize_linker_hand_control_info(assembly)
 
     scene.step()
     _mount_assembly_attached_parts(assembly, print_linker_status=True)
@@ -881,6 +1017,13 @@ def _xyzw_to_wxyz(quat_xyzw: tuple[float, float, float, float]) -> tuple[float, 
     return (float(w), float(x), float(y), float(z))
 
 
+def _normalize_quat_xyzw(quat_xyzw: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    norm = math.sqrt(sum(float(v) * float(v) for v in quat_xyzw))
+    if norm <= 1e-9:
+        return (0.0, 0.0, 0.0, 1.0)
+    return tuple(float(v) / norm for v in quat_xyzw)  # type: ignore[return-value]
+
+
 def _parse_axis_map(text: str) -> tuple[str, str, str]:
     values = tuple(part.strip().lower() for part in text.split(",") if part.strip())
     if len(values) != 3:
@@ -896,6 +1039,158 @@ def _vr_arm_pose_command_mode(*, pose_input_mode: str, use_teleop_orientation: b
     if pose_input_mode != "hand_abs":
         return "legacy_retargeted_ee"
     return "raw_wrist_position_full_orientation" if use_teleop_orientation else "raw_wrist_position_fixed_orientation"
+
+
+def _overlay_hand_trace_is_fresh(path: Path, *, max_age_s: float = 2.0) -> bool:
+    try:
+        return path.is_file() and (time.time() - path.stat().st_mtime) <= float(max_age_s)
+    except OSError:
+        return False
+
+
+class _OverlayHandLogTeleopSession:
+    def __init__(
+        self,
+        robot: _AddSceneNeroTeleopRobot,
+        *,
+        arm_side: str,
+        trace_path: Path,
+        hand_side: str,
+        use_teleop_orientation: bool,
+        print_every_n: int,
+        stale_after_s: float = 1.0,
+    ) -> None:
+        self.robot = robot
+        self.arm_side = "left" if arm_side == "left" else "right"
+        self.trace_path = trace_path.expanduser()
+        self.hand_side = str(hand_side)
+        self.use_teleop_orientation = bool(use_teleop_orientation)
+        self.print_every_n = max(1, int(print_every_n))
+        self.stale_after_s = max(0.1, float(stale_after_s))
+        self.frame_count = 0
+        self._handle = None
+        self._latest_sample: dict[str, object] | None = None
+        self._last_warn_time_s = 0.0
+
+    def __enter__(self) -> "_OverlayHandLogTeleopSession":
+        from teleop_stack.models import GripperCommand, Pose7, SingleArmTeleopCommand  # noqa: F401
+
+        self.robot.connect()
+        self.trace_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self.trace_path.open("r", encoding="utf-8")
+        self._handle.seek(0, os.SEEK_END)
+        print(
+            "[add-scene-vr] using camera overlay hand log "
+            f"path={self.trace_path} hand={self.hand_side} arm={self.arm_side}",
+            flush=True,
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        try:
+            if self._handle is not None:
+                self._handle.close()
+        finally:
+            self._handle = None
+            self.robot.stop()
+            self.robot.disconnect()
+
+    def _accept_sample(self, sample: dict[str, object]) -> bool:
+        if sample.get("event") != "frame":
+            return False
+        if self.hand_side != "auto" and str(sample.get("hand")) != self.hand_side:
+            return False
+        try:
+            positions = np.asarray(sample.get("raw_hand_positions_xyz"), dtype=np.float32)
+            valid = np.asarray(sample.get("joint_valid"), dtype=np.uint8)
+        except Exception:
+            return False
+        return positions.shape == (26, 3) and valid.shape == (26,) and int(valid.sum()) >= 10
+
+    def _read_latest_sample(self) -> dict[str, object] | None:
+        if self._handle is None:
+            return None
+        for raw_line in self._handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(sample, dict) and self._accept_sample(sample):
+                self._latest_sample = sample
+        return self._latest_sample
+
+    def _sample_age_s(self, sample: dict[str, object]) -> float | None:
+        raw_monotonic = sample.get("monotonic_time_s")
+        if isinstance(raw_monotonic, (int, float)):
+            return max(0.0, time.monotonic() - float(raw_monotonic))
+        raw_time = sample.get("time_s")
+        if isinstance(raw_time, (int, float)):
+            return max(0.0, time.time() - float(raw_time))
+        return None
+
+    def _command_from_sample(self, sample: dict[str, object]):
+        from teleop_stack.models import GripperCommand, Pose7, SingleArmTeleopCommand
+        from teleop_stack.retargeting.linker_hand_heuristic import retarget_openxr_joint_positions_to_linker_l10_right
+
+        positions = np.asarray(sample["raw_hand_positions_xyz"], dtype=np.float32)
+        orientations = np.asarray(sample.get("raw_hand_orientations_xyzw"), dtype=np.float32)
+        joint_valid = np.asarray(sample["joint_valid"], dtype=np.uint8)
+        wrist_pos = tuple(float(v) for v in positions[1])
+        if self.use_teleop_orientation and orientations.shape == (26, 4):
+            wrist_quat = _normalize_quat_xyzw(tuple(float(v) for v in orientations[1]))
+        else:
+            wrist_quat = (0.0, 0.0, 0.0, 1.0)
+        try:
+            hand_target = retarget_openxr_joint_positions_to_linker_l10_right(
+                positions,
+                joint_orientations_xyzw=orientations if orientations.shape == (26, 4) else None,
+                joint_valid=joint_valid,
+            )
+        except Exception:
+            hand_target = None
+        self.frame_count += 1
+        return SingleArmTeleopCommand(
+            arm_side=self.arm_side,
+            ee_target=Pose7(position_xyz=wrist_pos, quaternion_xyzw=wrist_quat),
+            gripper=GripperCommand(normalized_position=0.0),
+            source_name="camera_overlay_hand_log",
+            timestamp_s=float(sample.get("monotonic_time_s", time.monotonic())),
+            frame_id=self.frame_count,
+            hand_target=hand_target,
+        )
+
+    def step(self) -> None:
+        sample = self._read_latest_sample()
+        now = time.monotonic()
+        if sample is None:
+            if now - self._last_warn_time_s > 2.0:
+                print(f"[add-scene-vr] waiting for overlay hand samples: {self.trace_path}", flush=True)
+                self._last_warn_time_s = now
+            _step_scene_with_attached_parts(self.robot.scene)
+            return
+        age_s = self._sample_age_s(sample)
+        if age_s is not None and age_s > self.stale_after_s:
+            if now - self._last_warn_time_s > 2.0:
+                print(
+                    "[add-scene-vr] overlay hand samples are stale "
+                    f"age_s={age_s:.2f} path={self.trace_path}",
+                    flush=True,
+                )
+                self._last_warn_time_s = now
+            _step_scene_with_attached_parts(self.robot.scene)
+            return
+        command = self._command_from_sample(sample)
+        self.robot.send_command(command)
+        if self.frame_count == 1 or self.frame_count % self.print_every_n == 0:
+            print(
+                f"[add-scene-vr] overlay frame={self.frame_count} "
+                f"hand={sample.get('hand')} valid={sample.get('valid_joint_count')} "
+                f"hand_target={'yes' if command.hand_target is not None else 'no'}",
+                flush=True,
+            )
 
 
 class _AddSceneNeroTeleopRobot:
@@ -992,6 +1287,9 @@ class _AddSceneNeroTeleopRobot:
 
     def send_command(self, command) -> None:
         self._ensure_connected()
+        assembly = getattr(self.scene, "nero_assembly_info", None)
+        if isinstance(assembly, dict) and getattr(command, "hand_target", None) is not None:
+            _set_linker_hand_target(assembly, self.arm_side, command.hand_target)
         target_pos = np.asarray(self._target_position(command.ee_target), dtype=np.float32)
         if self.use_teleop_orientation:
             target_quat = np.asarray(_xyzw_to_wxyz(command.ee_target.quaternion_xyzw), dtype=np.float32)
@@ -1037,7 +1335,8 @@ class _AddSceneNeroTeleopRobot:
                 f"target={tuple(round(float(v), 4) for v in target_pos)} "
                 f"eef={tuple(round(float(v), 4) for v in eef_pos)} "
                 f"ik_error={tuple(round(float(v), 5) for v in error_vec)} "
-                f"gripper={command.gripper.normalized_position:.3f}",
+                f"gripper={command.gripper.normalized_position:.3f} "
+                f"hand_target={'yes' if getattr(command, 'hand_target', None) is not None else 'no'}",
                 flush=True,
             )
 
@@ -1439,6 +1738,7 @@ def _add_dual_nero_arm_assembly(
         "d405": d405,
         "linker_hand": linker_hand,
         "linker_hand_side": "left" if str(linker_hand_side) == "left" else "right",
+        "linker_hand_urdf": linker_hand_urdf,
         "linker_hand_mount_offset_xyz": tuple(float(v) for v in linker_hand_mount_offset_xyz),
         "linker_hand_mount_quat_wxyz": tuple(float(v) for v in linker_hand_mount_quat_wxyz),
         "eef_link": DEFAULT_EEF_LINK,
@@ -1774,9 +2074,18 @@ def main() -> None:
     parser.add_argument("--vr-isaac-teleop-root", default=None)
     parser.add_argument("--vr-startup-timeout-s", type=float, default=300.0)
     parser.add_argument("--vr-teleop-trace-path", default=None)
-    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(0.15, 0.15, 0.15))
+    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(1.0, 1.0, 1.0))
     parser.add_argument("--vr-workspace-origin-xyz", type=_vec3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--vr-input-axis-map", type=_parse_axis_map, default="z,x,y")
+    parser.add_argument(
+        "--vr-input-source",
+        choices=("auto", "quest", "overlay-log"),
+        default="auto",
+        help="VR input source. auto uses camera overlay hand JSONL when it is fresh, otherwise QuestRobotSession.",
+    )
+    parser.add_argument("--vr-overlay-hand-trace-path", type=Path, default=DEFAULT_OVERLAY_HAND_TRACE_PATH)
+    parser.add_argument("--vr-overlay-hand-side", choices=("auto", "left", "right"), default="auto")
+    parser.add_argument("--vr-overlay-stale-after-s", type=float, default=1.0)
     parser.add_argument("--vr-use-teleop-orientation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vr-palm-plane-wrist-orientation-blend-alpha", type=float, default=1.0)
     parser.add_argument("--vr-disable-synthetic-hands-plugin", action="store_true")
@@ -1881,8 +2190,6 @@ def main() -> None:
     vr_session = None
     try:
         if args.enable_vr_teleop:
-            from teleop_stack.session import QuestRobotSession, QuestRobotSessionConfig
-
             vr_robot = _AddSceneNeroTeleopRobot(
                 scene,
                 arm_side=args.vr_arm_side,
@@ -1894,31 +2201,53 @@ def main() -> None:
                 drive_ik=not args.vr_markers_only,
                 print_every_n=args.vr_print_every,
             )
-            vr_session = QuestRobotSession(
-                QuestRobotSessionConfig(
+            vr_input_source = str(args.vr_input_source)
+            if vr_input_source == "auto":
+                vr_input_source = (
+                    "overlay-log"
+                    if _overlay_hand_trace_is_fresh(args.vr_overlay_hand_trace_path.expanduser())
+                    else "quest"
+                )
+                print(f"[add-scene-vr] auto input source selected: {vr_input_source}", flush=True)
+            if vr_input_source == "overlay-log":
+                vr_session = _OverlayHandLogTeleopSession(
+                    vr_robot,
                     arm_side=args.vr_arm_side,
-                    pose_input_mode=args.vr_pose_input_mode,
-                    arm_pose_command_mode=_vr_arm_pose_command_mode(
+                    trace_path=args.vr_overlay_hand_trace_path,
+                    hand_side=args.vr_overlay_hand_side,
+                    use_teleop_orientation=bool(args.vr_use_teleop_orientation),
+                    print_every_n=args.vr_print_every,
+                    stale_after_s=float(args.vr_overlay_stale_after_s),
+                )
+                vr_session.__enter__()
+            else:
+                from teleop_stack.session import QuestRobotSession, QuestRobotSessionConfig
+
+                vr_session = QuestRobotSession(
+                    QuestRobotSessionConfig(
+                        arm_side=args.vr_arm_side,
                         pose_input_mode=args.vr_pose_input_mode,
-                        use_teleop_orientation=bool(args.vr_use_teleop_orientation),
+                        arm_pose_command_mode=_vr_arm_pose_command_mode(
+                            pose_input_mode=args.vr_pose_input_mode,
+                            use_teleop_orientation=bool(args.vr_use_teleop_orientation),
+                        ),
+                        use_wrist_position_for_hand=args.vr_pose_input_mode == "hand_abs",
+                        use_wrist_rotation_for_hand=bool(args.vr_use_teleop_orientation),
+                        palm_plane_wrist_orientation_blend_alpha=float(
+                            args.vr_palm_plane_wrist_orientation_blend_alpha
+                        ),
+                        loop_hz=float(args.vr_loop_hz),
+                        print_every_n_frames=int(args.vr_print_every),
+                        enable_synthetic_hands_plugin=not args.vr_disable_synthetic_hands_plugin,
+                        isaac_teleop_root=args.vr_isaac_teleop_root,
+                        startup_timeout_s=float(args.vr_startup_timeout_s),
+                        teleop_trace_path=args.vr_teleop_trace_path,
                     ),
-                    use_wrist_position_for_hand=args.vr_pose_input_mode == "hand_abs",
-                    use_wrist_rotation_for_hand=bool(args.vr_use_teleop_orientation),
-                    palm_plane_wrist_orientation_blend_alpha=float(
-                        args.vr_palm_plane_wrist_orientation_blend_alpha
-                    ),
-                    loop_hz=float(args.vr_loop_hz),
-                    print_every_n_frames=int(args.vr_print_every),
-                    enable_synthetic_hands_plugin=not args.vr_disable_synthetic_hands_plugin,
-                    isaac_teleop_root=args.vr_isaac_teleop_root,
-                    startup_timeout_s=float(args.vr_startup_timeout_s),
-                    teleop_trace_path=args.vr_teleop_trace_path,
-                ),
-                vr_robot,
-            )
-            vr_session.__enter__()
+                    vr_robot,
+                )
+                vr_session.__enter__()
             print(
-                "[add-scene-vr] Quest teleop is driving the add_scene_glb assembly. "
+                f"[add-scene-vr] {vr_input_source} teleop is driving the add_scene_glb assembly. "
                 "Use --vr-markers-only for target debug only.",
                 flush=True,
             )

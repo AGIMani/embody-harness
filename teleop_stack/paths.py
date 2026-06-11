@@ -29,3 +29,34 @@ def resolve_plugin_root_dir(isaac_teleop_root: str | os.PathLike[str] | None = N
     root = resolve_isaac_teleop_root(isaac_teleop_root)
     plugin_dir = root / "plugins"
     return plugin_dir if plugin_dir.is_dir() else None
+
+
+def resolve_linkerhand_root(explicit: str | os.PathLike[str] | None = None) -> Path:
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    env_value = os.environ.get("LINKERHAND_URDF_ROOT")
+    if env_value:
+        candidates.append(Path(env_value))
+    root = repo_root()
+    candidates.extend(
+        (
+            root / "assets" / "linkerhand-urdf",
+            root / "external" / "linkerhand-urdf",
+            root.parent / "linkerhand-urdf",
+        )
+    )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate.expanduser().resolve()
+    raise FileNotFoundError(
+        "Could not locate linkerhand-urdf. Set LINKERHAND_URDF_ROOT or keep it under assets/linkerhand-urdf."
+    )
+
+
+def resolve_linkerhand_l10_right_urdf(explicit_root: str | os.PathLike[str] | None = None) -> Path:
+    root = resolve_linkerhand_root(explicit_root)
+    urdf_path = root / "l10" / "right" / "linkerhand_l10_right.urdf"
+    if not urdf_path.is_file():
+        raise FileNotFoundError(f"Could not find Linker Hand L10 right URDF at {urdf_path}")
+    return urdf_path
