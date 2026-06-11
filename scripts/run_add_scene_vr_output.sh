@@ -17,6 +17,8 @@ XR_ENV_PATH="${HOME}/.cloudxr/run/cloudxr.env"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DOCKERFILE_SYNTAX_IMAGE="${TELEOP_DOCKERFILE_SYNTAX_IMAGE:-}"
 CAMERA_STREAMER_LITE_IMAGE="${HARNESS_CAMERA_STREAMER_LITE_IMAGE:-harness-camera-streamer-lite:latest}"
+XR_HAND_LOG_PATH="${TELEOP_XR_HAND_LOG_PATH:-$REPO_ROOT/logs/xr_debug/camera_overlay_hand.jsonl}"
+XR_HAND_LOG_STRIDE="${TELEOP_XR_HAND_LOG_STRIDE:-10}"
 CHECK_ONLY="false"
 DISABLE_HAND_OVERLAY="false"
 SKIP_PATCH="false"
@@ -46,6 +48,8 @@ Options:
                               Override Dockerfile BuildKit frontend image, e.g.
                               docker.1ms.run/docker/dockerfile:1
   --lite-image TAG            Lite camera_streamer image tag (default: harness-camera-streamer-lite:latest)
+  --hand-log-path PATH        XR hand joint log path (default: logs/xr_debug/camera_overlay_hand.jsonl)
+  --hand-log-stride N         Log every N rendered frames (default: 10)
   --use-upstream-camera-streamer
                               Use IsaacTeleop camera_streamer.sh instead of the migrated lite image
   --disable-hand-overlay      Disable XR hand skeleton overlay
@@ -74,6 +78,8 @@ while [[ $# -gt 0 ]]; do
         --python) PYTHON_BIN="$2"; shift 2 ;;
         --dockerfile-syntax-image) DOCKERFILE_SYNTAX_IMAGE="$2"; shift 2 ;;
         --lite-image) CAMERA_STREAMER_LITE_IMAGE="$2"; shift 2 ;;
+        --hand-log-path) XR_HAND_LOG_PATH="$2"; shift 2 ;;
+        --hand-log-stride) XR_HAND_LOG_STRIDE="$2"; shift 2 ;;
         --use-upstream-camera-streamer) USE_LITE_CAMERA_STREAMER="false"; shift ;;
         --disable-hand-overlay) DISABLE_HAND_OVERLAY="true"; shift ;;
         --skip-patch) SKIP_PATCH="true"; shift ;;
@@ -249,6 +255,8 @@ if [[ "$USE_LITE_CAMERA_STREAMER" == "true" ]]; then
     cxr_host_volume_path="${CXR_HOST_VOLUME_PATH:-$HOME/.cloudxr}"
     xr_runtime_json="${XR_RUNTIME_JSON:-${cxr_host_volume_path}/openxr_cloudxr.json}"
     nv_cxr_runtime_dir="${NV_CXR_RUNTIME_DIR:-${cxr_host_volume_path}/run}"
+    hand_log_dir="$(dirname "$XR_HAND_LOG_PATH")"
+    mkdir -p "$hand_log_dir"
     docker_args=(
         --rm -it
         --gpus all
@@ -258,11 +266,14 @@ if [[ "$USE_LITE_CAMERA_STREAMER" == "true" ]]; then
         --ulimit stack=33554432
         -e "XR_RUNTIME_JSON=${xr_runtime_json}"
         -e "NV_CXR_RUNTIME_DIR=${nv_cxr_runtime_dir}"
+        -e "TELEOP_XR_HAND_LOG_PATH=${XR_HAND_LOG_PATH}"
+        -e "TELEOP_XR_HAND_LOG_STRIDE=${XR_HAND_LOG_STRIDE}"
         -e "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-graphics,video,compute,utility,display}"
         -v /dev:/dev
         -v /run/udev:/run/udev:rw
         -v "${cxr_host_volume_path}:${cxr_host_volume_path}:ro"
         -v "${CONFIG_PATH}:/config/${config_basename}:ro"
+        -v "${hand_log_dir}:${hand_log_dir}:rw"
     )
     if [[ -f /usr/share/vulkan/icd.d/nvidia_icd.json ]]; then
         docker_args+=(
