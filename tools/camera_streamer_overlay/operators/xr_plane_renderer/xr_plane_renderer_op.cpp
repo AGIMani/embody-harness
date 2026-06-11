@@ -10,6 +10,7 @@
 #include "glm/gtc/quaternion.hpp"
 #include "glm/gtc/type_ptr.hpp"
 #include "glm/gtx/quaternion.hpp"
+#include "xdev_space_minimal.h"
 #include "xr_hand_tracker.hpp"
 
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <fstream>
 #include <iomanip>
+#include <iostream>
 #include <optional>
 #include <sstream>
 #include <string_view>
@@ -32,6 +34,25 @@ namespace isaac_teleop::cam_streamer
 
 namespace
 {
+
+template <size_t N>
+std::string bounded_string(const char (&value)[N])
+{
+    const char* end = std::find(value, value + N, '\0');
+    return std::string(value, end);
+}
+
+std::string ascii_lower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+bool contains_case_insensitive(const std::string& haystack, const char* needle)
+{
+    return ascii_lower(haystack).find(needle) != std::string::npos;
+}
 
 constexpr float kLeftHandColor[4] = { 0.10f, 0.82f, 1.00f, 1.00f };
 constexpr float kRightHandColor[4] = { 1.00f, 0.55f, 0.18f, 1.00f };
@@ -153,6 +174,15 @@ bool is_joint_position_valid(const xr::HandJointLocationEXT& joint)
     const auto flags = joint.locationFlags;
     return static_cast<bool>(flags & xr::SpaceLocationFlagBits::PositionValid) &&
            static_cast<bool>(flags & xr::SpaceLocationFlagBits::PositionTracked);
+}
+
+bool is_display_device_xdev(const XrXDevPropertiesMNDX& properties)
+{
+    const std::string name = bounded_string(properties.name);
+    const std::string serial = bounded_string(properties.serial);
+    return contains_case_insensitive(name, "displaydevice") || contains_case_insensitive(name, "display device") ||
+           contains_case_insensitive(serial, "displaydevice") || contains_case_insensitive(serial, "display device") ||
+           contains_case_insensitive(name, "head device") || contains_case_insensitive(serial, "head device");
 }
 
 uint64_t parse_env_uint64(const char* name, uint64_t fallback)
@@ -491,6 +521,223 @@ void draw_text(std::vector<uint8_t>& rgba, int width, int height, int x, int y, 
 
 } // namespace
 
+struct XDevHandTrackerSet
+{
+    std::shared_ptr<holoscan::XrSession> xr_session;
+    XrXDevListMNDX xdev_list = XR_NULL_HANDLE;
+    std::vector<XrHandTrackerEXT> left_trackers;
+    std::vector<XrHandTrackerEXT> right_trackers;
+
+    PFN_xrCreateHandTrackerEXT pfn_create_hand_tracker = nullptr;
+    PFN_xrDestroyHandTrackerEXT pfn_destroy_hand_tracker = nullptr;
+    PFN_xrLocateHandJointsEXT pfn_locate_hand_joints = nullptr;
+    PFN_xrCreateXDevListMNDX pfn_create_xdev_list = nullptr;
+    PFN_xrEnumerateXDevsMNDX pfn_enumerate_xdevs = nullptr;
+    PFN_xrGetXDevPropertiesMNDX pfn_get_xdev_properties = nullptr;
+    PFN_xrDestroyXDevListMNDX pfn_destroy_xdev_list = nullptr;
+
+    ~XDevHandTrackerSet()
+    {
+        release();
+    }
+
+    bool load_function(const char* name, PFN_xrVoidFunction* ptr)
+    {
+        const XrResult result = xr_session->dispatch().xrGetInstanceProcAddr(xr_session->instance().get(), name, ptr);
+        return XR_SUCCEEDED(result) && *ptr != nullptr;
+    }
+
+    bool initialize(std::shared_ptr<holoscan::XrSession> session)
+    {
+        xr_session = std::move(session);
+        if (!xr_session)
+        {
+            return false;
+        }
+
+        if (!load_function("xrCreateHandTrackerEXT", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_create_hand_tracker)) ||
+            !load_function("xrDestroyHandTrackerEXT", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_destroy_hand_tracker)) ||
+            !load_function("xrLocateHandJointsEXT", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_locate_hand_joints)) ||
+            !load_function("xrCreateXDevListMNDX", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_create_xdev_list)) ||
+            !load_function("xrEnumerateXDevsMNDX", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_enumerate_xdevs)) ||
+            !load_function("xrGetXDevPropertiesMNDX", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_get_xdev_properties)) ||
+            !load_function("xrDestroyXDevListMNDX", reinterpret_cast<PFN_xrVoidFunction*>(&pfn_destroy_xdev_list)))
+        {
+            return false;
+        }
+
+        XrCreateXDevListInfoMNDX create_info{ XR_TYPE_CREATE_XDEV_LIST_INFO_MNDX };
+        XrResult result = pfn_create_xdev_list(xr_session->get().get(), &create_info, &xdev_list);
+        if (XR_FAILED(result) || xdev_list == XR_NULL_HANDLE)
+        {
+            xdev_list = XR_NULL_HANDLE;
+            return false;
+        }
+
+        uint32_t xdev_count = 0;
+        result = pfn_enumerate_xdevs(xdev_list, 0, &xdev_count, nullptr);
+        if (XR_FAILED(result) || xdev_count == 0)
+        {
+            release();
+            return false;
+        }
+
+        std::vector<XrXDevIdMNDX> xdev_ids(xdev_count);
+        result = pfn_enumerate_xdevs(xdev_list, xdev_count, &xdev_count, xdev_ids.data());
+        if (XR_FAILED(result))
+        {
+            release();
+            return false;
+        }
+
+        std::vector<XrXDevIdMNDX> preferred_xdev_ids;
+        std::vector<XrXDevIdMNDX> display_xdev_ids;
+        for (const XrXDevIdMNDX xdev_id : xdev_ids)
+        {
+            XrGetXDevInfoMNDX get_info{ XR_TYPE_GET_XDEV_INFO_MNDX };
+            get_info.id = xdev_id;
+
+            XrXDevPropertiesMNDX properties{ XR_TYPE_XDEV_PROPERTIES_MNDX };
+            result = pfn_get_xdev_properties(xdev_list, &get_info, &properties);
+            if (XR_FAILED(result))
+            {
+                continue;
+            }
+
+            HOLOSCAN_LOG_INFO("XrPlaneRendererOp: XDev id={} name='{}' serial='{}' canCreateSpace={}",
+                              static_cast<uint64_t>(xdev_id), bounded_string(properties.name),
+                              bounded_string(properties.serial), properties.canCreateSpace);
+            if (is_display_device_xdev(properties))
+            {
+                display_xdev_ids.push_back(xdev_id);
+            }
+            else
+            {
+                preferred_xdev_ids.push_back(xdev_id);
+            }
+        }
+
+        auto add_candidates = [this](const std::vector<XrXDevIdMNDX>& ids)
+        {
+            for (const XrXDevIdMNDX id : ids)
+            {
+                try_create_xdev_hand_tracker(id, XR_HAND_LEFT_EXT, left_trackers);
+                try_create_xdev_hand_tracker(id, XR_HAND_RIGHT_EXT, right_trackers);
+            }
+        };
+        add_candidates(preferred_xdev_ids);
+        add_candidates(display_xdev_ids);
+
+        if (left_trackers.empty() && right_trackers.empty())
+        {
+            release();
+            return false;
+        }
+
+        HOLOSCAN_LOG_INFO("XrPlaneRendererOp: XDev hand trackers ready left_candidates={} right_candidates={}",
+                          left_trackers.size(), right_trackers.size());
+        return true;
+    }
+
+    bool try_create_xdev_hand_tracker(XrXDevIdMNDX xdev_id,
+                                      XrHandEXT hand,
+                                      std::vector<XrHandTrackerEXT>& trackers)
+    {
+        if (xdev_list == XR_NULL_HANDLE || xdev_id == 0 || pfn_create_hand_tracker == nullptr)
+        {
+            return false;
+        }
+
+        XrCreateHandTrackerXDevMNDX xdev_create_info{ XR_TYPE_CREATE_HAND_TRACKER_XDEV_MNDX };
+        xdev_create_info.xdevList = xdev_list;
+        xdev_create_info.id = xdev_id;
+
+        XrHandTrackerCreateInfoEXT create_info{ XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT };
+        create_info.next = &xdev_create_info;
+        create_info.hand = hand;
+        create_info.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+
+        XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+        const XrResult result = pfn_create_hand_tracker(xr_session->get().get(), &create_info, &tracker);
+        if (XR_FAILED(result) || tracker == XR_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        trackers.push_back(tracker);
+        return true;
+    }
+
+    std::optional<std::vector<xr::HandJointLocationEXT>> locate_first_active(
+        const std::vector<XrHandTrackerEXT>& trackers,
+        xr::Time predicted_display_time)
+    {
+        if (pfn_locate_hand_joints == nullptr || !xr_session)
+        {
+            return {};
+        }
+
+        for (const XrHandTrackerEXT tracker : trackers)
+        {
+            if (tracker == XR_NULL_HANDLE)
+            {
+                continue;
+            }
+
+            XrHandJointsLocateInfoEXT locate_info{ XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT };
+            locate_info.baseSpace = xr_session->reference_space().get();
+            locate_info.time = predicted_display_time.get();
+
+            std::vector<xr::HandJointLocationEXT> joint_data(XR_HAND_JOINT_COUNT_EXT);
+            XrHandJointLocationsEXT locations{ XR_TYPE_HAND_JOINT_LOCATIONS_EXT };
+            locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+            locations.jointLocations = reinterpret_cast<XrHandJointLocationEXT*>(joint_data.data());
+
+            const XrResult result = pfn_locate_hand_joints(tracker, &locate_info, &locations);
+            if (XR_FAILED(result) || !locations.isActive)
+            {
+                continue;
+            }
+
+            return joint_data;
+        }
+        return {};
+    }
+
+    void release()
+    {
+        if (pfn_destroy_hand_tracker != nullptr)
+        {
+            for (XrHandTrackerEXT& tracker : left_trackers)
+            {
+                if (tracker != XR_NULL_HANDLE)
+                {
+                    pfn_destroy_hand_tracker(tracker);
+                    tracker = XR_NULL_HANDLE;
+                }
+            }
+            for (XrHandTrackerEXT& tracker : right_trackers)
+            {
+                if (tracker != XR_NULL_HANDLE)
+                {
+                    pfn_destroy_hand_tracker(tracker);
+                    tracker = XR_NULL_HANDLE;
+                }
+            }
+        }
+        left_trackers.clear();
+        right_trackers.clear();
+
+        if (xdev_list != XR_NULL_HANDLE && pfn_destroy_xdev_list != nullptr)
+        {
+            pfn_destroy_xdev_list(xdev_list);
+            xdev_list = XR_NULL_HANDLE;
+        }
+    }
+};
+
+XrPlaneRendererOp::~XrPlaneRendererOp() = default;
+
 void XrPlaneRendererOp::setup(holoscan::OperatorSpec& spec)
 {
     spec.input<xr::FrameState>("xr_frame_state").condition(holoscan::ConditionType::kMessageAvailable);
@@ -626,6 +873,8 @@ void XrPlaneRendererOp::start()
             HOLOSCAN_LOG_INFO("XrPlaneRendererOp: XR hand log path={} stride={}", hand_log_path_, hand_log_stride_);
         }
     }
+
+    initialize_xdev_hand_tracking();
 }
 
 void XrPlaneRendererOp::stop()
@@ -654,6 +903,22 @@ void XrPlaneRendererOp::stop()
     {
         hand_log_.close();
     }
+    release_xdev_hand_tracking();
+}
+
+void XrPlaneRendererOp::initialize_xdev_hand_tracking()
+{
+    xdev_hand_tracker_set_ = std::make_shared<XDevHandTrackerSet>();
+    if (!xdev_hand_tracker_set_->initialize(xr_session_.get()))
+    {
+        xdev_hand_tracker_set_.reset();
+        HOLOSCAN_LOG_WARN("XrPlaneRendererOp: XDev hand trackers unavailable; using default hand trackers only");
+    }
+}
+
+void XrPlaneRendererOp::release_xdev_hand_tracking()
+{
+    xdev_hand_tracker_set_.reset();
 }
 
 void XrPlaneRendererOp::compute(holoscan::InputContext& input,
@@ -1185,8 +1450,23 @@ void XrPlaneRendererOp::render_hand_overlays(
         return;
     }
 
-    const auto left_hand = left_hand_tracker->locate_hand_joints();
-    const auto right_hand = right_hand_tracker->locate_hand_joints();
+    std::optional<std::vector<xr::HandJointLocationEXT>> left_hand;
+    std::optional<std::vector<xr::HandJointLocationEXT>> right_hand;
+    if (xdev_hand_tracker_set_)
+    {
+        left_hand = xdev_hand_tracker_set_->locate_first_active(xdev_hand_tracker_set_->left_trackers,
+                                                                current_frame_state_.predictedDisplayTime);
+        right_hand = xdev_hand_tracker_set_->locate_first_active(xdev_hand_tracker_set_->right_trackers,
+                                                                 current_frame_state_.predictedDisplayTime);
+    }
+    if (!left_hand.has_value())
+    {
+        left_hand = left_hand_tracker->locate_hand_joints();
+    }
+    if (!right_hand.has_value())
+    {
+        right_hand = right_hand_tracker->locate_hand_joints();
+    }
     if (!left_hand.has_value() && !right_hand.has_value())
     {
         return;

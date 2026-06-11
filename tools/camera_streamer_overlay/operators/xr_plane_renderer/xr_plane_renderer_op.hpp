@@ -34,6 +34,8 @@ class XrHandTracker;
 namespace isaac_teleop::cam_streamer
 {
 
+struct XDevHandTrackerSet;
+
 /**
  * Configuration for a single XR plane.
  */
@@ -80,6 +82,7 @@ public:
     HOLOSCAN_OPERATOR_FORWARD_ARGS(XrPlaneRendererOp)
 
     XrPlaneRendererOp() = default;
+    ~XrPlaneRendererOp() override;
 
     void setup(holoscan::OperatorSpec& spec) override;
     void initialize() override;
@@ -138,6 +141,8 @@ private:
     void release_status_overlay();
     void append_hand_log(const char* hand_name, const std::vector<xr::HandJointLocationEXT>& joints,
                          uint32_t valid_point_count);
+    void initialize_xdev_hand_tracking();
+    void release_xdev_hand_tracking();
 
     struct TeleopStatusOverlay
     {
@@ -193,6 +198,7 @@ private:
     std::string hand_log_path_;
     std::ofstream hand_log_;
     uint64_t hand_log_stride_ = 10;
+    std::shared_ptr<XDevHandTrackerSet> xdev_hand_tracker_set_;
 };
 
 } // namespace isaac_teleop::cam_streamer

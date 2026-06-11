@@ -9,8 +9,10 @@
 #include "holoscan/core/operator.hpp"
 #include "holoscan/core/operator_spec.hpp"
 #include "holoscan/core/resource.hpp"
+#include "xdev_space_minimal.h"
 #include "xr_hand_tracker.hpp"
 #include "xr_plane_renderer_op.hpp"
+#include "xr_plugin.hpp"
 
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -25,6 +27,25 @@ namespace py = pybind11;
 
 namespace isaac_teleop::cam_streamer
 {
+
+class XDevHandTrackingExtensionPlugin : public holoscan::IXrPlugin
+{
+public:
+    explicit XDevHandTrackingExtensionPlugin(std::shared_ptr<holoscan::XrSession> xr_session)
+        : holoscan::IXrPlugin(std::move(xr_session))
+    {
+    }
+
+    [[nodiscard]] std::vector<std::string_view> get_required_instance_extensions() override
+    {
+        return { XR_EXT_HAND_TRACKING_EXTENSION_NAME, XR_KHR_CONVERT_TIMESPEC_TIME_EXTENSION_NAME,
+                 XR_MNDX_XDEV_SPACE_EXTENSION_NAME };
+    }
+
+    void on_session_created() override
+    {
+    }
+};
 
 inline void add_positional_condition_and_resource_args(holoscan::Operator* op, const py::args& args)
 {
@@ -57,7 +78,8 @@ public:
         : XrPlaneRendererOp(holoscan::ArgList{ holoscan::Arg{ "xr_session", xr_session },
                                                holoscan::Arg{ "left_hand_tracker", left_hand_tracker },
                                                holoscan::Arg{ "right_hand_tracker", right_hand_tracker },
-                                               holoscan::Arg{ "verbose", verbose } })
+                                               holoscan::Arg{ "verbose", verbose } }),
+          xdev_extension_plugin_(std::make_shared<XDevHandTrackingExtensionPlugin>(xr_session))
     {
         add_positional_condition_and_resource_args(this, args);
         name_ = name;
@@ -69,6 +91,9 @@ public:
         spec_ = std::make_shared<holoscan::OperatorSpec>(fragment);
         setup(*spec_.get());
     }
+
+private:
+    std::shared_ptr<XDevHandTrackingExtensionPlugin> xdev_extension_plugin_;
 };
 
 PYBIND11_MODULE(xr_plane_renderer, m)
