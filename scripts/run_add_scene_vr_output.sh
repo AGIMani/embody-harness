@@ -19,6 +19,7 @@ DOCKERFILE_SYNTAX_IMAGE="${TELEOP_DOCKERFILE_SYNTAX_IMAGE:-}"
 CAMERA_STREAMER_LITE_IMAGE="${HARNESS_CAMERA_STREAMER_LITE_IMAGE:-harness-camera-streamer-lite:latest}"
 XR_HAND_LOG_PATH="${TELEOP_XR_HAND_LOG_PATH:-$REPO_ROOT/logs/xr_debug/camera_overlay_hand.jsonl}"
 XR_HAND_LOG_STRIDE="${TELEOP_XR_HAND_LOG_STRIDE:-10}"
+XR_STATUS_PATH="${TELEOP_XR_STATUS_PATH:-}"
 CHECK_ONLY="false"
 DISABLE_HAND_OVERLAY="false"
 SKIP_PATCH="false"
@@ -50,6 +51,8 @@ Options:
   --lite-image TAG            Lite camera_streamer image tag (default: harness-camera-streamer-lite:latest)
   --hand-log-path PATH        XR hand joint log path (default: logs/xr_debug/camera_overlay_hand.jsonl)
   --hand-log-stride N         Log every N rendered frames (default: 10)
+  --xr-status-path PATH       Teleop status JSON path shown in VR
+                              (default: $NV_CXR_RUNTIME_DIR/teleop_xr_status.json)
   --use-upstream-camera-streamer
                               Use IsaacTeleop camera_streamer.sh instead of the migrated lite image
   --disable-hand-overlay      Disable XR hand skeleton overlay
@@ -80,6 +83,7 @@ while [[ $# -gt 0 ]]; do
         --lite-image) CAMERA_STREAMER_LITE_IMAGE="$2"; shift 2 ;;
         --hand-log-path) XR_HAND_LOG_PATH="$2"; shift 2 ;;
         --hand-log-stride) XR_HAND_LOG_STRIDE="$2"; shift 2 ;;
+        --xr-status-path) XR_STATUS_PATH="$2"; shift 2 ;;
         --use-upstream-camera-streamer) USE_LITE_CAMERA_STREAMER="false"; shift ;;
         --disable-hand-overlay) DISABLE_HAND_OVERLAY="true"; shift ;;
         --skip-patch) SKIP_PATCH="true"; shift ;;
@@ -94,6 +98,9 @@ failures=0
 if [[ -f "$XR_ENV_PATH" ]]; then
     # shellcheck disable=SC1090
     source "$XR_ENV_PATH"
+fi
+if [[ -z "$XR_STATUS_PATH" ]]; then
+    XR_STATUS_PATH="${NV_CXR_RUNTIME_DIR:-$HOME/.cloudxr/run}/teleop_xr_status.json"
 fi
 
 status_ok() { printf '[vr-output] ok: %s\n' "$*"; }
@@ -167,6 +174,7 @@ else
     status_error "sim screen device missing: $DEVICE"
     status_warn "create it with: sudo modprobe v4l2loopback video_nr=${video_nr} card_label=teleop_sim_screen exclusive_caps=1 max_buffers=2"
 fi
+status_ok "xr status path=$XR_STATUS_PATH"
 
 if [[ -d "$CAMERA_STREAMER_ROOT" && -x "$CAMERA_STREAMER_ROOT/camera_streamer.sh" ]]; then
     status_ok "camera_streamer=$CAMERA_STREAMER_ROOT"
@@ -256,7 +264,9 @@ if [[ "$USE_LITE_CAMERA_STREAMER" == "true" ]]; then
     xr_runtime_json="${XR_RUNTIME_JSON:-${cxr_host_volume_path}/openxr_cloudxr.json}"
     nv_cxr_runtime_dir="${NV_CXR_RUNTIME_DIR:-${cxr_host_volume_path}/run}"
     hand_log_dir="$(dirname "$XR_HAND_LOG_PATH")"
+    xr_status_dir="$(dirname "$XR_STATUS_PATH")"
     mkdir -p "$hand_log_dir"
+    mkdir -p "$xr_status_dir"
     docker_args=(
         --rm -it
         --gpus all
@@ -268,6 +278,7 @@ if [[ "$USE_LITE_CAMERA_STREAMER" == "true" ]]; then
         -e "NV_CXR_RUNTIME_DIR=${nv_cxr_runtime_dir}"
         -e "TELEOP_XR_HAND_LOG_PATH=${XR_HAND_LOG_PATH}"
         -e "TELEOP_XR_HAND_LOG_STRIDE=${XR_HAND_LOG_STRIDE}"
+        -e "TELEOP_XR_STATUS_PATH=${XR_STATUS_PATH}"
         -e "NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES:-graphics,video,compute,utility,display}"
         -v /dev:/dev
         -v /run/udev:/run/udev:rw
@@ -275,6 +286,9 @@ if [[ "$USE_LITE_CAMERA_STREAMER" == "true" ]]; then
         -v "${CONFIG_PATH}:/config/${config_basename}:ro"
         -v "${hand_log_dir}:${hand_log_dir}:rw"
     )
+    if [[ "${xr_status_dir}" != "${cxr_host_volume_path}" && "${xr_status_dir}" != "${cxr_host_volume_path}/"* ]]; then
+        docker_args+=(-v "${xr_status_dir}:${xr_status_dir}:ro")
+    fi
     if [[ -f /usr/share/vulkan/icd.d/nvidia_icd.json ]]; then
         docker_args+=(
             -e "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json"

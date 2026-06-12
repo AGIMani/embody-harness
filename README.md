@@ -2,81 +2,74 @@
 
 ## VR 启动顺序
 
-每个终端先进入环境：
+每个终端都先执行：
 
 ```bash
 cd /home/whf/Project/harness
 conda activate genesis
 ```
 
-### 0. 首次准备
-
-```bash
-scripts/apply_isaac_teleop_cloudxr_overlay.sh
-```
-
-### 1. 启动 CloudXR
+### 1. 启动 CloudXR runtime
 
 ```bash
 python -m isaacteleop.cloudxr --accept-eula
 ```
 
-### 2. 启动 Quest 语音桥
+### 2. 启动 CloudXR 网页端
+
+```bash
+scripts/run_cloudxr_web_client.sh
+```
+
+这个脚本启动的是完整网页：`https://192.168.8.100:8443/`。
+
+`https://192.168.8.100:48322/` 只用于接受 CloudXR WSS 证书，不是操作页面，所以这里不会有 `Enable Voice`。
+
+### 3. 启动语音桥
 
 ```bash
 scripts/run_quest_voice_command_bridge.sh --model-path /home/whf/.cache/teleop_stack/vosk/vosk-model-small-cn-0.22 --no-tls --min-confidence 0.5
 ```
 
-### 3. Quest 进入 immersive VR session
+### 4. Quest 打开网页
 
-在 Quest 的 CloudXR WebXR 页面点 `Enable Voice`，允许麦克风，然后进入 immersive VR session。
-
-如果只是接受证书页面，就先打开：
+在 Quest 浏览器里按顺序打开：
 
 ```text
-https://<你的电脑IP>:48322
+https://192.168.8.100:8443/
+https://192.168.8.100:48322/
+https://192.168.8.100:8443/
 ```
 
-接受证书后回到 CloudXR WebXR 页面。进入 VR 后放下手柄，切到裸手追踪。
+回到 `8443` 页面后，点击 `Enable Voice`，允许麦克风，然后点击 `Connect` 进入 immersive VR session。
 
-### 4. 启动 VR 画面和手骨架输出
+### 5. 启动 VR 画面和手骨架输出
 
 ```bash
 scripts/run_add_scene_vr_output.sh --display :0
 ```
 
-### 5. 启动 Genesis 场景和遥操
+### 6. 启动 Genesis 场景和遥操
 
 ```bash
 python add_scene_glb.py --backend gpu --enable-vr-teleop
 ```
 
-启动后默认会等待“开始”命令，不会立刻跟手动。
+### 7. 开始遥操
 
-### 6. 开始遥操
-
-对 Quest 说：
+进入 VR 后放下手柄，切到裸手追踪，然后说：
 
 ```text
 开始
 ```
 
-也可以用本机命令验证链路：
+也可以用本机命令直接打开遥操：
 
 ```bash
 scripts/send_teleop_voice_command_once.sh --command engage
 ```
 
-之后可以用这些命令控制：
-
-```bash
-scripts/send_teleop_voice_command_once.sh --command clutch
-scripts/send_teleop_voice_command_once.sh --command resume
-scripts/send_teleop_voice_command_once.sh --command recenter
-scripts/send_teleop_voice_command_once.sh --command stop
-```
-
-### 7. 停止
+### 8. 停止
 
 按这个顺序 `Ctrl+C`：
 
@@ -84,5 +77,6 @@ scripts/send_teleop_voice_command_once.sh --command stop
 1. add_scene_glb.py
 2. scripts/run_add_scene_vr_output.sh
 3. scripts/run_quest_voice_command_bridge.sh
-4. python -m isaacteleop.cloudxr --accept-eula
+4. scripts/run_cloudxr_web_client.sh
+5. python -m isaacteleop.cloudxr --accept-eula
 ```

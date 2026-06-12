@@ -7,7 +7,7 @@ from typing import Any, Literal
 import numpy as np
 
 from teleop_stack.models import ArmSide, GripperCommand, NamedJointValues, Pose7, SingleArmTeleopCommand
-from teleop_stack.retargeting.linker_hand_heuristic import retarget_openxr_joint_positions_to_linker_l10_right
+from teleop_stack.retargeting.linker_l10_dex_retargeter import retarget_openxr_hand_to_linker_l10_right
 
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ def _optional_linker_hand_target(result: dict[str, Any], *, arm_side: ArmSide) -
         joint_orientations = None
 
     try:
-        return retarget_openxr_joint_positions_to_linker_l10_right(
+        return retarget_openxr_hand_to_linker_l10_right(
             joint_positions,
             joint_orientations_xyzw=joint_orientations,
             joint_valid=joint_valid,

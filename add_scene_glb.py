@@ -20,6 +20,7 @@ from assets.nero_arm_linker_l10_genesis_config import (
     INITIAL_RIGHT_ARM_Q,
     make_runtime_config,
 )
+from teleop_stack.session.xr_status import XrTeleopStatusPublisher
 from teleop_stack.session.voice_controls import VoiceTeleopControlConfig, VoiceTeleopControlPolicy
 from teleop_stack.teleop.openxr_genesis_adapter import (
     adapt_openxr_hand_frame_to_genesis_parent,
@@ -27,7 +28,12 @@ from teleop_stack.teleop.openxr_genesis_adapter import (
     map_openxr_quaternion_to_genesis_parent,
     map_openxr_vector_to_genesis,
 )
-from teleop_stack.teleop.spatial_frames import hand_anatomical_frame_from_debug
+from teleop_stack.teleop.orientation_tracker import OrientationTargetTracker, OrientationTrackerConfig
+from teleop_stack.teleop.spatial_frames import (
+    BeavrHandFrameSmoother,
+    hand_anatomical_frame_from_debug,
+    hand_beavr_anatomical_frame_from_debug,
+)
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -106,6 +112,7 @@ ARM_HOLES_MM = np.asarray(
     dtype=np.float64,
 )
 DEFAULT_EEF_LINK = "revo2_flange"
+DEFAULT_NERO_ORIENTATION_AXIS_MAP = ("x", "y", "z")
 ARM_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 8))
 REVO2_FLANGE_VISUAL_MESH = "package://agx_arm_description/agx_arm_urdf/nero/meshes/dae/revo2_flange.dae"
 REVO2_FLANGE_COLLISION_MESH = "package://agx_arm_description/agx_arm_urdf/nero/meshes/revo2_flange.stl"
@@ -1043,6 +1050,16 @@ def _parse_axis_map(text: str) -> tuple[str, str, str]:
     return values  # type: ignore[return-value]
 
 
+def _parse_quat4(text: str) -> tuple[float, float, float, float]:
+    parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("quaternion must contain 4 comma-separated numbers")
+    try:
+        return tuple(float(part) for part in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("quaternion must contain 4 comma-separated numbers") from exc
+
+
 def _vr_arm_pose_command_mode(*, pose_input_mode: str, use_teleop_orientation: bool) -> str:
     if pose_input_mode != "hand_abs":
         return "legacy_retargeted_ee"
@@ -1183,7 +1200,7 @@ class _OverlayHandLogTeleopSession:
 
     def _command_from_sample(self, sample: dict[str, object]):
         from teleop_stack.models import GripperCommand, Pose7, SingleArmTeleopCommand
-        from teleop_stack.retargeting.linker_hand_heuristic import retarget_openxr_joint_positions_to_linker_l10_right
+        from teleop_stack.retargeting.linker_l10_dex_retargeter import retarget_openxr_hand_to_linker_l10_right
 
         positions = np.asarray(sample["raw_hand_positions_xyz"], dtype=np.float32)
         orientations = np.asarray(sample.get("raw_hand_orientations_xyzw"), dtype=np.float32)
@@ -1194,7 +1211,7 @@ class _OverlayHandLogTeleopSession:
         else:
             wrist_quat = (0.0, 0.0, 0.0, 1.0)
         try:
-            hand_target = retarget_openxr_joint_positions_to_linker_l10_right(
+            hand_target = retarget_openxr_hand_to_linker_l10_right(
                 positions,
                 joint_orientations_xyzw=orientations if orientations.shape == (26, 4) else None,
                 joint_valid=joint_valid,
@@ -1256,6 +1273,10 @@ class _AddSceneNeroTeleopRobot:
         openxr_coordinate_adapter: str,
         use_teleop_orientation: bool,
         orientation_source: str,
+        orientation_axis_map: tuple[str, str, str],
+        orientation_max_speed_rad_s: float,
+        orientation_tool_offset_wxyz: tuple[float, float, float, float],
+        orientation_reference_mode: str,
         relative_control: bool,
         drive_ik: bool,
         require_engage: bool,
@@ -1274,6 +1295,20 @@ class _AddSceneNeroTeleopRobot:
         self.openxr_coordinate_adapter = "openxr_genesis" if openxr_coordinate_adapter == "openxr_genesis" else "none"
         self.use_teleop_orientation = bool(use_teleop_orientation)
         self.orientation_source = str(orientation_source)
+        self.orientation_axis_map = tuple(str(v) for v in orientation_axis_map)
+        self.orientation_reference_mode = str(orientation_reference_mode)
+        self.orientation_tracker = (
+            OrientationTargetTracker(
+                OrientationTrackerConfig(
+                    axis_map=self.orientation_axis_map,  # type: ignore[arg-type]
+                    max_speed_rad_s=float(orientation_max_speed_rad_s),
+                    tool_offset_wxyz=tuple(float(v) for v in orientation_tool_offset_wxyz),  # type: ignore[arg-type]
+                    reference_mode=self.orientation_reference_mode,  # type: ignore[arg-type]
+                )
+            )
+            if self.use_teleop_orientation
+            else None
+        )
         self.relative_control = bool(relative_control)
         self.drive_ik = bool(drive_ik)
         self.require_engage = bool(require_engage)
@@ -1293,6 +1328,13 @@ class _AddSceneNeroTeleopRobot:
         self.q_state: np.ndarray | None = None
         self.human_anchor_xyz: tuple[float, float, float] | None = None
         self.target_anchor_xyz: tuple[float, float, float] | None = None
+        self.target_anchor_quaternion_wxyz: tuple[float, float, float, float] | None = None
+        self.last_orientation_timestamp_s: float | None = None
+        self.last_orientation_source_quaternion_xyzw: tuple[float, float, float, float] | None = None
+        self.last_orientation_source_debug: dict[str, object] | None = None
+        self.orientation_anchor_source_actual: str | None = None
+        self.orientation_debug = None
+        self.beavr_hand_frame_smoother = BeavrHandFrameSmoother(moving_average_limit=5)
         self.mode = "ready"
         self.last_event = "initialized"
         self.latest_command = None
@@ -1339,15 +1381,7 @@ class _AddSceneNeroTeleopRobot:
                 for i in range(3)
             )  # type: ignore[return-value]
         if self.human_anchor_xyz is None or self.target_anchor_xyz is None:
-            current_target = _tensor_to_np(self.eef_link.get_pos()).reshape(3).astype(np.float64)
-            self.human_anchor_xyz = tuple(float(v) for v in pose.position_xyz)
-            self.target_anchor_xyz = tuple(float(v) for v in current_target)
-            print(
-                f"[add-scene-vr] anchor side={self.arm_side} "
-                f"human={tuple(round(v, 4) for v in self.human_anchor_xyz)} "
-                f"target={tuple(round(v, 4) for v in self.target_anchor_xyz)}",
-                flush=True,
-            )
+            self._reset_relative_anchor(pose)
         delta = tuple(float(pose.position_xyz[i]) - float(self.human_anchor_xyz[i]) for i in range(3))
         mapped_delta = self._map_delta(delta)  # type: ignore[arg-type]
         return tuple(float(self.target_anchor_xyz[i]) + float(mapped_delta[i]) for i in range(3))  # type: ignore[return-value]
@@ -1356,32 +1390,177 @@ class _AddSceneNeroTeleopRobot:
         self.latest_hand_debug = hand_debug
         return
 
+    def _current_target_quat_wxyz(self) -> tuple[float, float, float, float]:
+        self._ensure_connected()
+        return tuple(float(v) for v in _tensor_to_np(self.eef_link.get_quat()).reshape(4))
+
+    def _reset_relative_anchor(self, pose) -> None:
+        self._ensure_connected()
+        current_target = _tensor_to_np(self.eef_link.get_pos()).reshape(3).astype(np.float64)
+        self.human_anchor_xyz = tuple(float(v) for v in pose.position_xyz)
+        self.target_anchor_xyz = tuple(float(v) for v in current_target)
+        self.target_anchor_quaternion_wxyz = self._current_target_quat_wxyz()
+        if self.orientation_tracker is not None:
+            source_quat_xyzw, source_debug = self._orientation_source_quaternion_xyzw(pose)
+            self.orientation_tracker.reset_anchor(source_quat_xyzw, self.target_anchor_quaternion_wxyz)
+            self.orientation_debug = None
+            self.last_orientation_timestamp_s = None
+            self.orientation_anchor_source_actual = str(source_debug.get("actual", "unknown"))
+        print(
+            f"[add-scene-vr] anchor side={self.arm_side} "
+            f"human={tuple(round(v, 4) for v in self.human_anchor_xyz)} "
+            f"target={tuple(round(v, 4) for v in self.target_anchor_xyz)} "
+            f"orientation={'on' if self.orientation_tracker is not None else 'off'} "
+            f"orientation_source={self.orientation_source} "
+            f"orientation_reference_mode={self.orientation_reference_mode}",
+            flush=True,
+        )
+
+    def _orientation_source_quaternion_xyzw(self, command_pose) -> tuple[tuple[float, float, float, float], dict[str, object]]:
+        requested = self.orientation_source
+        wrist_quat = tuple(float(v) for v in command_pose.quaternion_xyzw)
+        if requested == "wrist_quat":
+            adapted = (
+                map_openxr_quaternion_to_genesis_parent(wrist_quat)
+                if self.openxr_coordinate_adapter == "openxr_genesis"
+                else wrist_quat
+            )
+            adapted = _normalize_quat_xyzw(adapted)
+            debug = {
+                "requested": requested,
+                "actual": "wrist_quat",
+                "fallback": False,
+                "reason": None,
+                "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+            }
+            self.last_orientation_source_quaternion_xyzw = adapted
+            self.last_orientation_source_debug = debug
+            return adapted, debug
+
+        if requested not in {"hand_anatomical_frame", "hand_beavr_anatomical_frame", "hand_genesis_wrist_frame"}:
+            raise ValueError(f"unsupported VR orientation source: {requested!r}")
+
+        frame = None
+        if isinstance(self.latest_hand_debug, dict):
+            if requested == "hand_anatomical_frame":
+                frame = hand_anatomical_frame_from_debug(self.latest_hand_debug)
+            elif requested == "hand_beavr_anatomical_frame":
+                frame = self.beavr_hand_frame_smoother.update(self.latest_hand_debug)
+                if frame is None:
+                    frame = hand_beavr_anatomical_frame_from_debug(self.latest_hand_debug)
+            else:
+                frame = self.beavr_hand_frame_smoother.update(self.latest_hand_debug)
+                if frame is None:
+                    frame = hand_beavr_anatomical_frame_from_debug(self.latest_hand_debug)
+
+        if frame is not None:
+            if requested == "hand_genesis_wrist_frame":
+                frame = adapt_openxr_hand_frame_to_genesis_wrist_frame(frame)
+            elif self.openxr_coordinate_adapter == "openxr_genesis":
+                frame = adapt_openxr_hand_frame_to_genesis_parent(frame)
+            quat = _normalize_quat_xyzw(tuple(float(v) for v in frame.quaternion_xyzw))
+            debug = {
+                "requested": requested,
+                "actual": requested,
+                "fallback": False,
+                "reason": None,
+                "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+                requested: frame.as_dict(),
+            }
+            self.last_orientation_source_quaternion_xyzw = quat
+            self.last_orientation_source_debug = debug
+            return quat, debug
+
+        if self.last_orientation_source_quaternion_xyzw is not None:
+            debug = {
+                "requested": requested,
+                "actual": f"last_{requested}",
+                "fallback": True,
+                "reason": f"{requested}_unavailable",
+                "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+            }
+            self.last_orientation_source_debug = debug
+            return self.last_orientation_source_quaternion_xyzw, debug
+
+        adapted = (
+            map_openxr_quaternion_to_genesis_parent(wrist_quat)
+            if self.openxr_coordinate_adapter == "openxr_genesis"
+            else wrist_quat
+        )
+        adapted = _normalize_quat_xyzw(adapted)
+        debug = {
+            "requested": requested,
+            "actual": "wrist_quat",
+            "fallback": True,
+            "reason": f"{requested}_unavailable",
+            "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+        }
+        self.last_orientation_source_quaternion_xyzw = adapted
+        self.last_orientation_source_debug = debug
+        return adapted, debug
+
+    def xr_status_snapshot(self) -> dict[str, object]:
+        input_tracking_state = "tracked" if self.latest_command is not None else "missing"
+        hand_valid_count = 0
+        if isinstance(self.latest_hand_debug, dict):
+            try:
+                hand_valid_count = int(self.latest_hand_debug.get("joint_valid_count", 0))
+            except (TypeError, ValueError):
+                hand_valid_count = 0
+            if hand_valid_count >= 10:
+                input_tracking_state = "tracked"
+        return {
+            "mode": self.mode,
+            "last_event": self.last_event,
+            "input_tracking_state": input_tracking_state,
+            "hand_pose_gate_state": "stable" if input_tracking_state == "tracked" else "reacquiring",
+            "mapper_control_profile": "voice",
+            "controller_available": False,
+            "guard_events": (),
+            "arm_side": self.arm_side,
+            "hand_valid_count": hand_valid_count,
+        }
+
     def _target_quat_wxyz(self, command) -> np.ndarray:
-        if not self.use_teleop_orientation:
+        if self.orientation_tracker is None:
             return _tensor_to_np(self.eef_link.get_quat()).reshape(4).astype(np.float32)
 
-        source_quat_xyzw: tuple[float, float, float, float] | None = None
-        if self.orientation_source in {"hand_anatomical_frame", "hand_genesis_wrist_frame"} and isinstance(
-            self.latest_hand_debug,
-            dict,
-        ):
-            frame = hand_anatomical_frame_from_debug(self.latest_hand_debug)
-            if frame is not None:
-                if self.orientation_source == "hand_genesis_wrist_frame":
-                    frame = adapt_openxr_hand_frame_to_genesis_wrist_frame(frame)
-                elif self.openxr_coordinate_adapter == "openxr_genesis":
-                    frame = adapt_openxr_hand_frame_to_genesis_parent(frame)
-                if frame is not None:
-                    source_quat_xyzw = tuple(float(v) for v in frame.quaternion_xyzw)
+        if self.target_anchor_quaternion_wxyz is None:
+            self._reset_relative_anchor(command.ee_target)
 
-        if source_quat_xyzw is None:
-            source_quat_xyzw = tuple(float(v) for v in command.ee_target.quaternion_xyzw)
-            if self.openxr_coordinate_adapter == "openxr_genesis":
-                source_quat_xyzw = map_openxr_quaternion_to_genesis_parent(source_quat_xyzw)
-        return np.asarray(_xyzw_to_wxyz(source_quat_xyzw), dtype=np.float32)
+        source_quat_xyzw, source_debug = self._orientation_source_quaternion_xyzw(command.ee_target)
+        source_actual = str(source_debug.get("actual", "unknown"))
+        if (
+            self.orientation_anchor_source_actual is not None
+            and source_actual in {"hand_anatomical_frame", "hand_beavr_anatomical_frame", "hand_genesis_wrist_frame"}
+            and self.orientation_anchor_source_actual != source_actual
+        ):
+            self._reset_relative_anchor(command.ee_target)
+            source_quat_xyzw, source_debug = self._orientation_source_quaternion_xyzw(command.ee_target)
+            source_actual = str(source_debug.get("actual", "unknown"))
+
+        timestamp_s = float(getattr(command, "timestamp_s", time.monotonic()))
+        if self.last_orientation_timestamp_s is None:
+            dt_s = 1.0 / 60.0
+        else:
+            dt_s = max(0.0, timestamp_s - float(self.last_orientation_timestamp_s))
+            if dt_s <= 0.0:
+                dt_s = 1.0 / 60.0
+        self.orientation_debug = self.orientation_tracker.update(source_quat_xyzw, dt_s=dt_s)
+        self.last_orientation_timestamp_s = timestamp_s
+        self.orientation_anchor_source_actual = source_actual
+        return np.asarray(self.orientation_debug.cmd_target_quat_wxyz, dtype=np.float32)
 
     def _current_human_pose(self):
         return getattr(self.latest_command, "ee_target", None)
+
+    def _clear_relative_anchor(self) -> None:
+        self.human_anchor_xyz = None
+        self.target_anchor_xyz = None
+        self.target_anchor_quaternion_wxyz = None
+        self.last_orientation_timestamp_s = None
+        self.orientation_anchor_source_actual = None
+        self.orientation_debug = None
 
     def engage_teleop(self) -> None:
         pose = self._current_human_pose()
@@ -1389,8 +1568,8 @@ class _AddSceneNeroTeleopRobot:
             self.last_event = "engage_waiting_for_hand"
             print("[add-scene-vr] engage_waiting_for_hand", flush=True)
             return
-        self.human_anchor_xyz = None
-        self.target_anchor_xyz = None
+        self._clear_relative_anchor()
+        self.beavr_hand_frame_smoother.reset()
         self._target_position(pose)
         self.mode = "engaged"
         self.last_event = "engaged"
@@ -1412,8 +1591,8 @@ class _AddSceneNeroTeleopRobot:
         initial_q = INITIAL_LEFT_ARM_Q if self.arm_side == "left" else INITIAL_RIGHT_ARM_Q
         _set_arm_initial_pose(self.arm, initial_q)
         self.q_state = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
-        self.human_anchor_xyz = None
-        self.target_anchor_xyz = None
+        self._clear_relative_anchor()
+        self.beavr_hand_frame_smoother.reset()
         self.mode = "ready" if self.require_engage else "engaged"
         self.last_event = "recentered"
         _step_scene_with_attached_parts(self.scene)
@@ -1422,8 +1601,8 @@ class _AddSceneNeroTeleopRobot:
     def disengage_teleop(self) -> None:
         self.mode = "ready"
         self.last_event = "disengaged"
-        self.human_anchor_xyz = None
-        self.target_anchor_xyz = None
+        self._clear_relative_anchor()
+        self.beavr_hand_frame_smoother.reset()
         print("[add-scene-vr] disengage_teleop mode=ready", flush=True)
 
     def estop_teleop(self) -> None:
@@ -2182,6 +2361,12 @@ def main() -> None:
     parser.add_argument("--no-linker-hand", action="store_true", help="Do not mount the Linker Hand L10.")
     parser.add_argument("--linker-hand-urdf", type=Path, default=DEFAULT_LINKER_HAND_URDF)
     parser.add_argument("--linker-hand-side", choices=("left", "right"), default=NERO_LINKER_CONFIG.linker_hand_side)
+    parser.add_argument(
+        "--linker-l10-retargeter",
+        choices=("heuristic", "dex_vector", "dex_position", "dex_dexpilot", "l10_adaptive", "holo_layered"),
+        default=os.environ.get("TELEOP_LINKER_L10_RETARGETER", "holo_layered"),
+        help="Linker L10 hand retargeter. Default matches the remote Nero setup: holo_layered.",
+    )
     parser.add_argument("--no-connectors", action="store_true", help="Do not mount connector.STL on the Nero end-effectors.")
     parser.add_argument("--connector-mesh", type=Path, default=DEFAULT_CONNECTOR_MESH)
     parser.add_argument("--connector-scale", type=float, default=DEFAULT_CONNECTOR_SCALE)
@@ -2228,10 +2413,10 @@ def main() -> None:
     parser.add_argument("--vr-isaac-teleop-root", default=None)
     parser.add_argument("--vr-startup-timeout-s", type=float, default=300.0)
     parser.add_argument("--vr-teleop-trace-path", default=None)
-    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(1.0, 1.0, 1.0))
+    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(0.15, 0.15, 0.15))
     parser.add_argument("--vr-workspace-origin-xyz", type=_vec3, default=(0.0, 0.0, 0.0))
-    parser.add_argument("--vr-input-axis-map", type=_parse_axis_map, default=_parse_axis_map("z,x,y"))
-    parser.add_argument("--vr-openxr-coordinate-adapter", choices=("none", "openxr_genesis"), default="none")
+    parser.add_argument("--vr-input-axis-map", type=_parse_axis_map, default=_parse_axis_map("x,y,z"))
+    parser.add_argument("--vr-openxr-coordinate-adapter", choices=("none", "openxr_genesis"), default="openxr_genesis")
     parser.add_argument(
         "--vr-input-source",
         choices=("auto", "quest", "overlay-log"),
@@ -2241,11 +2426,19 @@ def main() -> None:
     parser.add_argument("--vr-overlay-hand-trace-path", type=Path, default=DEFAULT_OVERLAY_HAND_TRACE_PATH)
     parser.add_argument("--vr-overlay-hand-side", choices=("auto", "left", "right"), default="auto")
     parser.add_argument("--vr-overlay-stale-after-s", type=float, default=1.0)
-    parser.add_argument("--vr-use-teleop-orientation", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--vr-use-teleop-orientation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--vr-orientation-source",
-        choices=("wrist_quat", "hand_anatomical_frame", "hand_genesis_wrist_frame"),
-        default="wrist_quat",
+        choices=("wrist_quat", "hand_anatomical_frame", "hand_beavr_anatomical_frame", "hand_genesis_wrist_frame"),
+        default="hand_genesis_wrist_frame",
+    )
+    parser.add_argument("--vr-orientation-axis-map", type=_parse_axis_map, default=DEFAULT_NERO_ORIENTATION_AXIS_MAP)
+    parser.add_argument("--vr-orientation-max-speed-rad-s", type=float, default=3.0)
+    parser.add_argument("--vr-orientation-tool-offset-wxyz", type=_parse_quat4, default=(1.0, 0.0, 0.0, 0.0))
+    parser.add_argument(
+        "--vr-orientation-reference-mode",
+        choices=("world_delta", "tool_local_delta", "calibrated_tool_local"),
+        default="calibrated_tool_local",
     )
     parser.add_argument("--vr-palm-plane-wrist-orientation-blend-alpha", type=float, default=1.0)
     parser.add_argument("--vr-enable-voice-controls", action=argparse.BooleanOptionalAction, default=True)
@@ -2260,6 +2453,7 @@ def main() -> None:
         default=os.environ.get("TELEOP_QUEST_VOICE_UDP_HOST", os.environ.get("TELEOP_VOICE_UDP_HOST", "127.0.0.1")),
     )
     parser.add_argument("--vr-voice-control-port", type=int, default=_default_voice_control_port())
+    parser.add_argument("--vr-xr-status-path", default=None, help="Optional teleop_xr_status.json path used by the VR overlay.")
     parser.add_argument("--vr-disable-synthetic-hands-plugin", action="store_true")
     parser.add_argument(
         "--vr-cloudxr-env-path",
@@ -2277,6 +2471,7 @@ def main() -> None:
         print("[scene] --no-collision ignored: scene.glb is visual-only; table collision uses --no-table-collider.", flush=True)
     if args.dynamic:
         print("[scene] --dynamic ignored: scene.glb stays fixed as the support surface.", flush=True)
+    os.environ["TELEOP_LINKER_L10_RETARGETER"] = str(args.linker_l10_retargeter)
     if args.enable_vr_teleop:
         if args.no_arm_assembly:
             raise SystemExit("--enable-vr-teleop requires the Nero arm assembly. Remove --no-arm-assembly.")
@@ -2362,8 +2557,10 @@ def main() -> None:
     vr_session = None
     vr_robot = None
     voice_policy = None
+    xr_status_publisher = None
     try:
         if args.enable_vr_teleop:
+            xr_status_publisher = XrTeleopStatusPublisher(args.vr_xr_status_path)
             vr_robot = _AddSceneNeroTeleopRobot(
                 scene,
                 arm_side=args.vr_arm_side,
@@ -2373,6 +2570,10 @@ def main() -> None:
                 openxr_coordinate_adapter=args.vr_openxr_coordinate_adapter,
                 use_teleop_orientation=bool(args.vr_use_teleop_orientation),
                 orientation_source=args.vr_orientation_source,
+                orientation_axis_map=args.vr_orientation_axis_map,
+                orientation_max_speed_rad_s=float(args.vr_orientation_max_speed_rad_s),
+                orientation_tool_offset_wxyz=args.vr_orientation_tool_offset_wxyz,
+                orientation_reference_mode=str(args.vr_orientation_reference_mode),
                 relative_control=not args.vr_absolute_control,
                 drive_ik=not args.vr_markers_only,
                 require_engage=bool(args.vr_require_engage),
@@ -2431,6 +2632,11 @@ def main() -> None:
                     )
                 )
                 voice_policy.connect()
+            xr_status_publisher.publish(
+                snapshot=vr_robot.xr_status_snapshot(),
+                lifecycle_event="session_started",
+                force=True,
+            )
             print(
                 f"[add-scene-vr] {vr_input_source} teleop is driving the add_scene_glb assembly. "
                 "Say 开始 to engage, 暂停 to clutch, 继续 to resume, 重置 to recenter, 停止 to hold.",
@@ -2480,8 +2686,16 @@ def main() -> None:
                 _step_scene_with_attached_parts(scene)
             _render_ego_view(scene, ego_view_enabled)
             _render_d405_view(scene, d405_view_enabled)
+            if xr_status_publisher is not None and vr_robot is not None:
+                xr_status_publisher.publish(snapshot=vr_robot.xr_status_snapshot())
             time.sleep(1.0 / 60.0)
     finally:
+        if xr_status_publisher is not None and vr_robot is not None:
+            xr_status_publisher.publish(
+                snapshot=vr_robot.xr_status_snapshot(),
+                lifecycle_event="session_stopped",
+                force=True,
+            )
         if voice_policy is not None:
             voice_policy.disconnect()
         if vr_session is not None:
