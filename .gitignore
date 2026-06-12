@@ -15,4 +15,5 @@ __pycache__/
 *.xacro
 *.urdf
 
-/logs
+/logs/
+/checkpoints/

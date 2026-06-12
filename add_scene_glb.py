@@ -119,6 +119,19 @@ ARM_HOLES_MM = np.asarray(
 DEFAULT_EEF_LINK = "revo2_flange"
 DEFAULT_NERO_ORIENTATION_AXIS_MAP = ("x", "y", "z")
 ARM_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 8))
+POLICY_LINKER_L10_JOINT_NAMES = tuple(ACTIVE_LINKER_L10_JOINTS)
+LINKER_L10_HAND_GAIN_TEMPLATES: dict[str, tuple[float, float]] = {
+    "thumb_cmc_roll": (3000.0, 300.0),
+    "thumb_cmc_yaw": (4000.0, 400.0),
+    "thumb_cmc_pitch": (5000.0, 500.0),
+    "thumb_mcp": (3500.0, 350.0),
+    "thumb_ip": (2500.0, 250.0),
+    "mcp_roll": (2500.0, 250.0),
+    "mcp_pitch": (5000.0, 500.0),
+    "pip": (3000.0, 300.0),
+    "dip": (1800.0, 180.0),
+}
+LINKER_L10_HAND_FORCE_RANGE = 1.0e6
 REVO2_FLANGE_VISUAL_MESH = "package://agx_arm_description/agx_arm_urdf/nero/meshes/dae/revo2_flange.dae"
 REVO2_FLANGE_COLLISION_MESH = "package://agx_arm_description/agx_arm_urdf/nero/meshes/revo2_flange.stl"
 REVO2_FLANGE_JOINT_XYZ = "0.032 0 -0.0235"
@@ -599,6 +612,44 @@ def _set_arm_initial_pose(robot: object, joint_values: tuple[float, ...]) -> Non
     robot.control_dofs_position(values, dofs)
 
 
+def _linker_l10_hand_gains_by_joint() -> dict[str, tuple[float, float]]:
+    gains = {
+        "thumb_cmc_roll": LINKER_L10_HAND_GAIN_TEMPLATES["thumb_cmc_roll"],
+        "thumb_cmc_yaw": LINKER_L10_HAND_GAIN_TEMPLATES["thumb_cmc_yaw"],
+        "thumb_cmc_pitch": LINKER_L10_HAND_GAIN_TEMPLATES["thumb_cmc_pitch"],
+        "thumb_mcp": LINKER_L10_HAND_GAIN_TEMPLATES["thumb_mcp"],
+        "thumb_ip": LINKER_L10_HAND_GAIN_TEMPLATES["thumb_ip"],
+    }
+    for finger in ("index", "middle", "ring", "pinky"):
+        gains[f"{finger}_mcp_roll"] = LINKER_L10_HAND_GAIN_TEMPLATES["mcp_roll"]
+        gains[f"{finger}_mcp_pitch"] = LINKER_L10_HAND_GAIN_TEMPLATES["mcp_pitch"]
+        gains[f"{finger}_pip"] = LINKER_L10_HAND_GAIN_TEMPLATES["pip"]
+        gains[f"{finger}_dip"] = LINKER_L10_HAND_GAIN_TEMPLATES["dip"]
+    return gains
+
+
+def _set_named_dof_gains(robot: object, gains: dict[str, tuple[float, float]], force_range: float) -> None:
+    dofs: list[int] = []
+    kp: list[float] = []
+    kv: list[float] = []
+    lower: list[float] = []
+    upper: list[float] = []
+
+    for joint_name, (joint_kp, joint_kv) in gains.items():
+        joint_dofs = _get_joint_dofs(robot, joint_name)
+        dofs.extend(joint_dofs)
+        kp.extend([float(joint_kp)] * len(joint_dofs))
+        kv.extend([float(joint_kv)] * len(joint_dofs))
+        lower.extend([-float(force_range)] * len(joint_dofs))
+        upper.extend([float(force_range)] * len(joint_dofs))
+
+    if not dofs:
+        return
+    robot.set_dofs_kp(np.asarray(kp, dtype=np.float32), dofs)
+    robot.set_dofs_kv(np.asarray(kv, dtype=np.float32), dofs)
+    robot.set_dofs_force_range(np.asarray(lower, dtype=np.float32), np.asarray(upper, dtype=np.float32), dofs)
+
+
 def _initialize_linker_hand_open_pose(linker_hand: object | None) -> None:
     if linker_hand is None:
         return
@@ -694,6 +745,7 @@ def _initialize_linker_hand_control_info(assembly: dict[str, object]) -> None:
         open_pose = np.zeros(len(dofs), dtype=np.float32)
         linker_hand.set_dofs_position(open_pose, dofs, zero_velocity=True)
         linker_hand.control_dofs_position(open_pose, dofs)
+        _set_named_dof_gains(linker_hand, _linker_l10_hand_gains_by_joint(), LINKER_L10_HAND_FORCE_RANGE)
     print(
         "[add-scene-linker] hand control ready "
         f"side={assembly.get('linker_hand_side', 'right')} "
@@ -742,7 +794,6 @@ def _apply_linker_hand_target(assembly: dict[str, object]) -> None:
         ],
         dtype=np.float32,
     )
-    linker_hand.set_dofs_position(values, dofs, zero_velocity=True)
     linker_hand.control_dofs_position(values, dofs)
 
 
@@ -2046,6 +2097,7 @@ def _add_dual_nero_arm_assembly(
     right_support_hole_z_mm: float = RIGHT_SUPPORT_HOLE_Z_MM,
     base_collision: bool = False,
     arm_collision: bool = False,
+    linker_hand_collision: bool = False,
     add_revo2_flange: bool = True,
     show_hole_markers: bool = False,
 ) -> dict[str, object]:
@@ -2195,8 +2247,8 @@ def _add_dual_nero_arm_assembly(
             gs.morphs.URDF(
                 file=str(_sanitize_relative_mesh_urdf(linker_hand_urdf)),
                 fixed=True,
-                collision=False,
-                convexify=False,
+                collision=bool(linker_hand_collision),
+                convexify=bool(linker_hand_collision),
                 merge_fixed_links=False,
                 prioritize_urdf_material=False,
             ),
@@ -2254,7 +2306,7 @@ def create_scene(
     scale: float | tuple[float, float, float] = 1.0,
     pos: tuple[float, float, float] = (0.0, 0.0, 0.0),
     euler: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    collision: bool = True,
+    collision: bool = False,
     fixed: bool = True,
     add_bottle: bool = True,
     bottle_path: str | Path = DEFAULT_BOTTLE_GLB,
@@ -2286,6 +2338,7 @@ def create_scene(
     d405_camera_gui: bool = DEFAULT_D405_CAMERA_GUI,
     base_collision: bool = False,
     arm_collision: bool = False,
+    linker_hand_collision: bool = False,
     add_revo2_flange: bool = True,
     show_hole_markers: bool = False,
 ) -> tuple[gs.Scene, gs.Entity]:
@@ -2364,7 +2417,7 @@ def create_scene(
             pos=pos,
             euler=euler,
             fixed=fixed,
-            collision=False,
+            collision=bool(collision),
             convexify=False,
             decimate=False,
         ),
@@ -2430,6 +2483,7 @@ def create_scene(
             origin=assembly_origin,
             base_collision=base_collision,
             arm_collision=arm_collision,
+            linker_hand_collision=linker_hand_collision,
             add_revo2_flange=add_revo2_flange,
             show_hole_markers=show_hole_markers,
         )
