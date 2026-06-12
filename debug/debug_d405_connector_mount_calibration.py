@@ -23,6 +23,7 @@ DEFAULT_OUTPUT = ROOT_DIR / "assets" / "d405_right_connector_mount_debug.json"
 DEFAULT_D405_CONNECTOR_REL_POS_M = (0.0, 0.0, 0.0)
 DEFAULT_D405_CONNECTOR_REL_EULER_DEG = (0.0, 0.0, 0.0)
 DEFAULT_D405_CAMERA_LOCAL_POS_RATIO = (0.0, 0.0, 0.5)
+DEFAULT_D405_CAMERA_NEAR_M = 1.0e-4
 DEFAULT_D405_CAMERA_FAR_M = 1.0e6
 
 COARSE_TRANSLATION_RANGE_M = 0.20
@@ -46,7 +47,6 @@ def _load_d405_config(path: Path) -> dict[str, object]:
 
     resolution = data.get("resolution", {})
     fov_degrees = data.get("fov_degrees", {})
-    clipping_range = data.get("clipping_range_m", {})
     return {
         "body_size": body_size,
         "res": (
@@ -54,7 +54,7 @@ def _load_d405_config(path: Path) -> dict[str, object]:
             int(resolution.get("height", 720)),
         ),
         "fov": float(fov_degrees.get("vertical", 58.0)),
-        "near": float(clipping_range.get("near", 0.07)),
+        "near": DEFAULT_D405_CAMERA_NEAR_M,
         "far": DEFAULT_D405_CAMERA_FAR_M,
     }
 

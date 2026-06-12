@@ -79,6 +79,7 @@ D405_BODY_SIZE_FALLBACK = (0.042, 0.042, 0.023)
 RIGHT_D405_CONNECTOR_REL_POS_M = (0.022759, -0.004138, 0.013103)
 RIGHT_D405_CONNECTOR_REL_EULER_DEG = (79.969, 0.0, 0.0)
 D405_CAMERA_LOCAL_POS_RATIO = (0.0, 0.0, 0.5)
+D405_CAMERA_NEAR_M = 1.0e-4
 D405_CAMERA_FAR_M = 1.0e6
 DEFAULT_D405_CAMERA_GUI = True
 SILVER_WHITE_METAL_COLOR = (0.86, 0.88, 0.88, 1.0)
@@ -445,7 +446,6 @@ def _load_d405_config(path: Path) -> dict[str, object]:
         raise ValueError(f"{path} body.body_size_m_xyz must contain three numbers")
     resolution = data.get("resolution", {})
     fov_degrees = data.get("fov_degrees", {})
-    clipping_range = data.get("clipping_range_m", {})
     return {
         "body_size": body_size,
         "res": (
@@ -453,7 +453,7 @@ def _load_d405_config(path: Path) -> dict[str, object]:
             int(resolution.get("height", 720)),
         ),
         "fov": float(fov_degrees.get("vertical", 58.0)),
-        "near": float(clipping_range.get("near", 0.07)),
+        "near": D405_CAMERA_NEAR_M,
         "far": D405_CAMERA_FAR_M,
     }
 

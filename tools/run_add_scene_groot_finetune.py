@@ -26,10 +26,43 @@ DEFAULT_POLICY_CHECKPOINT = ROOT_DIR / "checkpoints" / "finetune" / "checkpoint-
 DEFAULT_COSMOS_MODEL = ROOT_DIR / "checkpoints" / "nvidia" / "Cosmos-Reason2-2B"
 DEFAULT_TASK = "pick up the bottle with green cap and place it in the white rectangle area"
 DEFAULT_IMAGE_SIZE = (224, 224)
+DEFAULT_EGO_ROI_ZOOM = 2.0
+DEFAULT_EGO_ROI_CENTER_X = 0.50
+DEFAULT_EGO_ROI_CENTER_Y = 0.65
 DEFAULT_BOTTLE_POS = (-0.016, 0.32889, 0.82667)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 0.0)
 DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.107143, 0.455357, 0.683036)
 DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE = (0.732777, 0.772043, 0.108854)
+DEFAULT_INITIAL_RIGHT_ARM_Q = (
+    0.2724284429,
+    1.6012174157,
+    1.4535451076,
+    1.2643514167,
+    0.2993937799,
+    -0.0534419817,
+    0.1828232391,
+)
+DEFAULT_INITIAL_LEFT_ARM_Q = (
+    -0.1575159650,
+    1.6297011890,
+    -1.4525677233,
+    1.2456240339,
+    0.0059690260,
+    -0.0214850031,
+    0.1212131166,
+)
+DEFAULT_INITIAL_HAND_Q = (
+    0.113390,
+    0.422158,
+    0.072044,
+    0.034896,
+    0.0,
+    0.0,
+    0.026172,
+    0.0,
+    0.062802,
+    0.0,
+)
 POLICY_HAND_JOINT_NAMES = (
     "thumb_cmc_pitch",
     "thumb_cmc_yaw",
@@ -42,6 +75,12 @@ POLICY_HAND_JOINT_NAMES = (
     "pinky_mcp_roll",
     "thumb_cmc_roll",
 )
+POLICY_HAND_CLIP_LOWER = -0.6
+POLICY_HAND_CLIP_UPPER = 1.6
+L10_HAND_ACTIVE_LOCAL_INDICES = (0, 2, 3, 4, 5, 9)
+L10_HAND_MASKED_LOCAL_INDICES = (1, 6, 7, 8)
+DEFAULT_IK_J4_LIMIT_RAD = (0.0, 2.14)
+DEFAULT_POLICY_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_policy_debug.jsonl"
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -57,6 +96,36 @@ def _vec3(text: str) -> tuple[float, float, float]:
         return tuple(float(part) for part in parts)  # type: ignore[return-value]
     except ValueError as exc:
         raise argparse.ArgumentTypeError("expected numeric x,y,z") from exc
+
+
+def _vec2(text: str) -> tuple[float, float]:
+    parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected a,b")
+    try:
+        return tuple(float(part) for part in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected numeric a,b") from exc
+
+
+def _vec7(text: str) -> tuple[float, ...]:
+    parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
+    if len(parts) != 7:
+        raise argparse.ArgumentTypeError("expected 7 comma-separated numbers")
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
+
+
+def _vec10(text: str) -> tuple[float, ...]:
+    parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
+    if len(parts) != 10:
+        raise argparse.ArgumentTypeError("expected 10 comma-separated numbers")
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
 
 
 def _image_size(text: str) -> tuple[int, int]:
@@ -117,7 +186,32 @@ def _resize_one_with_pad(image: Image.Image, height: int, width: int) -> np.ndar
     return np.asarray(output)
 
 
-def _as_hwc_uint8(value: Any, *, image_size: tuple[int, int]) -> np.ndarray:
+def _roi_crop_zoom_hwc(image: np.ndarray, *, zoom: float, center_x: float, center_y: float) -> np.ndarray:
+    zoom = float(zoom)
+    if zoom <= 1.0:
+        return image
+    height, width = image.shape[:2]
+    if height <= 0 or width <= 0:
+        return image
+    center_x = min(max(float(center_x), 0.0), 1.0)
+    center_y = min(max(float(center_y), 0.0), 1.0)
+    crop_width = max(1, min(width, int(round(width / zoom))))
+    crop_height = max(1, min(height, int(round(height / zoom))))
+    crop_x = int(round(center_x * width - crop_width / 2.0))
+    crop_y = int(round(center_y * height - crop_height / 2.0))
+    crop_x = min(max(0, crop_x), max(0, width - crop_width))
+    crop_y = min(max(0, crop_y), max(0, height - crop_height))
+    return image[crop_y : crop_y + crop_height, crop_x : crop_x + crop_width]
+
+
+def _as_hwc_uint8(
+    value: Any,
+    *,
+    image_size: tuple[int, int],
+    roi_zoom: float = 1.0,
+    roi_center_x: float = 0.5,
+    roi_center_y: float = 0.5,
+) -> np.ndarray:
     if value is None:
         return np.zeros((*image_size, 3), dtype=np.uint8)
     image = _tensor_to_np(value)
@@ -144,10 +238,19 @@ def _as_hwc_uint8(value: Any, *, image_size: tuple[int, int]) -> np.ndarray:
         if max_value <= 1.0:
             image = image * 255.0
         image = np.clip(image, 0, 255)
-    return _resize_with_pad(image.astype(np.uint8, copy=False), image_size[0], image_size[1])
+    image = image.astype(np.uint8, copy=False)
+    image = _roi_crop_zoom_hwc(image, zoom=roi_zoom, center_x=roi_center_x, center_y=roi_center_y)
+    return _resize_with_pad(image, image_size[0], image_size[1])
 
 
-def _render_camera_rgb(camera: object | None, *, image_size: tuple[int, int]) -> np.ndarray:
+def _render_camera_rgb(
+    camera: object | None,
+    *,
+    image_size: tuple[int, int],
+    roi_zoom: float = 1.0,
+    roi_center_x: float = 0.5,
+    roi_center_y: float = 0.5,
+) -> np.ndarray:
     if camera is None:
         return np.zeros((*image_size, 3), dtype=np.uint8)
     try:
@@ -161,7 +264,13 @@ def _render_camera_rgb(camera: object | None, *, image_size: tuple[int, int]) ->
         rendered = rendered.get("rgb", rendered.get("color", rendered.get("image")))
     elif isinstance(rendered, (tuple, list)):
         rendered = rendered[0] if rendered else None
-    return _as_hwc_uint8(rendered, image_size=image_size)
+    return _as_hwc_uint8(
+        rendered,
+        image_size=image_size,
+        roi_zoom=roi_zoom,
+        roi_center_x=roi_center_x,
+        roi_center_y=roi_center_y,
+    )
 
 
 def _bottle_panel_main(initial_values, values, policy_running, sim_running, reset_counter, stop_flag) -> None:
@@ -390,6 +499,78 @@ class ConsoleController:
                 print(f"[console] unknown command: {command}", flush=True)
 
 
+class CameraPreview:
+    def __init__(self, *, enabled: bool, scale: int = 2) -> None:
+        self.enabled = bool(enabled)
+        self.scale = max(1, int(scale))
+        self._cv2 = None
+        self._available = False
+        self._warned = False
+        self._windows = ("GR00T ego_view model input", "GR00T wrist_view model input")
+
+    def _ensure(self) -> bool:
+        if not self.enabled:
+            return False
+        if self._available:
+            return True
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            if not self._warned:
+                print("[camera-preview] disabled: DISPLAY/WAYLAND_DISPLAY is not set", flush=True)
+                self._warned = True
+            self.enabled = False
+            return False
+        try:
+            import cv2  # type: ignore[import-not-found]
+        except Exception as exc:
+            if not self._warned:
+                print(f"[camera-preview] disabled: failed to import cv2: {exc}", flush=True)
+                self._warned = True
+            self.enabled = False
+            return False
+        self._cv2 = cv2
+        try:
+            for name in self._windows:
+                cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+        except Exception as exc:
+            if not self._warned:
+                print(f"[camera-preview] disabled: failed to create OpenCV windows: {exc}", flush=True)
+                self._warned = True
+            self.enabled = False
+            return False
+        self._available = True
+        print("[camera-preview] showing ego_view and wrist_view model inputs; press q in a preview window to close previews", flush=True)
+        return True
+
+    def show(self, *, ego: np.ndarray, wrist: np.ndarray) -> None:
+        if not self._ensure():
+            return
+        assert self._cv2 is not None
+        cv2 = self._cv2
+        for name, image in ((self._windows[0], ego), (self._windows[1], wrist)):
+            frame = np.asarray(image)
+            if frame.ndim != 3 or frame.shape[-1] != 3:
+                continue
+            if self.scale > 1:
+                height, width = frame.shape[:2]
+                frame = cv2.resize(frame, (width * self.scale, height * self.scale), interpolation=cv2.INTER_NEAREST)
+            cv2.imshow(name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord("q"), 27):
+            self.close()
+            self.enabled = False
+            print("[camera-preview] closed", flush=True)
+
+    def close(self) -> None:
+        if not self._available or self._cv2 is None:
+            return
+        for name in self._windows:
+            try:
+                self._cv2.destroyWindow(name)
+            except Exception:
+                pass
+        self._available = False
+
+
 class Gr00tObservationBuilder:
     def __init__(
         self,
@@ -465,8 +646,17 @@ class RightArmPolicyExecutor:
         scene: object,
         *,
         max_joint_step: float,
+        ik_solver_max_joint_step: float,
+        min_joint_step: float,
+        pos_tol: float,
+        ik_j4_limit: bool,
+        ik_j4_limit_rad: tuple[float, float],
         workspace_min: tuple[float, float, float],
         workspace_max: tuple[float, float, float],
+        print_hand_every: int,
+        initial_hand_q: tuple[float, ...],
+        initial_right_arm_q: tuple[float, ...],
+        initial_left_arm_q: tuple[float, ...],
     ) -> None:
         self.scene = scene
         assembly = getattr(scene, "nero_assembly_info", None)
@@ -474,28 +664,86 @@ class RightArmPolicyExecutor:
             raise RuntimeError("Scene does not contain Nero assembly")
         self.assembly = assembly
         self.arm = assembly["right"]
+        self.left_arm = assembly.get("left")
         self.eef_link = self.arm.get_link(str(assembly.get("eef_link", harness.DEFAULT_EEF_LINK)))
         self.arm_dofs = harness._arm_dofs(self.arm)  # noqa: SLF001
         self.max_joint_step = float(max_joint_step)
+        self.ik_solver_max_joint_step = float(ik_solver_max_joint_step)
+        self.min_joint_step = max(float(min_joint_step), 0.0)
+        self.pos_tol = float(pos_tol)
+        self.ik_j4_limit = bool(ik_j4_limit)
+        self.ik_j4_limit_rad = tuple(float(v) for v in ik_j4_limit_rad)
         self.workspace_min = np.asarray(workspace_min, dtype=np.float64)
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64)
+        self.initial_right_arm_q = np.asarray(initial_right_arm_q, dtype=np.float32).reshape(7)
+        self.initial_left_arm_q = np.asarray(initial_left_arm_q, dtype=np.float32).reshape(7)
+        self._ik_joint_limit_hit_count = 0
+        self.reset_generation = 0
+        self.initial_hand_q = self._clip_policy_hand_q(np.asarray(initial_hand_q, dtype=np.float32))
+        self.policy_hand_q_raw = self.initial_hand_q.copy()
+        self.reference_hand_q = self.initial_hand_q.copy()
+        self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
+        self.hand_q = self.sim_hand_q.copy()
+        self._set_initial_arm_poses()
         self.q_cmd = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
-        self.hand_q = np.zeros(10, dtype=np.float32)
         self.target_rotation = self.current_eef_pose()[:3, :3].copy()
         self.target_xyz = self.current_eef_pose()[:3, 3].copy()
         self._hand_target_print_count = 0
+        self.print_hand_every = int(print_hand_every)
+        print(
+            "[policy-ik] "
+            f"eef_link={getattr(self.eef_link, 'name', 'revo2_flange')} "
+            f"max_joint_step={self.max_joint_step:.4f} "
+            f"ik_solver_max_joint_step={self.ik_solver_max_joint_step:.4f} "
+            f"min_joint_step={self.min_joint_step:.4f} "
+            f"pos_tol={self.pos_tol:.1e} "
+            f"ik_j4_limit={self.ik_j4_limit} range={self.ik_j4_limit_rad}",
+            flush=True,
+        )
+        print(
+            "[policy-ik] initial_right_arm_q="
+            + str(tuple(round(float(v), 6) for v in self.initial_right_arm_q)),
+            flush=True,
+        )
         print(f"[policy-hand] canonical_order={POLICY_HAND_JOINT_NAMES}", flush=True)
+        print(
+            "[policy-hand] gr00t_l10_groups "
+            f"active={tuple(POLICY_HAND_JOINT_NAMES[idx] for idx in L10_HAND_ACTIVE_LOCAL_INDICES)} "
+            f"masked={tuple(POLICY_HAND_JOINT_NAMES[idx] for idx in L10_HAND_MASKED_LOCAL_INDICES)} "
+            f"policy_clip=({POLICY_HAND_CLIP_LOWER}, {POLICY_HAND_CLIP_UPPER})",
+            flush=True,
+        )
+        print(
+            "[policy-hand] initial_reference="
+            + str(
+                {
+                    name: round(float(value), 4)
+                    for name, value in zip(POLICY_HAND_JOINT_NAMES, self.reference_hand_q, strict=False)
+                }
+            ),
+            flush=True,
+        )
+        self._apply_linker_hand_target()
+        harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
+        self._freeze_target_at_current_eef()
+        self._warmup_ik()
+        self._hand_target_print_count = 0
 
     def reset(self) -> None:
-        harness._set_arm_initial_pose(self.arm, harness.INITIAL_RIGHT_ARM_Q)  # noqa: SLF001
+        self._set_initial_arm_poses()
         self.q_cmd = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
-        self.target_rotation = self.current_eef_pose()[:3, :3].copy()
-        self.target_xyz = self.current_eef_pose()[:3, 3].copy()
-        self.hand_q = np.zeros(10, dtype=np.float32)
+        self.policy_hand_q_raw = self.initial_hand_q.copy()
+        self.reference_hand_q = self.initial_hand_q.copy()
+        self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
+        self.hand_q = self.sim_hand_q.copy()
+        self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
+        self._freeze_target_at_current_eef()
+        self._warmup_ik()
+        self.reset_generation += 1
 
     def current_arm_q(self) -> np.ndarray:
-        return _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
+        return self.q_cmd.astype(np.float32, copy=True)
 
     def current_eef_pose(self) -> np.ndarray:
         pos = _tensor_to_np(self.eef_link.get_pos()).reshape(3).astype(np.float64)
@@ -511,9 +759,12 @@ class RightArmPolicyExecutor:
         arm_joint_target[: min(7, self.q_cmd.size)] = self.q_cmd[: min(7, self.q_cmd.size)]
         return {
             "eef_9d": eef_9d[None, :],
-            "hand_joint_target": self.hand_q[:10][None, :].astype(np.float32),
+            "hand_joint_target": self.reference_hand_q[:10][None, :].astype(np.float32),
             "arm_joint_target": arm_joint_target[None, :],
         }
+
+    def current_observation_hand_q(self) -> np.ndarray:
+        return self.sim_hand_q[:10].astype(np.float32, copy=True)
 
     def step_action(self, action: dict[str, np.ndarray], action_index: int) -> None:
         applied_hand = False
@@ -528,38 +779,113 @@ class RightArmPolicyExecutor:
             self._apply_joint_target(self._action_step(action["arm_joint_target"], action_index))
 
         if "hand_joint_target" in action:
-            self.hand_q = self._clip_hand_q(self._action_step(action["hand_joint_target"], action_index)[:10])
+            self.policy_hand_q_raw = np.asarray(
+                self._action_step(action["hand_joint_target"], action_index)[:10],
+                dtype=np.float32,
+            )
+            self.reference_hand_q = self._clip_policy_hand_q(self.policy_hand_q_raw)
+            self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
+            self.hand_q = self.sim_hand_q.copy()
             self._apply_linker_hand_target()
             applied_hand = True
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
-        if applied_hand and (self._hand_target_print_count == 1 or self._hand_target_print_count % 10 == 0):
+        if applied_hand and self._should_print_hand():
             print(f"[policy-hand] actual_after_step={self._current_linker_hand_positions()}", flush=True)
 
-    def clip_action_chunk_for_execution(self, action: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], float]:
-        clipped = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+    def hand_policy_clip_delta(self, action: dict[str, np.ndarray]) -> float:
         max_delta = 0.0
-        if "hand_joint_target" in clipped:
-            original = clipped["hand_joint_target"].copy()
-            hand = clipped["hand_joint_target"]
-            flat = hand.reshape(-1, hand.shape[-1])
+        if "hand_joint_target" in action:
+            hand = np.asarray(action["hand_joint_target"], dtype=np.float32)
+            clipped = hand.copy()
+            flat = clipped.reshape(-1, clipped.shape[-1])
             for row_idx in range(flat.shape[0]):
-                flat[row_idx, :10] = self._clip_hand_q(flat[row_idx, :10])
-            max_delta = max(max_delta, float(np.max(np.abs(clipped["hand_joint_target"] - original))))
-        return clipped, max_delta
+                flat[row_idx, :10] = self._clip_policy_hand_q(flat[row_idx, :10])
+            max_delta = max(max_delta, float(np.max(np.abs(clipped - hand))))
+        return max_delta
 
-    def _clip_hand_q(self, hand_q: np.ndarray) -> np.ndarray:
+    def probe_clip_action_chunk(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        clipped = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        if "hand_joint_target" not in clipped:
+            return clipped
+        hand = clipped["hand_joint_target"]
+        if hand.ndim < 2 or hand.shape[-1] < 10:
+            return clipped
+        flat = hand.reshape(-1, hand.shape[-1])
+        for row_idx in range(flat.shape[0]):
+            flat[row_idx, :10] = self._clip_policy_hand_q(flat[row_idx, :10])
+        return clipped
+
+    def sim_project_action_chunk(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        projected = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        if "hand_joint_target" not in projected:
+            return projected
+        hand = projected["hand_joint_target"]
+        if hand.ndim < 2 or hand.shape[-1] < 10:
+            return projected
+        flat = hand.reshape(-1, hand.shape[-1])
+        for row_idx in range(flat.shape[0]):
+            flat[row_idx, :10] = self._project_hand_q_for_sim(flat[row_idx, :10])
+        return projected
+
+    def hand_debug_snapshot(
+        self,
+        *,
+        policy_action_chunk: dict[str, np.ndarray],
+        clipped_action_chunk: dict[str, np.ndarray],
+        reference_action: dict[str, np.ndarray],
+        rtc_seed_action: dict[str, np.ndarray] | None,
+        reference_action_source: str,
+        observation_hand_q: np.ndarray,
+    ) -> dict[str, Any]:
+        raw_hand = _first_batch_chunk(policy_action_chunk, "hand_joint_target") if "hand_joint_target" in policy_action_chunk else None
+        clipped_hand = (
+            _first_batch_chunk(clipped_action_chunk, "hand_joint_target") if "hand_joint_target" in clipped_action_chunk else None
+        )
+        sim_hand = (
+            _first_batch_chunk(self.sim_project_action_chunk(clipped_action_chunk), "hand_joint_target")
+            if "hand_joint_target" in clipped_action_chunk
+            else None
+        )
+        reference_hand = np.asarray(reference_action.get("hand_joint_target", self.reference_hand_q[None, :]), dtype=np.float32)
+        rtc_seed_hand = None
+        if rtc_seed_action is not None and "hand_joint_target" in rtc_seed_action:
+            rtc_seed_hand = _first_batch_chunk(rtc_seed_action, "hand_joint_target")[:1]
+        return {
+            "reference_hand_source": str(reference_action_source),
+            "policy_raw_unclipped": _hand_chunk_debug(raw_hand),
+            "policy_clipped_probe_range": _hand_chunk_debug(clipped_hand),
+            "sim_hand_projected_range": _hand_chunk_debug(sim_hand),
+            "reference_hand_first": _named_hand_values(reference_hand.reshape(-1)[:10]),
+            "rtc_seed_hand_first": None if rtc_seed_hand is None else _named_hand_values(rtc_seed_hand.reshape(-1)[:10]),
+            "observation_hand_state": _named_hand_values(observation_hand_q),
+            "executor_reference_hand": _named_hand_values(self.reference_hand_q),
+            "executor_sim_hand": _named_hand_values(self.sim_hand_q),
+            "negative_floor_warning": _negative_floor_warning(clipped_hand),
+        }
+
+    def _clip_policy_hand_q(self, hand_q: np.ndarray) -> np.ndarray:
         values = np.asarray(hand_q, dtype=np.float32).reshape(-1)[:10].copy()
         if values.size < 10:
             padded = np.zeros(10, dtype=np.float32)
             padded[: values.size] = values
             values = padded
-        limits = self.assembly.get("linker_hand_joint_limits_by_name", {})
-        for idx, name in enumerate(POLICY_HAND_JOINT_NAMES):
-            lower, upper = (-0.6, 1.6)
-            if isinstance(limits, dict) and name in limits:
-                lower, upper = limits[name]
-            values[idx] = float(np.clip(values[idx], float(lower), float(upper)))
+        values = np.clip(values, POLICY_HAND_CLIP_LOWER, POLICY_HAND_CLIP_UPPER)
         return values.astype(np.float32, copy=False)
+
+    def _project_hand_q_for_sim(self, hand_q: np.ndarray) -> np.ndarray:
+        values = self._clip_policy_hand_q(hand_q)
+        limits_by_name = self.assembly.get("linker_hand_joint_limits_by_name", {})
+        if not isinstance(limits_by_name, dict):
+            limits_by_name = {}
+        projected = values.copy()
+        for idx, name in enumerate(POLICY_HAND_JOINT_NAMES):
+            limit = limits_by_name.get(name)
+            if isinstance(limit, (tuple, list)) and len(limit) == 2:
+                lower, upper = float(limit[0]), float(limit[1])
+            else:
+                lower, upper = 0.0, POLICY_HAND_CLIP_UPPER
+            projected[idx] = float(np.clip(projected[idx], lower, upper))
+        return projected.astype(np.float32, copy=False)
 
     @staticmethod
     def _action_step(value: np.ndarray, index: int) -> np.ndarray:
@@ -577,6 +903,8 @@ class RightArmPolicyExecutor:
             dtype=np.float32,
         )
         qpos_init = _tensor_to_np(self.arm.get_qpos()).reshape(-1).astype(np.float32)
+        qpos_init[self.arm_dofs] = self.q_cmd
+        qpos_init = self._apply_ik_joint4_search_limit(qpos_init)
         try:
             qpos, error = self.arm.inverse_kinematics(
                 link=self.eef_link,
@@ -587,18 +915,22 @@ class RightArmPolicyExecutor:
                 max_samples=1,
                 max_solver_iters=32,
                 damping=0.02,
-                pos_tol=1e-3,
-                max_step_size=self.max_joint_step,
+                pos_tol=self.pos_tol,
+                max_step_size=self.ik_solver_max_joint_step,
                 return_error=True,
             )
-            solved = _tensor_to_np(qpos).reshape(-1)[self.arm_dofs].astype(np.float32)
+            limited_qpos = self._apply_ik_joint4_search_limit(_tensor_to_np(qpos).reshape(-1).astype(np.float32))
+            solved = limited_qpos[self.arm_dofs].astype(np.float32)
             dq = np.clip(solved - self.q_cmd, -self.max_joint_step, self.max_joint_step)
+            if self.min_joint_step > 0.0:
+                dq = np.where(np.abs(dq) < self.min_joint_step, 0.0, dq)
             self.q_cmd = self.q_cmd + dq
             self.arm.set_dofs_position(self.q_cmd, self.arm_dofs, zero_velocity=True)
             self.arm.control_dofs_position(self.q_cmd, self.arm_dofs)
             err = tuple(round(float(v), 5) for v in _tensor_to_np(error).reshape(-1))
             print(
-                f"[policy-step] eef_target={tuple(round(float(v), 4) for v in self.target_xyz)} ik_error={err}",
+                f"[policy-step] eef_target={tuple(round(float(v), 4) for v in self.target_xyz)} "
+                f"ik_error={err} ik_seed_source=command_q_state",
                 flush=True,
             )
         except Exception as exc:
@@ -609,6 +941,8 @@ class RightArmPolicyExecutor:
             return
         target_q = np.asarray(joint_target[:7], dtype=np.float32)
         dq = np.clip(target_q - self.q_cmd, -self.max_joint_step, self.max_joint_step)
+        if self.min_joint_step > 0.0:
+            dq = np.where(np.abs(dq) < self.min_joint_step, 0.0, dq)
         self.q_cmd = self.q_cmd + dq
         self.arm.set_dofs_position(self.q_cmd, self.arm_dofs, zero_velocity=True)
         self.arm.control_dofs_position(self.q_cmd, self.arm_dofs)
@@ -625,13 +959,76 @@ class RightArmPolicyExecutor:
                 self.joint_positions = tuple(float(v) for v in values[: len(names)])
 
         self._hand_target_print_count += 1
-        if self._hand_target_print_count == 1 or self._hand_target_print_count % 10 == 0:
-            named = {
-                name: round(float(value), 4)
-                for name, value in zip(joint_names, self.hand_q[: len(joint_names)], strict=False)
-            }
-            print(f"[policy-hand] target={named}", flush=True)
-        harness._set_linker_hand_target(self.assembly, "right", _HandTarget(joint_names, self.hand_q))  # noqa: SLF001
+        if self._should_print_hand():
+            print(
+                f"[policy-hand] target={_named_hand_values(self.reference_hand_q)} "
+                f"sim={_named_hand_values(self.sim_hand_q)}",
+                flush=True,
+            )
+        harness._set_linker_hand_target(self.assembly, "right", _HandTarget(joint_names, self.sim_hand_q))  # noqa: SLF001
+
+    def _set_initial_arm_poses(self) -> None:
+        harness._set_arm_initial_pose(self.arm, self.initial_right_arm_q)  # noqa: SLF001
+        if self.left_arm is not None:
+            try:
+                harness._set_arm_initial_pose(self.left_arm, self.initial_left_arm_q)  # noqa: SLF001
+            except Exception as exc:
+                print(f"[policy-ik] left initial pose skipped: {exc}", flush=True)
+
+    def _freeze_target_at_current_eef(self) -> None:
+        pose = self.current_eef_pose()
+        self.target_rotation = pose[:3, :3].copy()
+        self.target_xyz = pose[:3, 3].copy()
+
+    def _warmup_ik(self) -> None:
+        qpos_init = _tensor_to_np(self.arm.get_qpos()).reshape(-1).astype(np.float32)
+        qpos_init[self.arm_dofs] = self.q_cmd
+        qpos_init = self._apply_ik_joint4_search_limit(qpos_init)
+        target_quat = np.asarray(_rotation_to_quat_xyzw(self.target_rotation), dtype=np.float32)
+        target_quat_wxyz = np.asarray((target_quat[3], target_quat[0], target_quat[1], target_quat[2]), dtype=np.float32)
+        started = time.perf_counter()
+        try:
+            self.arm.inverse_kinematics(
+                link=self.eef_link,
+                pos=self.target_xyz.astype(np.float32),
+                quat=target_quat_wxyz,
+                init_qpos=qpos_init,
+                dofs_idx_local=self.arm_dofs,
+                max_samples=1,
+                max_solver_iters=32,
+                damping=0.02,
+                pos_tol=self.pos_tol,
+                max_step_size=self.ik_solver_max_joint_step,
+                return_error=True,
+            )
+            print(f"[policy-ik] warmup_s={time.perf_counter() - started:.4f}", flush=True)
+        except Exception as exc:
+            print(f"[policy-ik] warmup failed: {exc}", flush=True)
+
+    def _apply_ik_joint4_search_limit(self, qpos: np.ndarray) -> np.ndarray:
+        limited = np.asarray(qpos, dtype=np.float32).copy()
+        if not self.ik_j4_limit or len(self.arm_dofs) < 4:
+            return limited
+        dof_index = int(self.arm_dofs[3])
+        lower, upper = (float(v) for v in self.ik_j4_limit_rad)
+        if lower > upper:
+            lower, upper = upper, lower
+        before = float(limited[dof_index])
+        after = float(np.clip(before, lower, upper))
+        if before != after:
+            limited[dof_index] = after
+            self._ik_joint_limit_hit_count += 1
+            if self._ik_joint_limit_hit_count == 1 or self._ik_joint_limit_hit_count % 60 == 0:
+                print(
+                    f"[policy-ik] joint4_limit before={before:+.3f} after={after:+.3f} "
+                    f"range=({lower:+.3f},{upper:+.3f})",
+                    flush=True,
+                )
+        return limited
+
+    def _should_print_hand(self) -> bool:
+        every = int(self.print_hand_every)
+        return every > 0 and (self._hand_target_print_count == 1 or self._hand_target_print_count % every == 0)
 
     def _current_linker_hand_positions(self) -> dict[str, float]:
         linker_hand = self.assembly.get("linker_hand")
@@ -655,6 +1052,77 @@ class RightArmPolicyExecutor:
             for name in POLICY_HAND_JOINT_NAMES
             if name in by_name
         }
+
+
+def _named_hand_values(values: np.ndarray) -> dict[str, float]:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    return {
+        name: round(float(value), 4)
+        for name, value in zip(POLICY_HAND_JOINT_NAMES, arr[: len(POLICY_HAND_JOINT_NAMES)], strict=False)
+    }
+
+
+def _hand_chunk_debug(values: np.ndarray | None) -> dict[str, object] | None:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    if arr.ndim != 2 or arr.shape[-1] < len(POLICY_HAND_JOINT_NAMES):
+        return {"shape": list(arr.shape)}
+    return {
+        "shape": list(arr.shape),
+        "first": _named_hand_values(arr[0, :10]),
+        "range": {
+            name: [
+                round(float(np.min(arr[:, idx])), 4),
+                round(float(np.max(arr[:, idx])), 4),
+            ]
+            for idx, name in enumerate(POLICY_HAND_JOINT_NAMES)
+        },
+    }
+
+
+def _negative_floor_warning(values: np.ndarray | None) -> dict[str, object]:
+    if values is None:
+        return {"active": False}
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    watched = ("middle_mcp_pitch", "ring_mcp_pitch", "pinky_mcp_pitch")
+    hits = {}
+    for name in watched:
+        idx = POLICY_HAND_JOINT_NAMES.index(name)
+        if arr.ndim == 2 and arr.shape[-1] > idx:
+            hits[name] = bool(np.any(arr[:, idx] <= POLICY_HAND_CLIP_LOWER + 1.0e-5))
+    return {"active": any(hits.values()), "hits": hits}
+
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _append_jsonl(path: Path | None, row: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(_jsonable(row), ensure_ascii=False, sort_keys=True) + "\n")
 
 
 class DryRunPolicy:
@@ -1407,6 +1875,24 @@ def main() -> int:
     parser.add_argument("--no-policy-strict", action="store_true")
     parser.add_argument("--instruction", default=DEFAULT_TASK)
     parser.add_argument("--image-size", type=_image_size, default=DEFAULT_IMAGE_SIZE, help="Model image height,width.")
+    parser.add_argument(
+        "--ego-roi-zoom",
+        type=float,
+        default=DEFAULT_EGO_ROI_ZOOM,
+        help="D455 ego_view center-crop digital zoom. Use 1.0 to disable; default matches remote RealSense collection.",
+    )
+    parser.add_argument(
+        "--ego-roi-center-x",
+        type=float,
+        default=DEFAULT_EGO_ROI_CENTER_X,
+        help="D455 ego_view ROI center X in normalized image coordinates.",
+    )
+    parser.add_argument(
+        "--ego-roi-center-y",
+        type=float,
+        default=DEFAULT_EGO_ROI_CENTER_Y,
+        help="D455 ego_view ROI center Y in normalized image coordinates.",
+    )
     parser.add_argument("--policy-hz", type=float, default=2.0)
     parser.add_argument(
         "--wall-clock-replan",
@@ -1421,11 +1907,31 @@ def main() -> int:
     parser.add_argument("--rtc-max-overlap-steps", type=int, default=None)
     parser.add_argument("--rtc-frozen-steps", type=int, default=4)
     parser.add_argument("--rtc-ramp-rate", type=float, default=20.0)
-    parser.add_argument("--max-joint-step", type=float, default=0.035)
+    parser.add_argument("--max-joint-step", type=float, default=0.045)
+    parser.add_argument("--ik-solver-max-joint-step", type=float, default=0.045)
+    parser.add_argument("--min-joint-step", type=float, default=0.001)
+    parser.add_argument("--ik-pos-tol", type=float, default=1e-3)
+    parser.add_argument("--ik-j4-limit", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ik-j4-limit-rad", type=_vec2, default=DEFAULT_IK_J4_LIMIT_RAD)
+    parser.add_argument(
+        "--print-hand-every",
+        type=int,
+        default=1,
+        help="Print L10 hand target/actual every N executed policy steps; 0 disables hand step logs.",
+    )
     parser.add_argument("--workspace-min", type=_vec3, default=(-0.75, -0.55, 0.30))
     parser.add_argument("--workspace-max", type=_vec3, default=(0.25, 0.55, 1.10))
     parser.add_argument("--bottle-pos", type=_vec3, default=DEFAULT_BOTTLE_POS)
     parser.add_argument("--bottle-euler", type=_vec3, default=DEFAULT_BOTTLE_EULER)
+    parser.add_argument(
+        "--initial-hand-q",
+        type=_vec10,
+        default=DEFAULT_INITIAL_HAND_Q,
+        help="Initial 10D L10 hand target in GR00T canonical order; defaults to the remote Teleop open pose.",
+    )
+    parser.add_argument("--initial-right-arm-q", type=_vec7, default=DEFAULT_INITIAL_RIGHT_ARM_Q)
+    parser.add_argument("--initial-left-arm-q", type=_vec7, default=DEFAULT_INITIAL_LEFT_ARM_Q)
+    parser.add_argument("--policy-debug-jsonl", type=Path, default=DEFAULT_POLICY_DEBUG_JSONL)
     parser.add_argument("--scene-support-collider-pos", type=_vec3, default=DEFAULT_SCENE_SUPPORT_COLLIDER_POS)
     parser.add_argument("--scene-support-collider-size", type=_vec3, default=DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE)
     parser.add_argument(
@@ -1436,11 +1942,24 @@ def main() -> int:
     parser.add_argument("--show-scene-support-collider", action="store_true")
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--no-bottle-panel", action="store_true", help="Do not open the bottle Tk control window.")
+    parser.add_argument(
+        "--camera-preview",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show ego_view and wrist_view model input windows while policy inference is running.",
+    )
+    parser.add_argument("--camera-preview-scale", type=int, default=2, help="Integer scale for camera preview windows.")
     parser.add_argument("--start-policy", action="store_true", help="Start policy inference immediately.")
     parser.add_argument("--max-steps", type=int, default=0, help="Stop after this many policy action steps; 0 means no limit.")
     args = parser.parse_args()
 
     image_size = tuple(int(v) for v in args.image_size)
+    if float(args.ego_roi_zoom) < 1.0:
+        raise SystemExit(f"--ego-roi-zoom must be >= 1.0, got {args.ego_roi_zoom}")
+    if not 0.0 <= float(args.ego_roi_center_x) <= 1.0:
+        raise SystemExit(f"--ego-roi-center-x must be in [0, 1], got {args.ego_roi_center_x}")
+    if not 0.0 <= float(args.ego_roi_center_y) <= 1.0:
+        raise SystemExit(f"--ego-roi-center-y must be in [0, 1], got {args.ego_roi_center_y}")
     policy = _make_policy(args)
     modality_config = policy.get_modality_config()
     _validate_policy_video_schema(modality_config)
@@ -1470,11 +1989,27 @@ def main() -> int:
         linker_hand_collision=True,
     )
     ego_camera, wrist_camera = _create_policy_cameras(scene, image_size=image_size)
+    print(
+        "[camera] ego_view_roi "
+        f"zoom={float(args.ego_roi_zoom):.2f} "
+        f"center=({float(args.ego_roi_center_x):.2f}, {float(args.ego_roi_center_y):.2f}) "
+        "source=remote_realsense_collection",
+        flush=True,
+    )
     executor = RightArmPolicyExecutor(
         scene,
         max_joint_step=float(args.max_joint_step),
+        ik_solver_max_joint_step=float(args.ik_solver_max_joint_step),
+        min_joint_step=float(args.min_joint_step),
+        pos_tol=float(args.ik_pos_tol),
+        ik_j4_limit=bool(args.ik_j4_limit),
+        ik_j4_limit_rad=args.ik_j4_limit_rad,
         workspace_min=args.workspace_min,
         workspace_max=args.workspace_max,
+        print_hand_every=int(args.print_hand_every),
+        initial_hand_q=args.initial_hand_q,
+        initial_right_arm_q=args.initial_right_arm_q,
+        initial_left_arm_q=args.initial_left_arm_q,
     )
     obs_builder = Gr00tObservationBuilder(
         modality_config=modality_config,
@@ -1500,6 +2035,7 @@ def main() -> int:
     console.start()
     if console.policy_running:
         print("[policy] inference starts immediately because --start-policy was set", flush=True)
+    camera_preview = CameraPreview(enabled=bool(args.camera_preview), scale=int(args.camera_preview_scale))
     action_chunk: dict[str, np.ndarray] | None = None
     action_keys = list(modality_config["action"].modality_keys)
     action_horizon = len(modality_config["action"].delta_indices)
@@ -1515,12 +2051,19 @@ def main() -> int:
     last_panel_pose: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
     last_reset_counter = -1
     step_count = 0
+    last_executor_reset_generation = int(executor.reset_generation)
 
     try:
         while bool(args.no_viewer) or scene.viewer.is_alive():
             console.update(executor)
             if console.quit_requested:
                 break
+            if int(executor.reset_generation) != last_executor_reset_generation:
+                action_chunk = None
+                action_index = 0
+                seed_manager.clear()
+                last_executor_reset_generation = int(executor.reset_generation)
+                print("[policy] cleared action/RTC history after executor reset", flush=True)
             sim_running = False
             if panel is not None:
                 bottle_pos, bottle_euler, _, sim_running, reset_counter, stop_requested = _read_bottle_panel(panel)
@@ -1544,14 +2087,22 @@ def main() -> int:
                     should_replan = should_replan or now - last_policy_time >= 1.0 / max(float(args.policy_hz), 1e-6)
                 if should_replan:
                     last_policy_time = now
-                    ego = _render_camera_rgb(ego_camera, image_size=image_size)
+                    ego = _render_camera_rgb(
+                        ego_camera,
+                        image_size=image_size,
+                        roi_zoom=float(args.ego_roi_zoom),
+                        roi_center_x=float(args.ego_roi_center_x),
+                        roi_center_y=float(args.ego_roi_center_y),
+                    )
                     wrist = _render_camera_rgb(wrist_camera, image_size=image_size)
+                    camera_preview.show(ego=ego, wrist=wrist)
                     obs_builder.append_frame(ego=ego, wrist=wrist)
                     reference_action = executor.current_reference_action()
+                    observation_hand_q = executor.current_observation_hand_q()
                     observation = obs_builder.build(
                         arm_q=executor.current_arm_q(),
                         eef_pose=executor.current_eef_pose(),
-                        hand_q=executor.hand_q,
+                        hand_q=observation_hand_q,
                         reference_action=reference_action,
                     )
                     if step_count == 0 and action_index == 0:
@@ -1593,19 +2144,54 @@ def main() -> int:
                         previous_action=rtc_seed_action if rtc_options is not None else None,
                         options=rtc_options,
                     )
-                    executable_policy_action, clip_delta = executor.clip_action_chunk_for_execution(policy_action_chunk)
+                    clip_delta = executor.hand_policy_clip_delta(policy_action_chunk)
                     frozen_steps = 0 if rtc_options is None else int(rtc_options["rtc_frozen_steps"])
-                    action_chunk, action_storage_metadata = _stored_rtc_action_chunk(
-                        policy_action=executable_policy_action,
+                    raw_stored_action, action_storage_metadata = _stored_rtc_action_chunk(
+                        policy_action=policy_action_chunk,
                         rtc_seed_action=rtc_seed_action,
                         action_keys=action_keys,
                         frozen_steps=frozen_steps,
+                    )
+                    action_chunk = executor.probe_clip_action_chunk(raw_stored_action)
+                    hand_debug = executor.hand_debug_snapshot(
+                        policy_action_chunk=policy_action_chunk,
+                        clipped_action_chunk=action_chunk,
+                        reference_action=reference_action,
+                        rtc_seed_action=rtc_seed_action,
+                        reference_action_source=reference_action_source,
+                        observation_hand_q=observation_hand_q,
                     )
                     seed_manager.push(
                         action_chunk,
                         start_monotonic_s=observation_ts_s,
                         frame_id=int(step_count),
                     )
+                    _append_jsonl(
+                        args.policy_debug_jsonl,
+                        {
+                            "schema_version": "harness.groot_finetune_policy_debug.v1",
+                            "step_count": int(step_count),
+                            "action_index": int(action_index),
+                            "observation_ts_s": float(observation_ts_s),
+                            "rtc": {
+                                "options": rtc_options,
+                                "metadata": rtc_metadata,
+                                "seed_metadata": rtc_seed_metadata,
+                                "storage": action_storage_metadata,
+                            },
+                            "hand": hand_debug,
+                            "action_summary": _summarize_action_chunk(action_chunk),
+                        },
+                    )
+                    if hand_debug.get("negative_floor_warning", {}).get("active"):
+                        print(
+                            "[policy-hand-debug] negative_floor "
+                            f"reference_source={reference_action_source} "
+                            f"reference={hand_debug.get('reference_hand_first')} "
+                            f"observation={hand_debug.get('observation_hand_state')} "
+                            f"rtc_seed={hand_debug.get('rtc_seed_hand_first')}",
+                            flush=True,
+                        )
                     print(
                         f"[policy] replan dt={time.perf_counter() - tic:.3f}s "
                         f"rtc={'off' if rtc_options is None else 'on'} "
@@ -1614,6 +2200,7 @@ def main() -> int:
                         f"reference={reference_action_source} "
                         f"stored_frozen={action_storage_metadata.get('frozen_seed_steps_applied', 0)} "
                         f"clip_delta={clip_delta:.4f} "
+                        f"hand_debug={hand_debug.get('negative_floor_warning')} "
                         f"{_summarize_action_chunk(action_chunk)}",
                         flush=True,
                     )
@@ -1632,6 +2219,7 @@ def main() -> int:
 
             time.sleep(1.0 / 60.0)
     finally:
+        camera_preview.close()
         _shutdown_panel(panel)
     print(f"[done] steps={step_count}", flush=True)
     return 0
