@@ -31,8 +31,13 @@ from teleop_stack.teleop.openxr_genesis_adapter import (
 from teleop_stack.teleop.orientation_tracker import OrientationTargetTracker, OrientationTrackerConfig
 from teleop_stack.teleop.spatial_frames import (
     BeavrHandFrameSmoother,
+    FrameAxes,
+    HandAnatomicalFrame,
     hand_anatomical_frame_from_debug,
     hand_beavr_anatomical_frame_from_debug,
+    matrix_from_axes,
+    matrix_to_quat_xyzw,
+    quat_xyzw_to_matrix,
 )
 
 
@@ -1277,6 +1282,7 @@ class _AddSceneNeroTeleopRobot:
         orientation_max_speed_rad_s: float,
         orientation_tool_offset_wxyz: tuple[float, float, float, float],
         orientation_reference_mode: str,
+        openxr_yaw_recenter: bool,
         relative_control: bool,
         drive_ik: bool,
         require_engage: bool,
@@ -1297,6 +1303,9 @@ class _AddSceneNeroTeleopRobot:
         self.orientation_source = str(orientation_source)
         self.orientation_axis_map = tuple(str(v) for v in orientation_axis_map)
         self.orientation_reference_mode = str(orientation_reference_mode)
+        self.openxr_yaw_recenter_enabled = bool(openxr_yaw_recenter)
+        self.openxr_yaw_correction_rad: float | None = None
+        self.openxr_yaw_recenter_debug: dict[str, object] | None = None
         self.orientation_tracker = (
             OrientationTargetTracker(
                 OrientationTrackerConfig(
@@ -1368,6 +1377,7 @@ class _AddSceneNeroTeleopRobot:
             else delta_xyz
         )
         mapped = _map_vec3_axes(source, self.input_axis_map)
+        mapped = self._apply_openxr_yaw_correction_to_vector(mapped)
         return tuple(float(self.translation_scale_xyz[i]) * float(mapped[i]) for i in range(3))  # type: ignore[return-value]
 
     def _target_position(self, pose) -> tuple[float, float, float]:
@@ -1376,6 +1386,7 @@ class _AddSceneNeroTeleopRobot:
             if self.openxr_coordinate_adapter == "openxr_genesis":
                 source = map_openxr_vector_to_genesis(source)
             mapped = _map_vec3_axes(source, self.input_axis_map)
+            mapped = self._apply_openxr_yaw_correction_to_vector(mapped)
             return tuple(
                 float(self.workspace_origin_xyz[i]) + float(self.translation_scale_xyz[i]) * float(mapped[i])
                 for i in range(3)
@@ -1394,8 +1405,167 @@ class _AddSceneNeroTeleopRobot:
         self._ensure_connected()
         return tuple(float(v) for v in _tensor_to_np(self.eef_link.get_quat()).reshape(4))
 
+    @staticmethod
+    def _yaw_rotation_matrix(rad: float) -> np.ndarray:
+        cos_v = math.cos(float(rad))
+        sin_v = math.sin(float(rad))
+        return np.asarray(
+            (
+                (cos_v, -sin_v, 0.0),
+                (sin_v, cos_v, 0.0),
+                (0.0, 0.0, 1.0),
+            ),
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _matrix_tuple(matrix: np.ndarray) -> tuple[tuple[float, float, float], ...]:
+        return tuple(tuple(float(value) for value in row) for row in np.asarray(matrix, dtype=np.float64))
+
+    def _set_openxr_yaw_correction_from_genesis_forward(
+        self,
+        forward_xyz: tuple[float, float, float],
+        *,
+        source: str,
+    ) -> bool:
+        if not self.openxr_yaw_recenter_enabled or self.openxr_coordinate_adapter != "openxr_genesis":
+            self.openxr_yaw_correction_rad = None
+            self.openxr_yaw_recenter_debug = {
+                "enabled": False,
+                "source": source,
+                "reason": (
+                    "disabled"
+                    if not self.openxr_yaw_recenter_enabled
+                    else "openxr_coordinate_adapter_not_openxr_genesis"
+                ),
+                "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+            }
+            return False
+
+        measured = np.asarray(forward_xyz, dtype=np.float64).reshape(3)
+        measured_xy = np.asarray((measured[0], measured[1]), dtype=np.float64)
+        norm_xy = float(np.linalg.norm(measured_xy))
+        if norm_xy <= 1e-9:
+            self.openxr_yaw_correction_rad = None
+            self.openxr_yaw_recenter_debug = {
+                "enabled": False,
+                "source": source,
+                "reason": "forward_axis_horizontal_norm_too_small",
+                "measured_forward_xyz": [float(v) for v in measured],
+            }
+            return False
+
+        measured_xy /= norm_xy
+        target_xy = np.asarray((-1.0, 0.0), dtype=np.float64)
+        cross_z = float(measured_xy[0] * target_xy[1] - measured_xy[1] * target_xy[0])
+        dot = float(np.dot(measured_xy, target_xy))
+        yaw_rad = math.atan2(cross_z, dot)
+        self.openxr_yaw_correction_rad = float(yaw_rad)
+        corrected = self._apply_openxr_yaw_correction_to_vector(tuple(float(v) for v in measured))
+        self.openxr_yaw_recenter_debug = {
+            "enabled": True,
+            "source": source,
+            "yaw_correction_rad": float(yaw_rad),
+            "yaw_correction_deg": float(math.degrees(yaw_rad)),
+            "measured_forward_xyz": [float(v) for v in measured],
+            "measured_forward_xy_normalized": [float(v) for v in measured_xy],
+            "target_forward_xyz": [-1.0, 0.0, 0.0],
+            "corrected_forward_xyz": [float(v) for v in corrected],
+        }
+        print(
+            f"[add-scene-vr] openxr_yaw_recenter "
+            f"source={source} yaw_deg={math.degrees(yaw_rad):+.2f} "
+            f"measured_forward=({measured[0]:+.3f},{measured[1]:+.3f},{measured[2]:+.3f})",
+            flush=True,
+        )
+        return True
+
+    def _apply_openxr_yaw_correction_to_vector(
+        self,
+        vector_xyz: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        if self.openxr_yaw_correction_rad is None:
+            return tuple(float(v) for v in vector_xyz)
+        corrected = self._yaw_rotation_matrix(self.openxr_yaw_correction_rad) @ np.asarray(vector_xyz, dtype=np.float64)
+        return (float(corrected[0]), float(corrected[1]), float(corrected[2]))
+
+    def _apply_openxr_yaw_correction_to_quaternion(
+        self,
+        quaternion_xyzw: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        if self.openxr_yaw_correction_rad is None:
+            return tuple(float(v) for v in quaternion_xyzw)
+        yaw_matrix = self._yaw_rotation_matrix(self.openxr_yaw_correction_rad)
+        rotation = np.asarray(quat_xyzw_to_matrix(quaternion_xyzw), dtype=np.float64)
+        return matrix_to_quat_xyzw(self._matrix_tuple(yaw_matrix @ rotation))  # type: ignore[return-value]
+
+    def _apply_openxr_yaw_correction_to_frame(self, frame: HandAnatomicalFrame) -> HandAnatomicalFrame:
+        if self.openxr_yaw_correction_rad is None:
+            return frame
+        axes = FrameAxes(
+            x=self._apply_openxr_yaw_correction_to_vector(tuple(float(v) for v in frame.axes.x)),
+            y=self._apply_openxr_yaw_correction_to_vector(tuple(float(v) for v in frame.axes.y)),
+            z=self._apply_openxr_yaw_correction_to_vector(tuple(float(v) for v in frame.axes.z)),
+        )
+        return HandAnatomicalFrame(
+            origin_xyz=self._apply_openxr_yaw_correction_to_vector(tuple(float(v) for v in frame.origin_xyz)),
+            axes=axes,
+            quaternion_xyzw=matrix_to_quat_xyzw(matrix_from_axes(axes)),
+            handedness_det=float(frame.handedness_det),
+            thumb_alignment=float(frame.thumb_alignment),
+            legacy_palm_normal_alignment=frame.legacy_palm_normal_alignment,
+            construction=f"{frame.construction}_openxr_yaw_recentered",
+            raw_axes=frame.raw_axes,
+            axis_adapter={
+                **(frame.axis_adapter or {}),
+                "session_yaw_recenter": "yaw-only Genesis +Z correction; operator front -> robot front",
+            },
+        )
+
+    def _hand_orientation_frame(
+        self,
+        requested: str,
+        *,
+        apply_openxr_yaw_correction: bool = True,
+    ) -> HandAnatomicalFrame | None:
+        if not isinstance(self.latest_hand_debug, dict):
+            return None
+        if requested == "hand_anatomical_frame":
+            frame = hand_anatomical_frame_from_debug(self.latest_hand_debug)
+        elif requested in {"hand_beavr_anatomical_frame", "hand_genesis_wrist_frame"}:
+            frame = self.beavr_hand_frame_smoother.update(self.latest_hand_debug)
+            if frame is None:
+                frame = hand_beavr_anatomical_frame_from_debug(self.latest_hand_debug)
+        else:
+            return None
+        if frame is None:
+            return None
+        if requested == "hand_genesis_wrist_frame":
+            frame = adapt_openxr_hand_frame_to_genesis_wrist_frame(frame)
+        elif self.openxr_coordinate_adapter == "openxr_genesis":
+            frame = adapt_openxr_hand_frame_to_genesis_parent(frame)
+        return self._apply_openxr_yaw_correction_to_frame(frame) if apply_openxr_yaw_correction else frame
+
+    def _recenter_openxr_yaw_from_hand(self, pose, *, source: str) -> bool:
+        frame = self._hand_orientation_frame("hand_genesis_wrist_frame", apply_openxr_yaw_correction=False)
+        if frame is None:
+            source_quat = tuple(float(v) for v in pose.quaternion_xyzw)
+            if self.openxr_coordinate_adapter == "openxr_genesis":
+                source_quat = map_openxr_quaternion_to_genesis_parent(source_quat)
+            forward = quat_xyzw_to_matrix(source_quat)
+            return self._set_openxr_yaw_correction_from_genesis_forward(
+                (float(forward[0][2]), float(forward[1][2]), float(forward[2][2])),
+                source=f"{source}:wrist_quat_fallback",
+            )
+        return self._set_openxr_yaw_correction_from_genesis_forward(
+            tuple(float(v) for v in frame.axes.z),
+            source=f"{source}:hand_genesis_wrist_frame_z",
+        )
+
     def _reset_relative_anchor(self, pose) -> None:
         self._ensure_connected()
+        if self.openxr_yaw_correction_rad is None:
+            self._recenter_openxr_yaw_from_hand(pose, source="anchor")
         current_target = _tensor_to_np(self.eef_link.get_pos()).reshape(3).astype(np.float64)
         self.human_anchor_xyz = tuple(float(v) for v in pose.position_xyz)
         self.target_anchor_xyz = tuple(float(v) for v in current_target)
@@ -1425,6 +1595,7 @@ class _AddSceneNeroTeleopRobot:
                 if self.openxr_coordinate_adapter == "openxr_genesis"
                 else wrist_quat
             )
+            adapted = self._apply_openxr_yaw_correction_to_quaternion(adapted)
             adapted = _normalize_quat_xyzw(adapted)
             debug = {
                 "requested": requested,
@@ -1432,6 +1603,7 @@ class _AddSceneNeroTeleopRobot:
                 "fallback": False,
                 "reason": None,
                 "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+                "openxr_yaw_recenter": self.openxr_yaw_recenter_debug,
             }
             self.last_orientation_source_quaternion_xyzw = adapted
             self.last_orientation_source_debug = debug
@@ -1440,24 +1612,8 @@ class _AddSceneNeroTeleopRobot:
         if requested not in {"hand_anatomical_frame", "hand_beavr_anatomical_frame", "hand_genesis_wrist_frame"}:
             raise ValueError(f"unsupported VR orientation source: {requested!r}")
 
-        frame = None
-        if isinstance(self.latest_hand_debug, dict):
-            if requested == "hand_anatomical_frame":
-                frame = hand_anatomical_frame_from_debug(self.latest_hand_debug)
-            elif requested == "hand_beavr_anatomical_frame":
-                frame = self.beavr_hand_frame_smoother.update(self.latest_hand_debug)
-                if frame is None:
-                    frame = hand_beavr_anatomical_frame_from_debug(self.latest_hand_debug)
-            else:
-                frame = self.beavr_hand_frame_smoother.update(self.latest_hand_debug)
-                if frame is None:
-                    frame = hand_beavr_anatomical_frame_from_debug(self.latest_hand_debug)
-
+        frame = self._hand_orientation_frame(requested)
         if frame is not None:
-            if requested == "hand_genesis_wrist_frame":
-                frame = adapt_openxr_hand_frame_to_genesis_wrist_frame(frame)
-            elif self.openxr_coordinate_adapter == "openxr_genesis":
-                frame = adapt_openxr_hand_frame_to_genesis_parent(frame)
             quat = _normalize_quat_xyzw(tuple(float(v) for v in frame.quaternion_xyzw))
             debug = {
                 "requested": requested,
@@ -1465,6 +1621,7 @@ class _AddSceneNeroTeleopRobot:
                 "fallback": False,
                 "reason": None,
                 "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+                "openxr_yaw_recenter": self.openxr_yaw_recenter_debug,
                 requested: frame.as_dict(),
             }
             self.last_orientation_source_quaternion_xyzw = quat
@@ -1478,6 +1635,7 @@ class _AddSceneNeroTeleopRobot:
                 "fallback": True,
                 "reason": f"{requested}_unavailable",
                 "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+                "openxr_yaw_recenter": self.openxr_yaw_recenter_debug,
             }
             self.last_orientation_source_debug = debug
             return self.last_orientation_source_quaternion_xyzw, debug
@@ -1487,6 +1645,7 @@ class _AddSceneNeroTeleopRobot:
             if self.openxr_coordinate_adapter == "openxr_genesis"
             else wrist_quat
         )
+        adapted = self._apply_openxr_yaw_correction_to_quaternion(adapted)
         adapted = _normalize_quat_xyzw(adapted)
         debug = {
             "requested": requested,
@@ -1494,6 +1653,7 @@ class _AddSceneNeroTeleopRobot:
             "fallback": True,
             "reason": f"{requested}_unavailable",
             "openxr_coordinate_adapter": self.openxr_coordinate_adapter,
+            "openxr_yaw_recenter": self.openxr_yaw_recenter_debug,
         }
         self.last_orientation_source_quaternion_xyzw = adapted
         self.last_orientation_source_debug = debug
@@ -1570,6 +1730,7 @@ class _AddSceneNeroTeleopRobot:
             return
         self._clear_relative_anchor()
         self.beavr_hand_frame_smoother.reset()
+        self._recenter_openxr_yaw_from_hand(pose, source="engage")
         self._target_position(pose)
         self.mode = "engaged"
         self.last_event = "engaged"
@@ -1593,6 +1754,9 @@ class _AddSceneNeroTeleopRobot:
         self.q_state = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
         self._clear_relative_anchor()
         self.beavr_hand_frame_smoother.reset()
+        pose = self._current_human_pose()
+        if pose is not None:
+            self._recenter_openxr_yaw_from_hand(pose, source="recenter")
         self.mode = "ready" if self.require_engage else "engaged"
         self.last_event = "recentered"
         _step_scene_with_attached_parts(self.scene)
@@ -2417,6 +2581,7 @@ def main() -> None:
     parser.add_argument("--vr-workspace-origin-xyz", type=_vec3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--vr-input-axis-map", type=_parse_axis_map, default=_parse_axis_map("x,y,z"))
     parser.add_argument("--vr-openxr-coordinate-adapter", choices=("none", "openxr_genesis"), default="openxr_genesis")
+    parser.add_argument("--vr-openxr-yaw-recenter", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
         "--vr-input-source",
         choices=("auto", "quest", "overlay-log"),
@@ -2574,6 +2739,7 @@ def main() -> None:
                 orientation_max_speed_rad_s=float(args.vr_orientation_max_speed_rad_s),
                 orientation_tool_offset_wxyz=args.vr_orientation_tool_offset_wxyz,
                 orientation_reference_mode=str(args.vr_orientation_reference_mode),
+                openxr_yaw_recenter=bool(args.vr_openxr_yaw_recenter),
                 relative_control=not args.vr_absolute_control,
                 drive_ik=not args.vr_markers_only,
                 require_engage=bool(args.vr_require_engage),
