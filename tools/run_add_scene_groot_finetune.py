@@ -81,11 +81,23 @@ L10_HAND_ACTIVE_LOCAL_INDICES = (0, 2, 3, 4, 5, 9)
 L10_HAND_MASKED_LOCAL_INDICES = (1, 6, 7, 8)
 DEFAULT_IK_J4_LIMIT_RAD = (0.0, 2.14)
 DEFAULT_POLICY_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_policy_debug.jsonl"
+DEFAULT_POLICY_TELEOP_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_teleop_bridge.jsonl"
+DEFAULT_POLICY_TRANSLATION_SCALE = (1.0, 1.0, 1.0)
+DEFAULT_POLICY_ORIENTATION_MAX_SPEED_RAD_S = 8.0
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import add_scene_glb as harness  # noqa: E402
+from teleop_stack.teleop.openxr_genesis_adapter import (  # noqa: E402
+    adapter_debug_payload as canonical_adapter_debug_payload,
+)
+from teleop_stack.teleop.openxr_genesis_adapter import (  # noqa: E402
+    map_openxr_quaternion_to_genesis_parent,
+    map_openxr_vector_to_genesis,
+)
+from teleop_stack.teleop.orientation_tracker import OrientationTargetTracker, OrientationTrackerConfig  # noqa: E402
+from teleop_stack.teleop.spatial_frames import matrix_to_quat_xyzw, quat_xyzw_to_matrix  # noqa: E402
 
 
 def _vec3(text: str) -> tuple[float, float, float]:
@@ -128,6 +140,17 @@ def _vec10(text: str) -> tuple[float, ...]:
         raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
 
 
+def _axis_map(text: str) -> tuple[str, str, str]:
+    parts = tuple(part.strip().lower() for part in str(text).split(",") if part.strip())
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("expected 3 comma-separated axis tokens, e.g. x,y,z")
+    for part in parts:
+        axis = part[1:] if part.startswith(("-", "+")) else part
+        if axis not in {"x", "y", "z"}:
+            raise argparse.ArgumentTypeError(f"unsupported axis token: {part!r}")
+    return parts  # type: ignore[return-value]
+
+
 def _image_size(text: str) -> tuple[int, int]:
     parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
     if len(parts) != 2:
@@ -164,6 +187,49 @@ def _rot6d_to_rotmat(rot6d: np.ndarray) -> np.ndarray:
 def _rotation_to_quat_xyzw(rotation: np.ndarray) -> tuple[float, float, float, float]:
     quat_wxyz = harness._quat_wxyz_from_rotation(rotation)  # noqa: SLF001
     return (float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3]), float(quat_wxyz[0]))
+
+
+def _quat_xyzw_to_rotation(quat_xyzw: tuple[float, float, float, float]) -> np.ndarray:
+    matrix = quat_xyzw_to_matrix(tuple(float(v) for v in quat_xyzw))
+    return np.asarray(matrix, dtype=np.float64)
+
+
+def _quat_wxyz_to_rotation(quat_wxyz: tuple[float, float, float, float]) -> np.ndarray:
+    w, x, y, z = (float(v) for v in quat_wxyz)
+    return _quat_xyzw_to_rotation((x, y, z, w))
+
+
+def _rotation_to_quat_wxyz(rotation: np.ndarray) -> tuple[float, float, float, float]:
+    quat_xyzw = _rotation_to_quat_xyzw(rotation)
+    return (float(quat_xyzw[3]), float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2]))
+
+
+def _matrix_tuple(matrix: np.ndarray) -> tuple[tuple[float, float, float], ...]:
+    arr = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    return tuple(tuple(float(value) for value in row) for row in arr)
+
+
+def _yaw_rotation_matrix(rad: float) -> np.ndarray:
+    cos_v = math.cos(float(rad))
+    sin_v = math.sin(float(rad))
+    return np.asarray(
+        (
+            (cos_v, -sin_v, 0.0),
+            (sin_v, cos_v, 0.0),
+            (0.0, 0.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+
+
+def _apply_yaw_to_quat_xyzw(
+    quaternion_xyzw: tuple[float, float, float, float],
+    yaw_rad: float | None,
+) -> tuple[float, float, float, float]:
+    if yaw_rad is None:
+        return tuple(float(v) for v in quaternion_xyzw)  # type: ignore[return-value]
+    rotation = _yaw_rotation_matrix(float(yaw_rad)) @ _quat_xyzw_to_rotation(quaternion_xyzw)
+    return matrix_to_quat_xyzw(_matrix_tuple(rotation))  # type: ignore[return-value]
 
 
 def _resize_with_pad(image: np.ndarray, height: int, width: int) -> np.ndarray:
@@ -571,6 +637,167 @@ class CameraPreview:
         self._available = False
 
 
+class EefChunkTrajectoryOverlay:
+    def __init__(
+        self,
+        scene: object,
+        *,
+        enabled: bool,
+        max_points: int,
+        line_radius: float,
+        point_radius: float,
+        show_orientation: bool,
+        orientation_max_frames: int,
+        orientation_axis_length: float,
+        orientation_axis_radius: float,
+    ) -> None:
+        self.scene = scene
+        self.enabled = bool(enabled)
+        self.max_points = max(2, int(max_points))
+        self.line_radius = max(float(line_radius), 1.0e-5)
+        self.point_radius = max(float(point_radius), 1.0e-5)
+        self.show_orientation = bool(show_orientation)
+        self.orientation_max_frames = max(1, int(orientation_max_frames))
+        self.orientation_axis_length = max(float(orientation_axis_length), 1.0e-4)
+        self.orientation_axis_radius = max(float(orientation_axis_radius), 1.0e-5)
+        self._objects: list[object] = []
+        self._active_obj: object | None = None
+        self._last_points: np.ndarray | None = None
+        self._warned = False
+
+    @staticmethod
+    def _chunk_eef(action: dict[str, np.ndarray] | None, *, max_points: int) -> np.ndarray | None:
+        if not isinstance(action, dict) or "eef_9d" not in action:
+            return None
+        arr = np.asarray(action["eef_9d"], dtype=np.float64)
+        if arr.ndim == 3:
+            arr = arr[0]
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[-1] < 3 or arr.shape[0] <= 0:
+            return None
+        eef = arr[:, : max(3, min(arr.shape[-1], 9))]
+        points = eef[:, :3]
+        finite = np.all(np.isfinite(points), axis=1)
+        eef = eef[finite]
+        if eef.shape[0] <= 0:
+            return None
+        if eef.shape[0] > max_points:
+            indices = np.linspace(0, eef.shape[0] - 1, max_points).round().astype(int)
+            eef = eef[indices]
+        return eef.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _orientation_frames(eef: np.ndarray, *, max_frames: int) -> np.ndarray | None:
+        if eef.ndim != 2 or eef.shape[-1] < 9:
+            return None
+        frames = eef
+        if frames.shape[0] > max_frames:
+            indices = np.linspace(0, frames.shape[0] - 1, max_frames).round().astype(int)
+            frames = frames[indices]
+        transforms = []
+        for row in frames:
+            transform = np.eye(4, dtype=np.float32)
+            transform[:3, 3] = np.asarray(row[:3], dtype=np.float32)
+            transform[:3, :3] = _rot6d_to_rotmat(np.asarray(row[3:9], dtype=np.float32)).astype(np.float32)
+            transforms.append(transform)
+        return np.stack(transforms, axis=0) if transforms else None
+
+    @staticmethod
+    def _pose_at(pos: np.ndarray) -> np.ndarray:
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, 3] = np.asarray(pos, dtype=np.float32).reshape(3)
+        return pose
+
+    def clear(self) -> None:
+        if not self._objects:
+            self._active_obj = None
+            self._last_points = None
+            return
+        for obj in tuple(self._objects):
+            try:
+                self.scene.clear_debug_object(obj)
+            except Exception:
+                try:
+                    self.scene.clear_debug_objects()
+                except Exception:
+                    pass
+                break
+        self._objects.clear()
+        self._active_obj = None
+        self._last_points = None
+
+    def _disable_after_error(self, exc: Exception) -> None:
+        if not self._warned:
+            print(f"[eef-trajectory] disabled: Genesis debug draw failed: {exc}", flush=True)
+            self._warned = True
+        self.enabled = False
+
+    def draw_chunk(self, action: dict[str, np.ndarray] | None) -> None:
+        if not self.enabled:
+            return
+        eef = self._chunk_eef(action, max_points=self.max_points)
+        if eef is None:
+            self.clear()
+            return
+        points = eef[:, :3]
+        try:
+            self.clear()
+            if points.shape[0] >= 2:
+                self._objects.append(
+                    self.scene.draw_debug_trajectory(
+                        points,
+                        radius=self.line_radius,
+                        color=(1.0, 0.55, 0.02, 0.92),
+                    )
+                )
+            self._objects.append(
+                self.scene.draw_debug_spheres(
+                    points,
+                    radius=self.point_radius,
+                    color=(0.0, 0.85, 1.0, 0.75),
+                )
+            )
+            self._active_obj = self.scene.draw_debug_sphere(
+                points[0],
+                radius=self.point_radius * 1.6,
+                color=(0.1, 1.0, 0.15, 0.95),
+            )
+            self._objects.append(self._active_obj)
+            orientation_frames = (
+                self._orientation_frames(eef, max_frames=self.orientation_max_frames) if self.show_orientation else None
+            )
+            if orientation_frames is not None:
+                self._objects.append(
+                    self.scene.draw_debug_frames(
+                        orientation_frames,
+                        axis_length=self.orientation_axis_length,
+                        origin_size=self.point_radius * 0.55,
+                        axis_radius=self.orientation_axis_radius,
+                    )
+                )
+            self._last_points = points
+            print(
+                "[eef-trajectory] chunk "
+                f"points={points.shape[0]} first={tuple(round(float(v), 4) for v in points[0])} "
+                f"last={tuple(round(float(v), 4) for v in points[-1])} "
+                f"orientation_frames={0 if orientation_frames is None else orientation_frames.shape[0]}",
+                flush=True,
+            )
+        except Exception as exc:
+            self.clear()
+            self._disable_after_error(exc)
+
+    def update_active(self, action_index: int) -> None:
+        if not self.enabled or self._active_obj is None or self._last_points is None:
+            return
+        idx = min(max(int(action_index), 0), self._last_points.shape[0] - 1)
+        try:
+            self.scene.update_debug_objects((self._active_obj,), (self._pose_at(self._last_points[idx]),))
+        except Exception as exc:
+            self._disable_after_error(exc)
+
+
 class Gr00tObservationBuilder:
     def __init__(
         self,
@@ -640,6 +867,187 @@ class Gr00tObservationBuilder:
         return {"video": video, "state": state, "language": language}
 
 
+class PolicyTeleopBridge:
+    """Interpret policy eef_9d as OpenXR-like source wrist motion."""
+
+    def __init__(
+        self,
+        *,
+        coordinate_adapter: str,
+        input_axis_map: tuple[str, str, str],
+        translation_scale_xyz: tuple[float, float, float],
+        yaw_recenter: bool,
+        orientation_reference_mode: str,
+        orientation_axis_map: tuple[str, str, str],
+        orientation_max_speed_rad_s: float,
+        workspace_min: tuple[float, float, float],
+        workspace_max: tuple[float, float, float],
+    ) -> None:
+        self.coordinate_adapter = str(coordinate_adapter)
+        if self.coordinate_adapter not in {"openxr_genesis", "none"}:
+            raise ValueError(f"unsupported policy coordinate adapter: {self.coordinate_adapter!r}")
+        self.input_axis_map = tuple(str(v) for v in input_axis_map)
+        self.translation_scale_xyz = np.asarray(translation_scale_xyz, dtype=np.float64).reshape(3)
+        self.yaw_recenter_enabled = bool(yaw_recenter)
+        self.workspace_min = np.asarray(workspace_min, dtype=np.float64).reshape(3)
+        self.workspace_max = np.asarray(workspace_max, dtype=np.float64).reshape(3)
+        self.orientation_tracker = OrientationTargetTracker(
+            OrientationTrackerConfig(
+                axis_map=tuple(str(v) for v in orientation_axis_map),  # type: ignore[arg-type]
+                max_speed_rad_s=float(orientation_max_speed_rad_s),
+                reference_mode=str(orientation_reference_mode),  # type: ignore[arg-type]
+            )
+        )
+        self.source_anchor_xyz = np.zeros(3, dtype=np.float64)
+        self.source_anchor_rotation = np.eye(3, dtype=np.float64)
+        self.source_command_xyz = np.zeros(3, dtype=np.float64)
+        self.source_command_rotation = np.eye(3, dtype=np.float64)
+        self.target_anchor_xyz = np.zeros(3, dtype=np.float64)
+        self.target_anchor_quat_wxyz = (1.0, 0.0, 0.0, 0.0)
+        self.yaw_correction_rad: float | None = None
+        self.last_debug: dict[str, Any] = {}
+        self.reset_generation = 0
+
+    def reset_from_eef(self, eef_pose: np.ndarray) -> None:
+        pose = np.asarray(eef_pose, dtype=np.float64).reshape(4, 4)
+        self.source_anchor_xyz = np.zeros(3, dtype=np.float64)
+        self.source_anchor_rotation = np.eye(3, dtype=np.float64)
+        self.source_command_xyz = self.source_anchor_xyz.copy()
+        self.source_command_rotation = self.source_anchor_rotation.copy()
+        self.target_anchor_xyz = pose[:3, 3].astype(np.float64, copy=True)
+        self.target_anchor_quat_wxyz = _rotation_to_quat_wxyz(pose[:3, :3])
+        source_quat = self._source_rotation_to_genesis_quat(self.source_anchor_rotation)
+        self._reset_yaw_correction(source_quat)
+        source_quat = _apply_yaw_to_quat_xyzw(source_quat, self.yaw_correction_rad)
+        self.orientation_tracker.reset_anchor(source_quat, self.target_anchor_quat_wxyz)
+        self.reset_generation += 1
+        self.last_debug = {
+            "event": "reset",
+            "coordinate_adapter": self.coordinate_adapter,
+            "adapter_payload": self._adapter_debug_payload(),
+            "source_anchor_xyz": self.source_anchor_xyz.tolist(),
+            "target_anchor_xyz": self.target_anchor_xyz.tolist(),
+            "target_anchor_quat_wxyz": list(self.target_anchor_quat_wxyz),
+            "yaw_correction_rad": self.yaw_correction_rad,
+            "yaw_correction_deg": None if self.yaw_correction_rad is None else math.degrees(self.yaw_correction_rad),
+        }
+        print(
+            "[policy-teleop] reset "
+            f"adapter={self.coordinate_adapter} "
+            f"target_anchor={tuple(round(float(v), 4) for v in self.target_anchor_xyz)} "
+            f"yaw_deg={None if self.yaw_correction_rad is None else round(math.degrees(self.yaw_correction_rad), 3)}",
+            flush=True,
+        )
+
+    def current_reference_eef_9d(self) -> np.ndarray:
+        return np.concatenate(
+            [
+                self.source_command_xyz.astype(np.float32),
+                _rotmat_to_rot6d(self.source_command_rotation),
+            ]
+        ).astype(np.float32)
+
+    def step_source_eef(self, eef_9d: np.ndarray, *, dt_s: float) -> tuple[np.ndarray, np.ndarray]:
+        source_xyz, source_rotation = self._decode_source_eef(eef_9d)
+        target_xyz, mapped_delta, source_delta = self._target_position_from_source(source_xyz)
+        source_quat = self._source_rotation_to_genesis_quat(source_rotation)
+        source_quat = _apply_yaw_to_quat_xyzw(source_quat, self.yaw_correction_rad)
+        orientation_result = self.orientation_tracker.update(source_quat, dt_s=max(float(dt_s), 1.0e-6))
+        target_rotation = _quat_wxyz_to_rotation(orientation_result.cmd_target_quat_wxyz)
+        self.source_command_xyz = source_xyz
+        self.source_command_rotation = source_rotation
+        self.last_debug = {
+            "event": "step",
+            "coordinate_adapter": self.coordinate_adapter,
+            "source_xyz": source_xyz.tolist(),
+            "source_delta_openxr": source_delta.tolist(),
+            "mapped_delta_genesis": mapped_delta.tolist(),
+            "target_xyz": target_xyz.tolist(),
+            "source_quat_xyzw_genesis": list(source_quat),
+            "orientation": orientation_result.as_dict(),
+        }
+        return target_xyz.astype(np.float64), target_rotation.astype(np.float64)
+
+    def preview_action_chunk(self, action: dict[str, np.ndarray] | None, *, max_dt_s: float) -> dict[str, np.ndarray] | None:
+        if not isinstance(action, dict) or "eef_9d" not in action:
+            return action
+        preview = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        arr = np.asarray(preview["eef_9d"], dtype=np.float32)
+        batched = arr.ndim == 3
+        chunk = arr[0] if batched else arr
+        if chunk.ndim == 1:
+            chunk = chunk[None, :]
+        if chunk.ndim != 2 or chunk.shape[-1] < 9:
+            return preview
+        mapped_rows = []
+        for row in chunk:
+            source_xyz, source_rotation = self._decode_source_eef(row)
+            target_xyz, _, _ = self._target_position_from_source(source_xyz)
+            source_quat = self._source_rotation_to_genesis_quat(source_rotation)
+            source_quat = _apply_yaw_to_quat_xyzw(source_quat, self.yaw_correction_rad)
+            target_rotation = _quat_xyzw_to_rotation(source_quat)
+            mapped_rows.append(np.concatenate([target_xyz.astype(np.float32), _rotmat_to_rot6d(target_rotation)]))
+        mapped = np.stack(mapped_rows, axis=0).astype(np.float32)
+        if batched:
+            preview["eef_9d"] = mapped[None, ...]
+        else:
+            preview["eef_9d"] = mapped
+        return preview
+
+    def _decode_source_eef(self, eef_9d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        eef = np.asarray(eef_9d, dtype=np.float64).reshape(-1)
+        source_xyz = np.zeros(3, dtype=np.float64)
+        source_xyz[: min(3, eef.size)] = eef[: min(3, eef.size)]
+        if eef.size >= 9:
+            source_rotation = _rot6d_to_rotmat(eef[3:9])
+        else:
+            source_rotation = self.source_command_rotation.copy()
+        return source_xyz, source_rotation
+
+    def _target_position_from_source(self, source_xyz: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        source_delta = np.asarray(source_xyz, dtype=np.float64).reshape(3) - self.source_anchor_xyz
+        if self.coordinate_adapter == "openxr_genesis":
+            mapped = np.asarray(map_openxr_vector_to_genesis(tuple(float(v) for v in source_delta)), dtype=np.float64)
+        else:
+            mapped = source_delta.copy()
+        mapped = np.asarray(harness._map_vec3_axes(tuple(float(v) for v in mapped), self.input_axis_map), dtype=np.float64)  # noqa: SLF001
+        if self.yaw_correction_rad is not None:
+            mapped = _yaw_rotation_matrix(self.yaw_correction_rad) @ mapped
+        mapped = mapped * self.translation_scale_xyz
+        target = np.clip(self.target_anchor_xyz + mapped, self.workspace_min, self.workspace_max)
+        return target, mapped, source_delta
+
+    def _source_rotation_to_genesis_quat(self, source_rotation: np.ndarray) -> tuple[float, float, float, float]:
+        source_quat = _rotation_to_quat_xyzw(np.asarray(source_rotation, dtype=np.float64).reshape(3, 3))
+        if self.coordinate_adapter == "openxr_genesis":
+            return map_openxr_quaternion_to_genesis_parent(source_quat)
+        return source_quat
+
+    def _reset_yaw_correction(self, source_quat_xyzw: tuple[float, float, float, float]) -> None:
+        if not self.yaw_recenter_enabled or self.coordinate_adapter == "none":
+            self.yaw_correction_rad = None
+            return
+        rotation = _quat_xyzw_to_rotation(source_quat_xyzw)
+        source_forward = -rotation[:, 2]
+        horizontal = np.asarray((source_forward[0], source_forward[1]), dtype=np.float64)
+        norm = float(np.linalg.norm(horizontal))
+        if norm <= 1.0e-9:
+            self.yaw_correction_rad = None
+            return
+        horizontal /= norm
+        target = np.asarray((-1.0, 0.0), dtype=np.float64)
+        cross_z = float(horizontal[0] * target[1] - horizontal[1] * target[0])
+        dot = float(np.dot(horizontal, target))
+        self.yaw_correction_rad = float(math.atan2(cross_z, dot))
+
+    def _adapter_debug_payload(self) -> dict[str, object]:
+        if self.coordinate_adapter == "openxr_genesis":
+            payload = canonical_adapter_debug_payload()
+            payload["adapter"] = "openxr_genesis"
+            return payload
+        return {"adapter": "none"}
+
+
 class RightArmPolicyExecutor:
     def __init__(
         self,
@@ -657,6 +1065,15 @@ class RightArmPolicyExecutor:
         initial_hand_q: tuple[float, ...],
         initial_right_arm_q: tuple[float, ...],
         initial_left_arm_q: tuple[float, ...],
+        policy_execution_mode: str,
+        policy_openxr_coordinate_adapter: str,
+        policy_input_axis_map: tuple[str, str, str],
+        policy_translation_scale: tuple[float, float, float],
+        policy_yaw_recenter: bool,
+        policy_orientation_reference_mode: str,
+        policy_orientation_axis_map: tuple[str, str, str],
+        policy_orientation_max_speed_rad_s: float,
+        action_dt_s: float,
     ) -> None:
         self.scene = scene
         assembly = getattr(scene, "nero_assembly_info", None)
@@ -675,6 +1092,10 @@ class RightArmPolicyExecutor:
         self.ik_j4_limit_rad = tuple(float(v) for v in ik_j4_limit_rad)
         self.workspace_min = np.asarray(workspace_min, dtype=np.float64)
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64)
+        self.policy_execution_mode = str(policy_execution_mode)
+        if self.policy_execution_mode not in {"teleop_source", "robot_target"}:
+            raise ValueError(f"unsupported policy execution mode: {self.policy_execution_mode!r}")
+        self.action_dt_s = float(action_dt_s)
         self.initial_right_arm_q = np.asarray(initial_right_arm_q, dtype=np.float32).reshape(7)
         self.initial_left_arm_q = np.asarray(initial_left_arm_q, dtype=np.float32).reshape(7)
         self._ik_joint_limit_hit_count = 0
@@ -688,6 +1109,23 @@ class RightArmPolicyExecutor:
         self.q_cmd = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
         self.target_rotation = self.current_eef_pose()[:3, :3].copy()
         self.target_xyz = self.current_eef_pose()[:3, 3].copy()
+        self.teleop_bridge = (
+            PolicyTeleopBridge(
+                coordinate_adapter=policy_openxr_coordinate_adapter,
+                input_axis_map=policy_input_axis_map,
+                translation_scale_xyz=policy_translation_scale,
+                yaw_recenter=policy_yaw_recenter,
+                orientation_reference_mode=policy_orientation_reference_mode,
+                orientation_axis_map=policy_orientation_axis_map,
+                orientation_max_speed_rad_s=policy_orientation_max_speed_rad_s,
+                workspace_min=workspace_min,
+                workspace_max=workspace_max,
+            )
+            if self.policy_execution_mode == "teleop_source"
+            else None
+        )
+        if self.teleop_bridge is not None:
+            self.teleop_bridge.reset_from_eef(self.current_eef_pose())
         self._hand_target_print_count = 0
         self.print_hand_every = int(print_hand_every)
         print(
@@ -697,9 +1135,19 @@ class RightArmPolicyExecutor:
             f"ik_solver_max_joint_step={self.ik_solver_max_joint_step:.4f} "
             f"min_joint_step={self.min_joint_step:.4f} "
             f"pos_tol={self.pos_tol:.1e} "
-            f"ik_j4_limit={self.ik_j4_limit} range={self.ik_j4_limit_rad}",
+            f"ik_j4_limit={self.ik_j4_limit} range={self.ik_j4_limit_rad} "
+            f"policy_execution_mode={self.policy_execution_mode}",
             flush=True,
         )
+        if self.teleop_bridge is not None:
+            print(
+                "[policy-teleop] "
+                f"adapter={self.teleop_bridge.coordinate_adapter} "
+                f"axis_map={self.teleop_bridge.input_axis_map} "
+                f"translation_scale={tuple(float(v) for v in self.teleop_bridge.translation_scale_xyz)} "
+                f"yaw_recenter={self.teleop_bridge.yaw_recenter_enabled}",
+                flush=True,
+            )
         print(
             "[policy-ik] initial_right_arm_q="
             + str(tuple(round(float(v), 6) for v in self.initial_right_arm_q)),
@@ -726,6 +1174,8 @@ class RightArmPolicyExecutor:
         self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         self._freeze_target_at_current_eef()
+        if self.teleop_bridge is not None:
+            self.teleop_bridge.reset_from_eef(self.current_eef_pose())
         self._warmup_ik()
         self._hand_target_print_count = 0
 
@@ -739,6 +1189,8 @@ class RightArmPolicyExecutor:
         self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         self._freeze_target_at_current_eef()
+        if self.teleop_bridge is not None:
+            self.teleop_bridge.reset_from_eef(self.current_eef_pose())
         self._warmup_ik()
         self.reset_generation += 1
 
@@ -754,7 +1206,10 @@ class RightArmPolicyExecutor:
         return pose
 
     def current_reference_action(self) -> dict[str, np.ndarray]:
-        eef_9d = np.concatenate([self.target_xyz.astype(np.float32), _rotmat_to_rot6d(self.target_rotation)])
+        if self.teleop_bridge is not None:
+            eef_9d = self.teleop_bridge.current_reference_eef_9d()
+        else:
+            eef_9d = np.concatenate([self.target_xyz.astype(np.float32), _rotmat_to_rot6d(self.target_rotation)])
         arm_joint_target = np.zeros(7, dtype=np.float32)
         arm_joint_target[: min(7, self.q_cmd.size)] = self.q_cmd[: min(7, self.q_cmd.size)]
         return {
@@ -771,9 +1226,16 @@ class RightArmPolicyExecutor:
         if "eef_9d" in action:
             eef = self._action_step(action["eef_9d"], action_index)
             if eef.size >= 3:
-                self.target_xyz = np.clip(eef[:3], self.workspace_min, self.workspace_max)
+                if self.teleop_bridge is not None:
+                    self.target_xyz, self.target_rotation = self.teleop_bridge.step_source_eef(
+                        eef,
+                        dt_s=self.action_dt_s,
+                    )
+                else:
+                    self.target_xyz = np.clip(eef[:3], self.workspace_min, self.workspace_max)
             if eef.size >= 9:
-                self.target_rotation = _rot6d_to_rotmat(eef[3:9])
+                if self.teleop_bridge is None:
+                    self.target_rotation = _rot6d_to_rotmat(eef[3:9])
             self._solve_and_apply_eef_target()
         elif "arm_joint_target" in action:
             self._apply_joint_target(self._action_step(action["arm_joint_target"], action_index))
@@ -791,6 +1253,16 @@ class RightArmPolicyExecutor:
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         if applied_hand and self._should_print_hand():
             print(f"[policy-hand] actual_after_step={self._current_linker_hand_positions()}", flush=True)
+
+    def preview_action_chunk_for_overlay(self, action: dict[str, np.ndarray] | None) -> dict[str, np.ndarray] | None:
+        if self.teleop_bridge is None:
+            return action
+        return self.teleop_bridge.preview_action_chunk(action, max_dt_s=self.action_dt_s)
+
+    def teleop_debug_snapshot(self) -> dict[str, Any] | None:
+        if self.teleop_bridge is None:
+            return None
+        return dict(self.teleop_bridge.last_debug)
 
     def hand_policy_clip_delta(self, action: dict[str, np.ndarray]) -> float:
         max_delta = 0.0
@@ -1932,6 +2404,32 @@ def main() -> int:
     parser.add_argument("--initial-right-arm-q", type=_vec7, default=DEFAULT_INITIAL_RIGHT_ARM_Q)
     parser.add_argument("--initial-left-arm-q", type=_vec7, default=DEFAULT_INITIAL_LEFT_ARM_Q)
     parser.add_argument("--policy-debug-jsonl", type=Path, default=DEFAULT_POLICY_DEBUG_JSONL)
+    parser.add_argument("--policy-teleop-debug-jsonl", type=Path, default=DEFAULT_POLICY_TELEOP_DEBUG_JSONL)
+    parser.add_argument(
+        "--policy-execution-mode",
+        choices=("teleop_source", "robot_target"),
+        default="teleop_source",
+        help="teleop_source treats eef_9d as OpenXR-like source wrist motion; robot_target keeps the old direct Genesis EEF target path.",
+    )
+    parser.add_argument(
+        "--policy-openxr-coordinate-adapter",
+        choices=("openxr_genesis", "none"),
+        default="openxr_genesis",
+        help=(
+            "Coordinate adapter for policy teleop_source mode. "
+            "openxr_genesis matches remote Teleop: Genesis +X=back,+Y=right,+Z=up."
+        ),
+    )
+    parser.add_argument("--policy-input-axis-map", type=_axis_map, default=("x", "y", "z"))
+    parser.add_argument("--policy-translation-scale", type=_vec3, default=DEFAULT_POLICY_TRANSLATION_SCALE)
+    parser.add_argument("--policy-yaw-recenter", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--policy-orientation-reference-mode",
+        choices=("calibrated_tool_local", "tool_local_delta", "world_delta"),
+        default="calibrated_tool_local",
+    )
+    parser.add_argument("--policy-orientation-axis-map", type=_axis_map, default=("x", "y", "z"))
+    parser.add_argument("--policy-orientation-max-speed-rad-s", type=float, default=DEFAULT_POLICY_ORIENTATION_MAX_SPEED_RAD_S)
     parser.add_argument("--scene-support-collider-pos", type=_vec3, default=DEFAULT_SCENE_SUPPORT_COLLIDER_POS)
     parser.add_argument("--scene-support-collider-size", type=_vec3, default=DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE)
     parser.add_argument(
@@ -1949,6 +2447,24 @@ def main() -> int:
         help="Show ego_view and wrist_view model input windows while policy inference is running.",
     )
     parser.add_argument("--camera-preview-scale", type=int, default=2, help="Integer scale for camera preview windows.")
+    parser.add_argument(
+        "--eef-trajectory-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw the current policy eef_9d xyz chunk trajectory in the Genesis viewer.",
+    )
+    parser.add_argument("--eef-trajectory-max-points", type=int, default=64)
+    parser.add_argument("--eef-trajectory-line-radius", type=float, default=0.004)
+    parser.add_argument("--eef-trajectory-point-radius", type=float, default=0.008)
+    parser.add_argument(
+        "--eef-orientation-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Draw rot6d orientation frames along the current eef_9d chunk trajectory.",
+    )
+    parser.add_argument("--eef-orientation-max-frames", type=int, default=16)
+    parser.add_argument("--eef-orientation-axis-length", type=float, default=0.05)
+    parser.add_argument("--eef-orientation-axis-radius", type=float, default=0.002)
     parser.add_argument("--start-policy", action="store_true", help="Start policy inference immediately.")
     parser.add_argument("--max-steps", type=int, default=0, help="Stop after this many policy action steps; 0 means no limit.")
     args = parser.parse_args()
@@ -1971,6 +2487,9 @@ def main() -> int:
         f"action_keys={list(modality_config['action'].modality_keys)}",
         flush=True,
     )
+    action_keys = list(modality_config["action"].modality_keys)
+    action_horizon = len(modality_config["action"].delta_indices)
+    action_dt_s = 1.0 / max(float(args.action_fps), 1.0e-6)
 
     print(f"[scene] creating add_scene_glb scene image_size={image_size}", flush=True)
     scene, _ = harness.create_scene(
@@ -2010,6 +2529,15 @@ def main() -> int:
         initial_hand_q=args.initial_hand_q,
         initial_right_arm_q=args.initial_right_arm_q,
         initial_left_arm_q=args.initial_left_arm_q,
+        policy_execution_mode=str(args.policy_execution_mode),
+        policy_openxr_coordinate_adapter=str(args.policy_openxr_coordinate_adapter),
+        policy_input_axis_map=args.policy_input_axis_map,
+        policy_translation_scale=args.policy_translation_scale,
+        policy_yaw_recenter=bool(args.policy_yaw_recenter),
+        policy_orientation_reference_mode=str(args.policy_orientation_reference_mode),
+        policy_orientation_axis_map=args.policy_orientation_axis_map,
+        policy_orientation_max_speed_rad_s=float(args.policy_orientation_max_speed_rad_s),
+        action_dt_s=action_dt_s,
     )
     obs_builder = Gr00tObservationBuilder(
         modality_config=modality_config,
@@ -2036,10 +2564,18 @@ def main() -> int:
     if console.policy_running:
         print("[policy] inference starts immediately because --start-policy was set", flush=True)
     camera_preview = CameraPreview(enabled=bool(args.camera_preview), scale=int(args.camera_preview_scale))
+    eef_trajectory_overlay = EefChunkTrajectoryOverlay(
+        scene,
+        enabled=bool(args.eef_trajectory_overlay and not args.no_viewer),
+        max_points=int(args.eef_trajectory_max_points),
+        line_radius=float(args.eef_trajectory_line_radius),
+        point_radius=float(args.eef_trajectory_point_radius),
+        show_orientation=bool(args.eef_orientation_overlay),
+        orientation_max_frames=int(args.eef_orientation_max_frames),
+        orientation_axis_length=float(args.eef_orientation_axis_length),
+        orientation_axis_radius=float(args.eef_orientation_axis_radius),
+    )
     action_chunk: dict[str, np.ndarray] | None = None
-    action_keys = list(modality_config["action"].modality_keys)
-    action_horizon = len(modality_config["action"].delta_indices)
-    action_dt_s = 1.0 / max(float(args.action_fps), 1.0e-6)
     seed_manager = TeleopRtcSeedManager(
         action_keys=action_keys,
         action_dt_s=action_dt_s,
@@ -2062,6 +2598,7 @@ def main() -> int:
                 action_chunk = None
                 action_index = 0
                 seed_manager.clear()
+                eef_trajectory_overlay.clear()
                 last_executor_reset_generation = int(executor.reset_generation)
                 print("[policy] cleared action/RTC history after executor reset", flush=True)
             sim_running = False
@@ -2153,6 +2690,8 @@ def main() -> int:
                         frozen_steps=frozen_steps,
                     )
                     action_chunk = executor.probe_clip_action_chunk(raw_stored_action)
+                    overlay_action_chunk = executor.preview_action_chunk_for_overlay(action_chunk)
+                    eef_trajectory_overlay.draw_chunk(overlay_action_chunk)
                     hand_debug = executor.hand_debug_snapshot(
                         policy_action_chunk=policy_action_chunk,
                         clipped_action_chunk=action_chunk,
@@ -2180,7 +2719,9 @@ def main() -> int:
                                 "storage": action_storage_metadata,
                             },
                             "hand": hand_debug,
+                            "teleop_bridge": executor.teleop_debug_snapshot(),
                             "action_summary": _summarize_action_chunk(action_chunk),
+                            "overlay_action_summary": _summarize_action_chunk(overlay_action_chunk or {}),
                         },
                     )
                     if hand_debug.get("negative_floor_warning", {}).get("active"):
@@ -2206,7 +2747,19 @@ def main() -> int:
                     )
                     action_index = 0
                 if action_chunk is not None:
+                    eef_trajectory_overlay.update_active(action_index)
                     executor.step_action(action_chunk, action_index)
+                    teleop_debug = executor.teleop_debug_snapshot()
+                    if teleop_debug is not None:
+                        _append_jsonl(
+                            args.policy_teleop_debug_jsonl,
+                            {
+                                "schema_version": "harness.groot_finetune_teleop_bridge.v1",
+                                "step_count": int(step_count),
+                                "action_index": int(action_index),
+                                "debug": teleop_debug,
+                            },
+                        )
                     action_index += 1
                     step_count += 1
                     if int(args.max_steps) > 0 and step_count >= int(args.max_steps):
@@ -2219,6 +2772,7 @@ def main() -> int:
 
             time.sleep(1.0 / 60.0)
     finally:
+        eef_trajectory_overlay.clear()
         camera_preview.close()
         _shutdown_panel(panel)
     print(f"[done] steps={step_count}", flush=True)
