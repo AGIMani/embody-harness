@@ -31,8 +31,8 @@ DEFAULT_EGO_ROI_CENTER_X = 0.50
 DEFAULT_EGO_ROI_CENTER_Y = 0.65
 DEFAULT_BOTTLE_POS = (-0.016, 0.32889, 0.82667)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 0.0)
-DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.107143, 0.455357, 0.683036)
-DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE = (0.732777, 0.772043, 0.108854)
+DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.541071, -0.112500, 0.678571)
+DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE = (0.700000, 0.700000, 0.040000)
 DEFAULT_INITIAL_RIGHT_ARM_Q = (
     0.2724284429,
     1.6012174157,
@@ -52,16 +52,39 @@ DEFAULT_INITIAL_LEFT_ARM_Q = (
     0.1212131166,
 )
 DEFAULT_INITIAL_HAND_Q = (
-    0.113390,
-    0.422158,
     0.072044,
+    0.422158,
+    0.136070,
+    0.136070,
+    0.136070,
+    0.204105,
     0.034896,
-    0.0,
-    0.0,
     0.026172,
-    0.0,
     0.062802,
-    0.0,
+    0.113390,
+)
+DEFAULT_INITIAL_REFERENCE_EEF_9D = (
+    -0.382481151,
+    0.157008573,
+    0.614672903,
+    -0.117517303,
+    -0.277327377,
+    -0.948701119,
+    0.055898530,
+    -0.955272723,
+    0.272063020,
+)
+DEFAULT_INITIAL_REFERENCE_HAND_Q = (
+    0.072044,
+    0.422158,
+    0.136070,
+    0.136070,
+    0.136070,
+    0.204105,
+    0.034896,
+    0.026172,
+    0.062802,
+    0.113390,
 )
 POLICY_HAND_JOINT_NAMES = (
     "thumb_cmc_pitch",
@@ -77,6 +100,7 @@ POLICY_HAND_JOINT_NAMES = (
 )
 POLICY_HAND_CLIP_LOWER = -0.6
 POLICY_HAND_CLIP_UPPER = 1.6
+DEFAULT_MAX_HAND_JOINT_DELTA = 0.0
 L10_HAND_ACTIVE_LOCAL_INDICES = (0, 2, 3, 4, 5, 9)
 L10_HAND_MASKED_LOCAL_INDICES = (1, 6, 7, 8)
 DEFAULT_IK_J4_LIMIT_RAD = (0.0, 2.14)
@@ -130,6 +154,16 @@ def _vec7(text: str) -> tuple[float, ...]:
         raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
 
 
+def _vec9(text: str) -> tuple[float, ...]:
+    parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
+    if len(parts) != 9:
+        raise argparse.ArgumentTypeError("expected 9 comma-separated numbers")
+    try:
+        return tuple(float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
+
+
 def _vec10(text: str) -> tuple[float, ...]:
     parts = tuple(part.strip() for part in str(text).split(",") if part.strip())
     if len(parts) != 10:
@@ -170,18 +204,20 @@ def _tensor_to_np(value: object) -> np.ndarray:
 
 def _rotmat_to_rot6d(rotation: np.ndarray) -> np.ndarray:
     rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
-    return rotation[:2, :].reshape(6).astype(np.float32)
+    # GR00T's Nero/L10 dataset stores rot6d as the first two rotation columns.
+    # Keep this convention aligned with remote Teleop's groot_policy.py.
+    return rotation[:, :2].reshape(6, order="F").astype(np.float32)
 
 
 def _rot6d_to_rotmat(rot6d: np.ndarray) -> np.ndarray:
-    rot6d = np.asarray(rot6d, dtype=np.float64).reshape(2, 3)
-    row0 = rot6d[0]
-    row1 = rot6d[1]
-    row0 = row0 / max(float(np.linalg.norm(row0)), 1e-12)
-    row1 = row1 - float(np.dot(row0, row1)) * row0
-    row1 = row1 / max(float(np.linalg.norm(row1)), 1e-12)
-    row2 = np.cross(row0, row1)
-    return np.stack([row0, row1, row2], axis=0)
+    rot6d = np.asarray(rot6d, dtype=np.float64).reshape(6)
+    col0 = rot6d[:3]
+    col1 = rot6d[3:6]
+    col0 = col0 / max(float(np.linalg.norm(col0)), 1e-12)
+    col1 = col1 - float(np.dot(col0, col1)) * col0
+    col1 = col1 / max(float(np.linalg.norm(col1)), 1e-12)
+    col2 = np.cross(col0, col1)
+    return np.column_stack([col0, col1, col2])
 
 
 def _rotation_to_quat_xyzw(rotation: np.ndarray) -> tuple[float, float, float, float]:
@@ -833,6 +869,7 @@ class Gr00tObservationBuilder:
         *,
         arm_q: np.ndarray,
         eef_pose: np.ndarray,
+        policy_eef_9d: np.ndarray | None = None,
         hand_q: np.ndarray,
         reference_action: dict[str, np.ndarray],
     ) -> dict[str, Any]:
@@ -848,10 +885,20 @@ class Gr00tObservationBuilder:
         arm_7[: min(7, arm_q.size)] = arm_q[: min(7, arm_q.size)]
         hand_10 = np.zeros(10, dtype=np.float32)
         hand_10[: min(10, hand_q.size)] = np.asarray(hand_q, dtype=np.float32).reshape(-1)[: min(10, hand_q.size)]
-        eef_xyz = np.asarray(eef_pose[:3, 3], dtype=np.float32).reshape(3)
-        eef_9d = np.concatenate([eef_xyz, _rotmat_to_rot6d(eef_pose[:3, :3])]).astype(np.float32)
+        if policy_eef_9d is None:
+            eef_xyz = np.asarray(eef_pose[:3, 3], dtype=np.float32).reshape(3)
+            eef_rot6d = _rotmat_to_rot6d(eef_pose[:3, :3])
+            eef_9d = np.concatenate([eef_xyz, eef_rot6d]).astype(np.float32)
+        else:
+            eef_9d = np.asarray(policy_eef_9d, dtype=np.float32).reshape(-1)[:9]
+            if eef_9d.size != 9:
+                raise ValueError(f"policy_eef_9d must contain 9 values, got {eef_9d.shape}")
+            eef_xyz = eef_9d[:3].astype(np.float32, copy=False)
+            eef_rot6d = eef_9d[3:9].astype(np.float32, copy=False)
         source = {
             "eef_9d": eef_9d,
+            "arm_eef_pos": eef_xyz,
+            "arm_eef_rot6d": eef_rot6d,
             "hand_joint_pos": hand_10,
             "arm_joint_pos": arm_7,
             "hand_joint_target": reference_action["hand_joint_target"].reshape(-1).astype(np.float32),
@@ -1062,7 +1109,10 @@ class RightArmPolicyExecutor:
         workspace_min: tuple[float, float, float],
         workspace_max: tuple[float, float, float],
         print_hand_every: int,
+        max_hand_joint_delta: float,
         initial_hand_q: tuple[float, ...],
+        initial_reference_eef_9d: tuple[float, ...],
+        initial_reference_hand_q: tuple[float, ...],
         initial_right_arm_q: tuple[float, ...],
         initial_left_arm_q: tuple[float, ...],
         policy_execution_mode: str,
@@ -1092,6 +1142,7 @@ class RightArmPolicyExecutor:
         self.ik_j4_limit_rad = tuple(float(v) for v in ik_j4_limit_rad)
         self.workspace_min = np.asarray(workspace_min, dtype=np.float64)
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64)
+        self.max_hand_joint_delta = max(0.0, float(max_hand_joint_delta))
         self.policy_execution_mode = str(policy_execution_mode)
         if self.policy_execution_mode not in {"teleop_source", "robot_target"}:
             raise ValueError(f"unsupported policy execution mode: {self.policy_execution_mode!r}")
@@ -1101,14 +1152,20 @@ class RightArmPolicyExecutor:
         self._ik_joint_limit_hit_count = 0
         self.reset_generation = 0
         self.initial_hand_q = self._clip_policy_hand_q(np.asarray(initial_hand_q, dtype=np.float32))
-        self.policy_hand_q_raw = self.initial_hand_q.copy()
-        self.reference_hand_q = self.initial_hand_q.copy()
-        self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
+        self.initial_reference_eef_9d = np.asarray(initial_reference_eef_9d, dtype=np.float32).reshape(9)
+        self.initial_reference_hand_q = self._clip_policy_hand_q(
+            np.asarray(initial_reference_hand_q, dtype=np.float32)
+        )
+        self.reference_eef_9d = self.initial_reference_eef_9d.copy()
+        self.policy_hand_q_raw = self.initial_reference_hand_q.copy()
+        self.reference_hand_q = self.initial_reference_hand_q.copy()
+        self.sim_hand_q = self._project_hand_q_for_sim(self.initial_hand_q)
         self.hand_q = self.sim_hand_q.copy()
         self._set_initial_arm_poses()
         self.q_cmd = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
         self.target_rotation = self.current_eef_pose()[:3, :3].copy()
         self.target_xyz = self.current_eef_pose()[:3, 3].copy()
+        self.reference_eef_9d = self.target_policy_eef_9d()
         self.teleop_bridge = (
             PolicyTeleopBridge(
                 coordinate_adapter=policy_openxr_coordinate_adapter,
@@ -1158,7 +1215,8 @@ class RightArmPolicyExecutor:
             "[policy-hand] gr00t_l10_groups "
             f"active={tuple(POLICY_HAND_JOINT_NAMES[idx] for idx in L10_HAND_ACTIVE_LOCAL_INDICES)} "
             f"masked={tuple(POLICY_HAND_JOINT_NAMES[idx] for idx in L10_HAND_MASKED_LOCAL_INDICES)} "
-            f"policy_clip=({POLICY_HAND_CLIP_LOWER}, {POLICY_HAND_CLIP_UPPER})",
+            f"policy_clip=({POLICY_HAND_CLIP_LOWER}, {POLICY_HAND_CLIP_UPPER}) "
+            f"max_hand_joint_delta={self.max_hand_joint_delta:.3f}",
             flush=True,
         )
         print(
@@ -1171,9 +1229,25 @@ class RightArmPolicyExecutor:
             ),
             flush=True,
         )
+        print(
+            "[policy-eef] initial_reference_eef_9d="
+            + str(tuple(round(float(v), 6) for v in self.reference_eef_9d)),
+            flush=True,
+        )
+        print(
+            "[policy-hand] initial_sim_pose="
+            + str(
+                {
+                    name: round(float(value), 4)
+                    for name, value in zip(POLICY_HAND_JOINT_NAMES, self.sim_hand_q, strict=False)
+                }
+            ),
+            flush=True,
+        )
         self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         self._freeze_target_at_current_eef()
+        self.reference_eef_9d = self.target_policy_eef_9d()
         if self.teleop_bridge is not None:
             self.teleop_bridge.reset_from_eef(self.current_eef_pose())
         self._warmup_ik()
@@ -1182,20 +1256,30 @@ class RightArmPolicyExecutor:
     def reset(self) -> None:
         self._set_initial_arm_poses()
         self.q_cmd = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
-        self.policy_hand_q_raw = self.initial_hand_q.copy()
-        self.reference_hand_q = self.initial_hand_q.copy()
-        self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
+        self.reference_eef_9d = self.initial_reference_eef_9d.copy()
+        self.policy_hand_q_raw = self.initial_reference_hand_q.copy()
+        self.reference_hand_q = self.initial_reference_hand_q.copy()
+        self.sim_hand_q = self._project_hand_q_for_sim(self.initial_hand_q)
         self.hand_q = self.sim_hand_q.copy()
         self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         self._freeze_target_at_current_eef()
+        self.reference_eef_9d = self.target_policy_eef_9d()
         if self.teleop_bridge is not None:
             self.teleop_bridge.reset_from_eef(self.current_eef_pose())
         self._warmup_ik()
         self.reset_generation += 1
 
     def current_arm_q(self) -> np.ndarray:
-        return self.q_cmd.astype(np.float32, copy=True)
+        return self.current_actual_arm_q()
+
+    def current_actual_arm_q(self) -> np.ndarray:
+        qpos = _tensor_to_np(self.arm.get_qpos()).reshape(-1).astype(np.float32)
+        out = np.zeros(len(self.arm_dofs), dtype=np.float32)
+        for idx, dof in enumerate(self.arm_dofs):
+            if int(dof) < qpos.size:
+                out[idx] = float(qpos[int(dof)])
+        return out
 
     def current_eef_pose(self) -> np.ndarray:
         pos = _tensor_to_np(self.eef_link.get_pos()).reshape(3).astype(np.float64)
@@ -1205,21 +1289,120 @@ class RightArmPolicyExecutor:
         pose[:3, 3] = pos
         return pose
 
+    def _arm_root_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        pos = _tensor_to_np(self.arm.get_pos()).reshape(3).astype(np.float64)
+        quat = _tensor_to_np(self.arm.get_quat()).reshape(4).astype(np.float64)
+        rotation = harness._rotation_from_quat_wxyz(quat)  # noqa: SLF001
+        return pos, np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+
+    def world_pose_to_policy_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Convert Genesis world EEF pose to the remote Teleop robot-base policy frame."""
+        pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+        arm_pos, arm_rotation = self._arm_root_pose()
+        out = np.eye(4, dtype=np.float64)
+        out[:3, 3] = arm_rotation.T @ (pose[:3, 3] - arm_pos)
+        out[:3, :3] = arm_rotation.T @ pose[:3, :3]
+        return out
+
+    def policy_pose_to_world_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Convert remote Teleop robot-base policy frame pose to Genesis world."""
+        pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+        arm_pos, arm_rotation = self._arm_root_pose()
+        out = np.eye(4, dtype=np.float64)
+        out[:3, 3] = arm_pos + arm_rotation @ pose[:3, 3]
+        out[:3, :3] = arm_rotation @ pose[:3, :3]
+        return out
+
+    def current_policy_eef_pose(self) -> np.ndarray:
+        return self.world_pose_to_policy_pose(self.current_eef_pose())
+
+    def current_policy_eef_9d(self) -> np.ndarray:
+        pose = self.current_policy_eef_pose()
+        return np.concatenate([pose[:3, 3].astype(np.float32), _rotmat_to_rot6d(pose[:3, :3])]).astype(np.float32)
+
+    def target_policy_eef_9d(self) -> np.ndarray:
+        pose = np.eye(4, dtype=np.float64)
+        pose[:3, 3] = self.target_xyz
+        pose[:3, :3] = self.target_rotation
+        policy_pose = self.world_pose_to_policy_pose(pose)
+        return np.concatenate(
+            [policy_pose[:3, 3].astype(np.float32), _rotmat_to_rot6d(policy_pose[:3, :3])]
+        ).astype(np.float32)
+
+    def policy_eef_9d_to_world_pose(self, eef_9d: np.ndarray) -> np.ndarray:
+        eef = np.asarray(eef_9d, dtype=np.float64).reshape(-1)
+        policy_pose = np.eye(4, dtype=np.float64)
+        policy_pose[:3, 3] = 0.0
+        policy_pose[:3, 3][: min(3, eef.size)] = eef[: min(3, eef.size)]
+        if eef.size >= 9:
+            policy_pose[:3, :3] = _rot6d_to_rotmat(eef[3:9])
+        else:
+            policy_pose[:3, :3] = self.world_pose_to_policy_pose(
+                np.block(
+                    [
+                        [self.target_rotation, self.target_xyz.reshape(3, 1)],
+                        [np.zeros((1, 3), dtype=np.float64), np.ones((1, 1), dtype=np.float64)],
+                    ]
+                )
+            )[:3, :3]
+        return self.policy_pose_to_world_pose(policy_pose)
+
+    def _command_eef_9d_from_action_step(self, eef: np.ndarray) -> np.ndarray:
+        values = np.asarray(eef, dtype=np.float32).reshape(-1)
+        out = self.reference_eef_9d.astype(np.float32, copy=True)
+        out[: min(9, values.size)] = values[: min(9, values.size)]
+        out = self._clamp_policy_eef_command(out)
+        return out
+
+    def _clamp_policy_eef_command(self, eef_9d: np.ndarray) -> np.ndarray:
+        out = np.asarray(eef_9d, dtype=np.float32).reshape(-1).copy()
+        if out.size >= 3:
+            out[:3] = np.clip(out[:3], self.workspace_min.astype(np.float32), self.workspace_max.astype(np.float32))
+        return out
+
     def current_reference_action(self) -> dict[str, np.ndarray]:
         if self.teleop_bridge is not None:
             eef_9d = self.teleop_bridge.current_reference_eef_9d()
         else:
-            eef_9d = np.concatenate([self.target_xyz.astype(np.float32), _rotmat_to_rot6d(self.target_rotation)])
+            eef_9d = self.reference_eef_9d.astype(np.float32, copy=True)
         arm_joint_target = np.zeros(7, dtype=np.float32)
-        arm_joint_target[: min(7, self.q_cmd.size)] = self.q_cmd[: min(7, self.q_cmd.size)]
+        actual_arm_q = self.current_actual_arm_q()
+        arm_joint_target[: min(7, actual_arm_q.size)] = actual_arm_q[: min(7, actual_arm_q.size)]
         return {
             "eef_9d": eef_9d[None, :],
             "hand_joint_target": self.reference_hand_q[:10][None, :].astype(np.float32),
             "arm_joint_target": arm_joint_target[None, :],
         }
 
+    def rtc_seed_action_from_command_chunk(
+        self,
+        action: dict[str, np.ndarray],
+        *,
+        observation_arm_q: np.ndarray | None = None,
+    ) -> dict[str, np.ndarray]:
+        """Mirror remote _commands_to_groot_action_seed for arm_joint_target.
+
+        EEF and hand commands are action targets. The remote command->seed adapter
+        fills arm_joint_target from the reported arm_joint_pos because policy
+        commands do not carry an arm-joint target when EEF control is active.
+        """
+        seed = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        if "arm_joint_target" not in seed:
+            return seed
+        arm_q = self.current_actual_arm_q() if observation_arm_q is None else np.asarray(observation_arm_q, dtype=np.float32)
+        arm_7 = np.zeros(7, dtype=np.float32)
+        arm_7[: min(7, arm_q.size)] = arm_q[: min(7, arm_q.size)]
+        arr = np.asarray(seed["arm_joint_target"], dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr[0]
+        if arr.ndim == 2:
+            seed["arm_joint_target"] = np.repeat(arm_7[None, :], arr.shape[0], axis=0).astype(np.float32)
+        elif arr.ndim == 1:
+            seed["arm_joint_target"] = arm_7.astype(np.float32)
+        return seed
+
     def current_observation_hand_q(self) -> np.ndarray:
-        return self.sim_hand_q[:10].astype(np.float32, copy=True)
+        return self._current_linker_hand_q(fallback=self.sim_hand_q).astype(np.float32, copy=True)
 
     def step_action(self, action: dict[str, np.ndarray], action_index: int) -> None:
         applied_hand = False
@@ -1232,10 +1415,14 @@ class RightArmPolicyExecutor:
                         dt_s=self.action_dt_s,
                     )
                 else:
-                    self.target_xyz = np.clip(eef[:3], self.workspace_min, self.workspace_max)
+                    self.reference_eef_9d = self._command_eef_9d_from_action_step(eef)
+                    world_pose = self.policy_eef_9d_to_world_pose(self.reference_eef_9d)
+                    self.target_xyz = world_pose[:3, 3]
+                    self.target_rotation = world_pose[:3, :3]
             if eef.size >= 9:
                 if self.teleop_bridge is None:
-                    self.target_rotation = _rot6d_to_rotmat(eef[3:9])
+                    self.reference_eef_9d = self._command_eef_9d_from_action_step(eef)
+                    self.target_rotation = self.policy_eef_9d_to_world_pose(self.reference_eef_9d)[:3, :3]
             self._solve_and_apply_eef_target()
         elif "arm_joint_target" in action:
             self._apply_joint_target(self._action_step(action["arm_joint_target"], action_index))
@@ -1245,7 +1432,10 @@ class RightArmPolicyExecutor:
                 self._action_step(action["hand_joint_target"], action_index)[:10],
                 dtype=np.float32,
             )
-            self.reference_hand_q = self._clip_policy_hand_q(self.policy_hand_q_raw)
+            self.reference_hand_q = self._guard_hand_q_for_command(
+                self.policy_hand_q_raw,
+                previous_hand_q=self.reference_hand_q,
+            )
             self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
             self.hand_q = self.sim_hand_q.copy()
             self._apply_linker_hand_target()
@@ -1256,13 +1446,58 @@ class RightArmPolicyExecutor:
 
     def preview_action_chunk_for_overlay(self, action: dict[str, np.ndarray] | None) -> dict[str, np.ndarray] | None:
         if self.teleop_bridge is None:
-            return action
+            return self._preview_robot_target_action_chunk_in_world(action)
         return self.teleop_bridge.preview_action_chunk(action, max_dt_s=self.action_dt_s)
+
+    def _preview_robot_target_action_chunk_in_world(
+        self,
+        action: dict[str, np.ndarray] | None,
+    ) -> dict[str, np.ndarray] | None:
+        if not isinstance(action, dict) or "eef_9d" not in action:
+            return action
+        preview = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        arr = np.asarray(preview["eef_9d"], dtype=np.float32)
+        batched = arr.ndim == 3
+        chunk = arr[0] if batched else arr
+        if chunk.ndim == 1:
+            chunk = chunk[None, :]
+        if chunk.ndim != 2 or chunk.shape[-1] < 3:
+            return preview
+        mapped_rows = []
+        for row in chunk:
+            world_pose = self.policy_eef_9d_to_world_pose(row)
+            mapped_rows.append(np.concatenate([world_pose[:3, 3].astype(np.float32), _rotmat_to_rot6d(world_pose[:3, :3])]))
+        mapped = np.stack(mapped_rows, axis=0).astype(np.float32)
+        if batched:
+            preview["eef_9d"] = mapped[None, ...]
+        else:
+            preview["eef_9d"] = mapped
+        return preview
 
     def teleop_debug_snapshot(self) -> dict[str, Any] | None:
         if self.teleop_bridge is None:
             return None
         return dict(self.teleop_bridge.last_debug)
+
+    def eef_frame_debug_snapshot(self) -> dict[str, Any]:
+        current_world = self.current_eef_pose()
+        current_policy = self.world_pose_to_policy_pose(current_world)
+        target_world = np.eye(4, dtype=np.float64)
+        target_world[:3, 3] = self.target_xyz
+        target_world[:3, :3] = self.target_rotation
+        target_policy = self.world_pose_to_policy_pose(target_world)
+        arm_pos, arm_rotation = self._arm_root_pose()
+        return {
+            "frame": "right_arm_entity_local_rokae_base",
+            "arm_root_world_pos": arm_pos.tolist(),
+            "arm_root_world_rot6d": _rotmat_to_rot6d(arm_rotation).tolist(),
+            "current_world_xyz": current_world[:3, 3].tolist(),
+            "current_policy_xyz": current_policy[:3, 3].tolist(),
+            "target_world_xyz": target_world[:3, 3].tolist(),
+            "target_policy_xyz": target_policy[:3, 3].tolist(),
+            "reference_action_policy_xyz": self.reference_eef_9d[:3].tolist(),
+            "reference_action_policy_rot6d": self.reference_eef_9d[3:9].tolist(),
+        }
 
     def hand_policy_clip_delta(self, action: dict[str, np.ndarray]) -> float:
         max_delta = 0.0
@@ -1299,11 +1534,69 @@ class RightArmPolicyExecutor:
             flat[row_idx, :10] = self._project_hand_q_for_sim(flat[row_idx, :10])
         return projected
 
+    def guard_action_chunk_for_execution(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        guarded = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        if "eef_9d" in guarded:
+            eef = guarded["eef_9d"]
+            if eef.ndim >= 2 and eef.shape[-1] >= 3:
+                flat_eef = eef.reshape(-1, eef.shape[-1])
+                for row_idx in range(flat_eef.shape[0]):
+                    flat_eef[row_idx, : min(9, flat_eef.shape[1])] = self._clamp_policy_eef_command(
+                        flat_eef[row_idx, : min(9, flat_eef.shape[1])]
+                    )
+        return guarded
+
+    def sim_project_action_chunk_for_execution(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Project command/reference actions to Genesis physical hand limits only for execution."""
+        projected = self.guard_action_chunk_for_execution(action)
+        if "hand_joint_target" not in projected:
+            return projected
+        hand = projected["hand_joint_target"]
+        if hand.ndim < 2 or hand.shape[-1] < 10:
+            return projected
+        flat = hand.reshape(-1, hand.shape[-1])
+        for row_idx in range(flat.shape[0]):
+            flat[row_idx, :10] = self._project_hand_q_for_sim(flat[row_idx, :10])
+        return projected
+
+    def limit_command_hand_chunk(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """Optional command-space rate limit without applying Genesis/URDF physical projection."""
+        limited = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        if "hand_joint_target" not in limited or self.max_hand_joint_delta <= 0.0:
+            return limited
+        hand = limited["hand_joint_target"]
+        if hand.ndim < 2 or hand.shape[-1] < 10:
+            return limited
+        flat = hand.reshape(-1, hand.shape[-1])
+        previous = self.reference_hand_q.astype(np.float32, copy=True)
+        for row_idx in range(flat.shape[0]):
+            values = self._clip_policy_hand_q(flat[row_idx, :10])
+            lower = previous - self.max_hand_joint_delta
+            upper = previous + self.max_hand_joint_delta
+            values = self._clip_policy_hand_q(np.clip(values, lower, upper))
+            flat[row_idx, :10] = values
+            previous = values
+        return limited
+
+    def execution_hand_action_from_command(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        return self.sim_project_action_chunk_for_execution(self.limit_command_hand_chunk(action))
+
+    def _guard_hand_q_for_command(self, hand_q: np.ndarray, *, previous_hand_q: np.ndarray) -> np.ndarray:
+        """Keep GR00T command/reference in policy space; Genesis projection happens separately."""
+        values = self._clip_policy_hand_q(hand_q)
+        if self.max_hand_joint_delta > 0.0:
+            previous = self._clip_policy_hand_q(previous_hand_q)
+            lower = previous - self.max_hand_joint_delta
+            upper = previous + self.max_hand_joint_delta
+            values = self._clip_policy_hand_q(np.clip(values, lower, upper))
+        return values
+
     def hand_debug_snapshot(
         self,
         *,
         policy_action_chunk: dict[str, np.ndarray],
         clipped_action_chunk: dict[str, np.ndarray],
+        guarded_action_chunk: dict[str, np.ndarray],
         reference_action: dict[str, np.ndarray],
         rtc_seed_action: dict[str, np.ndarray] | None,
         reference_action_source: str,
@@ -1313,21 +1606,30 @@ class RightArmPolicyExecutor:
         clipped_hand = (
             _first_batch_chunk(clipped_action_chunk, "hand_joint_target") if "hand_joint_target" in clipped_action_chunk else None
         )
+        guarded_hand = (
+            _first_batch_chunk(guarded_action_chunk, "hand_joint_target")
+            if "hand_joint_target" in guarded_action_chunk
+            else None
+        )
         sim_hand = (
-            _first_batch_chunk(self.sim_project_action_chunk(clipped_action_chunk), "hand_joint_target")
-            if "hand_joint_target" in clipped_action_chunk
+            _first_batch_chunk(self.sim_project_action_chunk(guarded_action_chunk), "hand_joint_target")
+            if "hand_joint_target" in guarded_action_chunk
             else None
         )
         reference_hand = np.asarray(reference_action.get("hand_joint_target", self.reference_hand_q[None, :]), dtype=np.float32)
         rtc_seed_hand = None
         if rtc_seed_action is not None and "hand_joint_target" in rtc_seed_action:
             rtc_seed_hand = _first_batch_chunk(rtc_seed_action, "hand_joint_target")[:1]
+        reference_hand_flat = reference_hand.reshape(-1)[:10].astype(np.float32, copy=True)
         return {
             "reference_hand_source": str(reference_action_source),
             "policy_raw_unclipped": _hand_chunk_debug(raw_hand),
+            "policy_raw_delta_from_reference": _hand_chunk_delta_debug(raw_hand, reference_hand_flat),
             "policy_clipped_probe_range": _hand_chunk_debug(clipped_hand),
+            "guarded_command_range": _hand_chunk_debug(guarded_hand),
+            "guarded_delta_from_reference": _hand_chunk_delta_debug(guarded_hand, reference_hand_flat),
             "sim_hand_projected_range": _hand_chunk_debug(sim_hand),
-            "reference_hand_first": _named_hand_values(reference_hand.reshape(-1)[:10]),
+            "reference_hand_first": _named_hand_values(reference_hand_flat),
             "rtc_seed_hand_first": None if rtc_seed_hand is None else _named_hand_values(rtc_seed_hand.reshape(-1)[:10]),
             "observation_hand_state": _named_hand_values(observation_hand_q),
             "executor_reference_hand": _named_hand_values(self.reference_hand_q),
@@ -1438,6 +1740,59 @@ class RightArmPolicyExecutor:
                 flush=True,
             )
         harness._set_linker_hand_target(self.assembly, "right", _HandTarget(joint_names, self.sim_hand_q))  # noqa: SLF001
+        self._force_linker_hand_q(self.sim_hand_q)
+
+    def _force_linker_hand_q(self, hand_q: np.ndarray) -> bool:
+        """Synchronize Genesis' actual L10 qpos with the current command.
+
+        Remote Nero runtime applies LinkerHand targets by setting and controlling
+        the DOFs in the same update. Keep this policy rollout on that path so
+        reported hand state, command target, and the next RTC reference agree.
+        """
+        linker_hand = self.assembly.get("linker_hand")
+        if linker_hand is None:
+            return False
+        assembly_names = list(self.assembly.get("linker_hand_joint_names", ()))
+        assembly_dofs = list(self.assembly.get("linker_hand_dofs", ()))
+        if not assembly_names or not assembly_dofs:
+            return False
+
+        command = self._project_hand_q_for_sim(hand_q)
+        values_by_name = {
+            name: float(value)
+            for name, value in zip(POLICY_HAND_JOINT_NAMES, command, strict=False)
+        }
+        mimic_by_name = self.assembly.get("linker_hand_mimic_by_name", {})
+        if isinstance(mimic_by_name, dict):
+            for mimic_name, spec in mimic_by_name.items():
+                try:
+                    source_name, multiplier, offset = spec
+                except (TypeError, ValueError):
+                    continue
+                if str(mimic_name) not in values_by_name and str(source_name) in values_by_name:
+                    values_by_name[str(mimic_name)] = float(multiplier) * float(values_by_name[str(source_name)]) + float(offset)
+
+        limits_by_name = self.assembly.get("linker_hand_joint_limits_by_name", {})
+        default_limits = (-np.inf, np.inf)
+        values = np.asarray(
+            [
+                float(
+                    np.clip(
+                        values_by_name.get(str(name), 0.0),
+                        *(limits_by_name.get(str(name), default_limits) if isinstance(limits_by_name, dict) else default_limits),
+                    )
+                )
+                for name in assembly_names
+            ],
+            dtype=np.float32,
+        )
+        try:
+            linker_hand.set_dofs_position(values, assembly_dofs, zero_velocity=True)
+            linker_hand.control_dofs_position(values, assembly_dofs)
+        except Exception as exc:
+            print(f"[policy-hand] force_qpos skipped: {exc}", flush=True)
+            return False
+        return True
 
     def _set_initial_arm_poses(self) -> None:
         harness._set_arm_initial_pose(self.arm, self.initial_right_arm_q)  # noqa: SLF001
@@ -1503,27 +1858,38 @@ class RightArmPolicyExecutor:
         return every > 0 and (self._hand_target_print_count == 1 or self._hand_target_print_count % every == 0)
 
     def _current_linker_hand_positions(self) -> dict[str, float]:
+        qpos = self._current_linker_hand_q(fallback=None)
+        if qpos is None:
+            return {}
+        return {
+            name: round(float(value), 4)
+            for name, value in zip(POLICY_HAND_JOINT_NAMES, qpos, strict=False)
+        }
+
+    def _current_linker_hand_q(self, *, fallback: np.ndarray | None) -> np.ndarray | None:
         linker_hand = self.assembly.get("linker_hand")
         if linker_hand is None:
-            return {}
+            return None if fallback is None else np.asarray(fallback, dtype=np.float32).reshape(-1)[:10].copy()
         assembly_names = list(self.assembly.get("linker_hand_joint_names", ()))
         assembly_dofs = list(self.assembly.get("linker_hand_dofs", ()))
         if not assembly_names or not assembly_dofs:
-            return {}
+            return None if fallback is None else np.asarray(fallback, dtype=np.float32).reshape(-1)[:10].copy()
         try:
             qpos = _tensor_to_np(linker_hand.get_qpos()).reshape(-1)
         except Exception:
-            return {}
+            return None if fallback is None else np.asarray(fallback, dtype=np.float32).reshape(-1)[:10].copy()
         by_name = {
             name: float(qpos[int(dof)])
             for name, dof in zip(assembly_names, assembly_dofs, strict=False)
             if int(dof) < qpos.size
         }
-        return {
-            name: round(float(by_name[name]), 4)
-            for name in POLICY_HAND_JOINT_NAMES
-            if name in by_name
-        }
+        values = np.asarray(fallback if fallback is not None else np.zeros(10, dtype=np.float32), dtype=np.float32).reshape(-1)
+        out = np.zeros(10, dtype=np.float32)
+        out[: min(10, values.size)] = values[: min(10, values.size)]
+        for idx, name in enumerate(POLICY_HAND_JOINT_NAMES):
+            if name in by_name:
+                out[idx] = float(by_name[name])
+        return out
 
 
 def _named_hand_values(values: np.ndarray) -> dict[str, float]:
@@ -1551,6 +1917,35 @@ def _hand_chunk_debug(values: np.ndarray | None) -> dict[str, object] | None:
             name: [
                 round(float(np.min(arr[:, idx])), 4),
                 round(float(np.max(arr[:, idx])), 4),
+            ]
+            for idx, name in enumerate(POLICY_HAND_JOINT_NAMES)
+        },
+    }
+
+
+def _hand_chunk_delta_debug(values: np.ndarray | None, reference: np.ndarray) -> dict[str, object] | None:
+    if values is None:
+        return None
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    if arr.ndim != 2 or arr.shape[-1] < len(POLICY_HAND_JOINT_NAMES):
+        return {"shape": list(arr.shape)}
+    ref = np.asarray(reference, dtype=np.float64).reshape(-1)
+    if ref.size < len(POLICY_HAND_JOINT_NAMES):
+        padded = np.zeros(len(POLICY_HAND_JOINT_NAMES), dtype=np.float64)
+        padded[: ref.size] = ref
+        ref = padded
+    delta = arr[:, : len(POLICY_HAND_JOINT_NAMES)] - ref[: len(POLICY_HAND_JOINT_NAMES)][None, :]
+    return {
+        "shape": list(delta.shape),
+        "first": _named_hand_values(delta[0]),
+        "range": {
+            name: [
+                round(float(np.min(delta[:, idx])), 4),
+                round(float(np.max(delta[:, idx])), 4),
             ]
             for idx, name in enumerate(POLICY_HAND_JOINT_NAMES)
         },
@@ -1586,6 +1981,15 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _jsonable_action(action: dict[str, np.ndarray] | None) -> dict[str, Any] | None:
+    if action is None:
+        return None
+    return {
+        str(key): _jsonable(np.asarray(value, dtype=np.float32))
+        for key, value in action.items()
+    }
 
 
 def _append_jsonl(path: Path | None, row: dict[str, Any]) -> None:
@@ -1839,6 +2243,7 @@ def _stored_rtc_action_chunk(
     }
     metadata: dict[str, Any] = {
         "raw_action_shape": "T,D",
+        "policy_raw_action_field": "policy_raw_action",
         "frozen_seed_steps_requested": int(max(0, frozen_steps)),
         "frozen_seed_steps_applied": 0,
     }
@@ -1986,6 +2391,7 @@ def _teleop_rtc_options(
     max_overlap_steps: int | None,
     frozen_steps: int,
     ramp_rate: float,
+    guidance_beta: float,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     metadata: dict[str, Any] = {
         "enabled": bool(enabled),
@@ -1993,6 +2399,7 @@ def _teleop_rtc_options(
         "action_dt_s": float(action_dt_s),
         "fallback_replan_horizon": int(fallback_replan_horizon),
         "max_overlap_steps": max_overlap_steps,
+        "guidance_beta": float(guidance_beta),
         "previous_action_source": "teleop_trajectory_manager" if previous_action is not None else "none",
     }
     if not enabled or str(rtc_mode) == "off" or previous_action is None:
@@ -2033,6 +2440,7 @@ def _teleop_rtc_options(
         "rtc_overlap_steps": int(overlap_steps),
         "rtc_frozen_steps": max(0, min(int(frozen_steps), int(overlap_steps))),
         "rtc_ramp_rate": float(ramp_rate),
+        "rtc_guidance_beta": float(guidance_beta),
         "rtc_previous_start_step": int(previous_start_step),
     }
     metadata["options"] = dict(options)
@@ -2374,11 +2782,12 @@ def main() -> int:
     parser.add_argument("--replan-horizon", type=int, default=8)
     parser.add_argument("--rtc", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--action-fps", type=float, default=10.0, help="Policy action timeline FPS used for probe-style RTC seed windows.")
-    parser.add_argument("--rtc-mode", choices=("seed_window", "off"), default="seed_window")
+    parser.add_argument("--rtc-mode", choices=("compat", "seed_window", "off"), default="compat")
     parser.add_argument("--rtc-overlap-steps", type=int, default=None)
-    parser.add_argument("--rtc-max-overlap-steps", type=int, default=None)
-    parser.add_argument("--rtc-frozen-steps", type=int, default=4)
-    parser.add_argument("--rtc-ramp-rate", type=float, default=20.0)
+    parser.add_argument("--rtc-max-overlap-steps", type=int, default=5)
+    parser.add_argument("--rtc-frozen-steps", type=int, default=2)
+    parser.add_argument("--rtc-ramp-rate", type=float, default=3.0)
+    parser.add_argument("--rtc-guidance-beta", type=float, default=0.5)
     parser.add_argument("--max-joint-step", type=float, default=0.045)
     parser.add_argument("--ik-solver-max-joint-step", type=float, default=0.045)
     parser.add_argument("--min-joint-step", type=float, default=0.001)
@@ -2391,8 +2800,24 @@ def main() -> int:
         default=1,
         help="Print L10 hand target/actual every N executed policy steps; 0 disables hand step logs.",
     )
-    parser.add_argument("--workspace-min", type=_vec3, default=(-0.75, -0.55, 0.30))
-    parser.add_argument("--workspace-max", type=_vec3, default=(0.25, 0.55, 1.10))
+    parser.add_argument(
+        "--max-hand-joint-delta",
+        type=float,
+        default=DEFAULT_MAX_HAND_JOINT_DELTA,
+        help="Remote Teleop-style per-step L10 command guard in radians; 0 disables step limiting.",
+    )
+    parser.add_argument(
+        "--workspace-min",
+        type=_vec3,
+        default=(-0.85, -0.60, 0.50),
+        help="Policy robot-base frame EEF command minimum xyz, matching remote RealShadow defaults.",
+    )
+    parser.add_argument(
+        "--workspace-max",
+        type=_vec3,
+        default=(-0.20, 0.60, 0.70),
+        help="Policy robot-base frame EEF command maximum xyz, matching remote RealShadow defaults.",
+    )
     parser.add_argument("--bottle-pos", type=_vec3, default=DEFAULT_BOTTLE_POS)
     parser.add_argument("--bottle-euler", type=_vec3, default=DEFAULT_BOTTLE_EULER)
     parser.add_argument(
@@ -2401,6 +2826,18 @@ def main() -> int:
         default=DEFAULT_INITIAL_HAND_Q,
         help="Initial 10D L10 hand target in GR00T canonical order; defaults to the remote Teleop open pose.",
     )
+    parser.add_argument(
+        "--initial-reference-eef-9d",
+        type=_vec9,
+        default=DEFAULT_INITIAL_REFERENCE_EEF_9D,
+        help="Initial action-relative eef_9d command reference in the policy/robot-base frame.",
+    )
+    parser.add_argument(
+        "--initial-reference-hand-q",
+        type=_vec10,
+        default=DEFAULT_INITIAL_REFERENCE_HAND_Q,
+        help="Initial action-relative 10D hand command reference in GR00T canonical order.",
+    )
     parser.add_argument("--initial-right-arm-q", type=_vec7, default=DEFAULT_INITIAL_RIGHT_ARM_Q)
     parser.add_argument("--initial-left-arm-q", type=_vec7, default=DEFAULT_INITIAL_LEFT_ARM_Q)
     parser.add_argument("--policy-debug-jsonl", type=Path, default=DEFAULT_POLICY_DEBUG_JSONL)
@@ -2408,8 +2845,11 @@ def main() -> int:
     parser.add_argument(
         "--policy-execution-mode",
         choices=("teleop_source", "robot_target"),
-        default="teleop_source",
-        help="teleop_source treats eef_9d as OpenXR-like source wrist motion; robot_target keeps the old direct Genesis EEF target path.",
+        default="robot_target",
+        help=(
+            "robot_target matches remote GR00T/Teleop: decoded eef_9d is the robot-frame EEF command target. "
+            "teleop_source is only for explicit OpenXR-source debug."
+        ),
     )
     parser.add_argument(
         "--policy-openxr-coordinate-adapter",
@@ -2503,9 +2943,17 @@ def main() -> int:
         table_collider_pos=args.scene_support_collider_pos,
         table_collider_size=args.scene_support_collider_size,
         show_table_collider=bool(args.show_scene_support_collider),
+        initial_base_pos=harness.DEFAULT_INITIAL_BASE_WORLD_POS,
+        initial_base_euler=harness.DEFAULT_INITIAL_BASE_WORLD_EULER,
         d455_rgb_gui=False,
         d405_camera_gui=False,
         linker_hand_collision=True,
+    )
+    print(
+        "[scene] base_world_pose "
+        f"pos={tuple(round(float(v), 6) for v in harness.DEFAULT_INITIAL_BASE_WORLD_POS)} "
+        f"euler_deg={tuple(round(float(v), 3) for v in harness.DEFAULT_INITIAL_BASE_WORLD_EULER)}",
+        flush=True,
     )
     ego_camera, wrist_camera = _create_policy_cameras(scene, image_size=image_size)
     print(
@@ -2526,7 +2974,10 @@ def main() -> int:
         workspace_min=args.workspace_min,
         workspace_max=args.workspace_max,
         print_hand_every=int(args.print_hand_every),
+        max_hand_joint_delta=float(args.max_hand_joint_delta),
         initial_hand_q=args.initial_hand_q,
+        initial_reference_eef_9d=args.initial_reference_eef_9d,
+        initial_reference_hand_q=args.initial_reference_hand_q,
         initial_right_arm_q=args.initial_right_arm_q,
         initial_left_arm_q=args.initial_left_arm_q,
         policy_execution_mode=str(args.policy_execution_mode),
@@ -2635,10 +3086,12 @@ def main() -> int:
                     camera_preview.show(ego=ego, wrist=wrist)
                     obs_builder.append_frame(ego=ego, wrist=wrist)
                     reference_action = executor.current_reference_action()
+                    observation_arm_q = executor.current_arm_q()
                     observation_hand_q = executor.current_observation_hand_q()
                     observation = obs_builder.build(
-                        arm_q=executor.current_arm_q(),
+                        arm_q=observation_arm_q,
                         eef_pose=executor.current_eef_pose(),
+                        policy_eef_9d=executor.current_policy_eef_9d(),
                         hand_q=observation_hand_q,
                         reference_action=reference_action,
                     )
@@ -2668,6 +3121,7 @@ def main() -> int:
                         max_overlap_steps=max_overlap_steps,
                         frozen_steps=int(args.rtc_frozen_steps),
                         ramp_rate=float(args.rtc_ramp_rate),
+                        guidance_beta=float(args.rtc_guidance_beta),
                     )
                     rtc_reference_action = _first_step_reference(rtc_seed_action) if rtc_options is not None else None
                     reference_action_source = "rtc_seed" if rtc_reference_action is not None else "executor_current"
@@ -2689,19 +3143,25 @@ def main() -> int:
                         action_keys=action_keys,
                         frozen_steps=frozen_steps,
                     )
-                    action_chunk = executor.probe_clip_action_chunk(raw_stored_action)
+                    clipped_action_chunk = executor.probe_clip_action_chunk(raw_stored_action)
+                    action_chunk = executor.guard_action_chunk_for_execution(clipped_action_chunk)
                     overlay_action_chunk = executor.preview_action_chunk_for_overlay(action_chunk)
                     eef_trajectory_overlay.draw_chunk(overlay_action_chunk)
                     hand_debug = executor.hand_debug_snapshot(
                         policy_action_chunk=policy_action_chunk,
-                        clipped_action_chunk=action_chunk,
+                        clipped_action_chunk=clipped_action_chunk,
+                        guarded_action_chunk=action_chunk,
                         reference_action=reference_action,
                         rtc_seed_action=rtc_seed_action,
                         reference_action_source=reference_action_source,
                         observation_hand_q=observation_hand_q,
                     )
-                    seed_manager.push(
+                    rtc_store_action_chunk = executor.rtc_seed_action_from_command_chunk(
                         action_chunk,
+                        observation_arm_q=observation_arm_q,
+                    )
+                    seed_manager.push(
+                        rtc_store_action_chunk,
                         start_monotonic_s=observation_ts_s,
                         frame_id=int(step_count),
                     )
@@ -2719,8 +3179,18 @@ def main() -> int:
                                 "storage": action_storage_metadata,
                             },
                             "hand": hand_debug,
+                            "eef_frame": executor.eef_frame_debug_snapshot(),
                             "teleop_bridge": executor.teleop_debug_snapshot(),
+                            "raw_action": _jsonable_action(raw_stored_action),
+                            "policy_raw_action": _jsonable_action(policy_action_chunk),
+                            "rtc_stored_seed_action": _jsonable_action(rtc_store_action_chunk),
+                            "rtc_seed_action": None
+                            if rtc_seed_action is None
+                            else _jsonable_action(rtc_seed_action),
+                            "reference_action": _jsonable_action(reference_action),
                             "action_summary": _summarize_action_chunk(action_chunk),
+                            "rtc_stored_seed_action_summary": _summarize_action_chunk(rtc_store_action_chunk),
+                            "policy_raw_action_summary": _summarize_action_chunk(policy_action_chunk),
                             "overlay_action_summary": _summarize_action_chunk(overlay_action_chunk or {}),
                         },
                     )

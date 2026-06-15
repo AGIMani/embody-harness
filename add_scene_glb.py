@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 
 import genesis as gs
 import numpy as np
+from PIL import Image
 
 from assets.nero_arm_linker_l10_genesis_config import (
     ACTIVE_LINKER_L10_JOINTS,
@@ -57,6 +58,8 @@ TMP_ROOT = Path(os.environ.get("HARNESS_GENESIS_TMPDIR", f"/tmp/harness_genesis_
 DEFAULT_BASE_SCALE = 0.001
 DEFAULT_BASE_EULER = (90.0, 0.0, 0.0)
 DEFAULT_BASE_FOOT_CENTER_MM = (-51.439, -842.036, -50.0)
+DEFAULT_INITIAL_BASE_WORLD_POS = (0.386667, -0.306667, 0.038889)
+DEFAULT_INITIAL_BASE_WORLD_EULER = (0.0, 0.0, 1.8)
 DEFAULT_MOUNT_HOLE_YAW_DEG = 90.0
 DEFAULT_ARM_LIFT_M = 0.005
 FIXED_ASSEMBLY_TRANSLATION = (-0.235556, -0.486667, -0.805556)
@@ -75,6 +78,10 @@ D455_BASE_REL_EULER_DEG = (180.0, 140.0, 0.0)
 D455_BODY_SIZE_FALLBACK = (0.026, 0.124, 0.029)
 D455_RGB_LOCAL_POS_RATIO = (0.5, 0.0, 0.0)
 DEFAULT_D455_RGB_GUI = True
+D455_MODEL_IMAGE_SIZE = (224, 224)
+D455_EGO_ROI_ZOOM = 2.0
+D455_EGO_ROI_CENTER_X = 0.50
+D455_EGO_ROI_CENTER_Y = 0.65
 D405_BODY_SIZE_FALLBACK = (0.042, 0.042, 0.023)
 RIGHT_D405_CONNECTOR_REL_POS_M = (0.022759, -0.004138, 0.013103)
 RIGHT_D405_CONNECTOR_REL_EULER_DEG = (79.969, 0.0, 0.0)
@@ -287,6 +294,96 @@ def _tensor_to_np(value: object) -> np.ndarray:
     if hasattr(value, "detach"):
         return value.detach().cpu().numpy()
     return np.asarray(value)
+
+
+def _image_size(value: str) -> tuple[int, int]:
+    parts = tuple(part.strip() for part in str(value).split(",") if part.strip())
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("expected height,width, e.g. 224,224")
+    try:
+        height, width = (int(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected integer height,width") from exc
+    if height <= 0 or width <= 0:
+        raise argparse.ArgumentTypeError("height and width must be positive")
+    return height, width
+
+
+def _resize_one_with_pad(image: Image.Image, height: int, width: int) -> np.ndarray:
+    cur_width, cur_height = image.size
+    ratio = max(cur_width / width, cur_height / height)
+    resized_width = max(1, int(cur_width / ratio))
+    resized_height = max(1, int(cur_height / ratio))
+    resized_image = image.resize((resized_width, resized_height), resample=Image.BILINEAR)
+    output = Image.new(resized_image.mode, (width, height), 0)
+    output.paste(resized_image, ((width - resized_width) // 2, (height - resized_height) // 2))
+    return np.asarray(output)
+
+
+def _resize_with_pad(image: np.ndarray, height: int, width: int) -> np.ndarray:
+    if image.shape[-3:-1] == (height, width):
+        return image.astype(np.uint8, copy=False)
+    original_shape = image.shape
+    image = image.reshape(-1, *original_shape[-3:])
+    resized = [_resize_one_with_pad(Image.fromarray(frame), height, width) for frame in image]
+    return np.stack(resized).reshape(*original_shape[:-3], height, width, original_shape[-1])
+
+
+def _roi_crop_zoom_hwc(image: np.ndarray, *, zoom: float, center_x: float, center_y: float) -> np.ndarray:
+    zoom = float(zoom)
+    if zoom <= 1.0:
+        return image
+    height, width = image.shape[:2]
+    if height <= 0 or width <= 0:
+        return image
+    center_x = min(max(float(center_x), 0.0), 1.0)
+    center_y = min(max(float(center_y), 0.0), 1.0)
+    crop_width = max(1, min(width, int(round(width / zoom))))
+    crop_height = max(1, min(height, int(round(height / zoom))))
+    crop_x = int(round(center_x * width - crop_width / 2.0))
+    crop_y = int(round(center_y * height - crop_height / 2.0))
+    crop_x = min(max(0, crop_x), max(0, width - crop_width))
+    crop_y = min(max(0, crop_y), max(0, height - crop_height))
+    return image[crop_y : crop_y + crop_height, crop_x : crop_x + crop_width]
+
+
+def _as_hwc_uint8(
+    value: object,
+    *,
+    image_size: tuple[int, int],
+    roi_zoom: float = 1.0,
+    roi_center_x: float = 0.5,
+    roi_center_y: float = 0.5,
+) -> np.ndarray:
+    if value is None:
+        return np.zeros((*image_size, 3), dtype=np.uint8)
+    image = _tensor_to_np(value)
+    if isinstance(image, np.ndarray) and image.dtype.fields is not None:
+        image = image.view(np.uint8).reshape(image.shape + (-1,))
+    elif isinstance(image, np.ndarray) and image.dtype == np.uint32:
+        image = image.view(np.uint8).reshape(image.shape + (4,))
+    while image.ndim > 3:
+        image = image[0]
+    if image.ndim == 2:
+        image = np.repeat(image[..., None], 3, axis=-1)
+    if image.ndim != 3:
+        return np.zeros((*image_size, 3), dtype=np.uint8)
+    if image.shape[0] in (1, 3, 4) and image.shape[-1] not in (1, 3, 4):
+        image = np.moveaxis(image, 0, -1)
+    if image.shape[-1] == 4:
+        image = image[..., :3]
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+    if image.shape[-1] != 3:
+        return np.zeros((*image_size, 3), dtype=np.uint8)
+    if np.issubdtype(image.dtype, np.floating):
+        max_value = float(np.nanmax(image)) if image.size else 0.0
+        if max_value <= 1.0:
+            image = image * 255.0
+        image = np.clip(image, 0, 255)
+    image = image.astype(np.uint8, copy=False)
+    image = _roi_crop_zoom_hwc(image, zoom=roi_zoom, center_x=roi_center_x, center_y=roi_center_y)
+    return _resize_with_pad(image, image_size[0], image_size[1])
 
 
 def _pose_from_local_anchor(
@@ -1011,13 +1108,93 @@ def _mount_d405_to_right_connector(assembly: dict[str, object]) -> None:
         )
 
 
-def _render_ego_view(scene: gs.Scene, enabled: bool = True) -> None:
+def _render_camera_rgb_model_input(
+    camera: object | None,
+    *,
+    image_size: tuple[int, int],
+    roi_zoom: float = 1.0,
+    roi_center_x: float = 0.5,
+    roi_center_y: float = 0.5,
+) -> np.ndarray:
+    if camera is None:
+        return np.zeros((*image_size, 3), dtype=np.uint8)
+    try:
+        rendered = camera.render(rgb=True, depth=False, segmentation=False, normal=False, force_render=True)
+    except TypeError:
+        rendered = camera.render()
+    except Exception as exc:
+        print(f"[d455-preview] render failed: {exc}", flush=True)
+        return np.zeros((*image_size, 3), dtype=np.uint8)
+    if isinstance(rendered, dict):
+        rendered = rendered.get("rgb", rendered.get("color", rendered.get("image")))
+    elif isinstance(rendered, (tuple, list)):
+        rendered = rendered[0] if rendered else None
+    return _as_hwc_uint8(
+        rendered,
+        image_size=image_size,
+        roi_zoom=roi_zoom,
+        roi_center_x=roi_center_x,
+        roi_center_y=roi_center_y,
+    )
+
+
+def _show_rgb_preview(scene: gs.Scene, window_name: str, image: np.ndarray, *, scale: int = 2) -> None:
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        if not getattr(scene, "_d455_preview_display_warned", False):
+            print("[d455-preview] disabled: DISPLAY/WAYLAND_DISPLAY is not set", flush=True)
+            scene._d455_preview_display_warned = True
+        return
+    try:
+        import cv2
+    except Exception as exc:
+        if not getattr(scene, "_d455_preview_cv2_warned", False):
+            print(f"[d455-preview] disabled: failed to import cv2: {exc}", flush=True)
+            scene._d455_preview_cv2_warned = True
+        return
+    frame = np.asarray(image, dtype=np.uint8)
+    if int(scale) > 1:
+        height, width = frame.shape[:2]
+        frame = cv2.resize(frame, (width * int(scale), height * int(scale)), interpolation=cv2.INTER_NEAREST)
+    try:
+        cv2.imshow(window_name, frame[..., ::-1])
+        cv2.waitKey(1)
+    except Exception as exc:
+        if not getattr(scene, "_d455_preview_imshow_warned", False):
+            print(f"[d455-preview] disabled: failed to show OpenCV window: {exc}", flush=True)
+            scene._d455_preview_imshow_warned = True
+
+
+def _render_ego_view(
+    scene: gs.Scene,
+    enabled: bool = True,
+    *,
+    image_size: tuple[int, int] = D455_MODEL_IMAGE_SIZE,
+    roi_zoom: float = D455_EGO_ROI_ZOOM,
+    roi_center_x: float = D455_EGO_ROI_CENTER_X,
+    roi_center_y: float = D455_EGO_ROI_CENTER_Y,
+    preview_scale: int = 2,
+) -> None:
     if not enabled:
         return
     camera = getattr(scene, "d455_rgb_camera", None)
     if camera is None:
         return
-    camera.render(rgb=True, depth=False, segmentation=False, normal=False, force_render=True)
+    image = _render_camera_rgb_model_input(
+        camera,
+        image_size=image_size,
+        roi_zoom=roi_zoom,
+        roi_center_x=roi_center_x,
+        roi_center_y=roi_center_y,
+    )
+    if not getattr(scene, "_d455_preview_started", False):
+        print(
+            "[d455-preview] showing D455 ego_view model input "
+            f"size={tuple(int(v) for v in image_size)} roi_zoom={float(roi_zoom):.2f} "
+            f"center=({float(roi_center_x):.2f},{float(roi_center_y):.2f})",
+            flush=True,
+        )
+        scene._d455_preview_started = True
+    _show_rgb_preview(scene, "D455 ego_view model input", image, scale=int(preview_scale))
 
 
 def _render_d405_view(scene: gs.Scene, enabled: bool = True) -> None:
@@ -2552,8 +2729,12 @@ def create_scene(
         )
 
     scene.build()
-    initial_base_pos = tuple(float(v) for v in (pos if initial_base_pos is None else initial_base_pos))
-    initial_base_euler = tuple(float(v) for v in (euler if initial_base_euler is None else initial_base_euler))
+    initial_base_pos = tuple(
+        float(v) for v in (DEFAULT_INITIAL_BASE_WORLD_POS if initial_base_pos is None else initial_base_pos)
+    )
+    initial_base_euler = tuple(
+        float(v) for v in (DEFAULT_INITIAL_BASE_WORLD_EULER if initial_base_euler is None else initial_base_euler)
+    )
     _initialize_nero_linker_assembly(
         scene,
         assembly_info,
@@ -2679,14 +2860,39 @@ def main() -> None:
         dest="d455_rgb_gui",
         action="store_true",
         default=DEFAULT_D455_RGB_GUI,
-        help="Open the built-in Genesis GUI window for the D455 RGB ego camera (default).",
+        help="Open a cropped D455 ego_view preview matching the finetune model input (default).",
     )
     parser.add_argument(
         "--no-d455-rgb-gui",
         dest="d455_rgb_gui",
         action="store_false",
-        help="Disable the built-in Genesis GUI window for the D455 RGB ego camera.",
+        help="Disable the cropped D455 ego_view preview window.",
     )
+    parser.add_argument(
+        "--d455-model-image-size",
+        type=_image_size,
+        default=D455_MODEL_IMAGE_SIZE,
+        help="D455 ego preview/model input size as height,width.",
+    )
+    parser.add_argument(
+        "--d455-ego-roi-zoom",
+        type=float,
+        default=D455_EGO_ROI_ZOOM,
+        help="D455 ego_view center-crop digital zoom, matching finetune inference.",
+    )
+    parser.add_argument(
+        "--d455-ego-roi-center-x",
+        type=float,
+        default=D455_EGO_ROI_CENTER_X,
+        help="D455 ego_view ROI center X in normalized image coordinates.",
+    )
+    parser.add_argument(
+        "--d455-ego-roi-center-y",
+        type=float,
+        default=D455_EGO_ROI_CENTER_Y,
+        help="D455 ego_view ROI center Y in normalized image coordinates.",
+    )
+    parser.add_argument("--d455-preview-scale", type=int, default=2, help="Integer scale for the cropped D455 preview window.")
     parser.add_argument("--no-d405", action="store_true", help="Do not mount the D405 camera on the right connector.")
     parser.add_argument("--d405-json", type=Path, default=DEFAULT_D405_JSON)
     parser.add_argument(
@@ -2770,6 +2976,12 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true", help="Build the scene without opening the viewer.")
     parser.add_argument("--steps", type=int, default=0, help="Simulation steps to run in headless mode.")
     args = parser.parse_args()
+    if float(args.d455_ego_roi_zoom) < 1.0:
+        raise SystemExit(f"--d455-ego-roi-zoom must be >= 1.0, got {args.d455_ego_roi_zoom}")
+    if not 0.0 <= float(args.d455_ego_roi_center_x) <= 1.0:
+        raise SystemExit(f"--d455-ego-roi-center-x must be in [0, 1], got {args.d455_ego_roi_center_x}")
+    if not 0.0 <= float(args.d455_ego_roi_center_y) <= 1.0:
+        raise SystemExit(f"--d455-ego-roi-center-y must be in [0, 1], got {args.d455_ego_roi_center_y}")
     if args.no_collision:
         print("[scene] --no-collision ignored: scene.glb is visual-only; table collision uses --no-table-collider.", flush=True)
     if args.dynamic:
@@ -2833,7 +3045,7 @@ def main() -> None:
         connector_scale=args.connector_scale,
         add_d455=not args.no_d455,
         d455_json=args.d455_json,
-        d455_rgb_gui=args.d455_rgb_gui,
+        d455_rgb_gui=False,
         add_d405=not args.no_d405,
         d405_json=args.d405_json,
         d405_camera_gui=args.d405_camera_gui,
@@ -2953,7 +3165,15 @@ def main() -> None:
                 "Say 开始 to engage, 暂停 to clutch, 继续 to resume, 重置 to recenter, 停止 to hold.",
                 flush=True,
             )
-        _render_ego_view(scene, ego_view_enabled)
+        _render_ego_view(
+            scene,
+            ego_view_enabled,
+            image_size=args.d455_model_image_size,
+            roi_zoom=float(args.d455_ego_roi_zoom),
+            roi_center_x=float(args.d455_ego_roi_center_x),
+            roi_center_y=float(args.d455_ego_roi_center_y),
+            preview_scale=int(args.d455_preview_scale),
+        )
         _render_d405_view(scene, d405_view_enabled)
         while scene.viewer.is_alive():
             if voice_policy is not None and vr_robot is not None:
@@ -2995,7 +3215,15 @@ def main() -> None:
                     scene.visualizer.update(force=True)
             else:
                 _step_scene_with_attached_parts(scene)
-            _render_ego_view(scene, ego_view_enabled)
+            _render_ego_view(
+                scene,
+                ego_view_enabled,
+                image_size=args.d455_model_image_size,
+                roi_zoom=float(args.d455_ego_roi_zoom),
+                roi_center_x=float(args.d455_ego_roi_center_x),
+                roi_center_y=float(args.d455_ego_roi_center_y),
+                preview_scale=int(args.d455_preview_scale),
+            )
             _render_d405_view(scene, d405_view_enabled)
             if xr_status_publisher is not None and vr_robot is not None:
                 xr_status_publisher.publish(snapshot=vr_robot.xr_status_snapshot())
@@ -3011,6 +3239,14 @@ def main() -> None:
             voice_policy.disconnect()
         if vr_session is not None:
             vr_session.__exit__(None, None, None)
+        if getattr(scene, "_d455_preview_started", False):
+            try:
+                import cv2
+
+                cv2.destroyWindow("D455 ego_view model input")
+                cv2.waitKey(1)
+            except Exception:
+                pass
         _shutdown_base_pose_panel(base_pose_panel)
 
 
