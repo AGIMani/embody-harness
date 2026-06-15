@@ -20,8 +20,8 @@ import add_scene_glb as harness
 DEFAULT_D455_JSON = ROOT_DIR / "assets" / "d455json.json"
 DEFAULT_OUTPUT = ROOT_DIR / "assets" / "d455_base_mount_debug.json"
 
-DEFAULT_D455_REL_POS_M = (0.0, 1.08, 0.55)
-DEFAULT_D455_REL_EULER_DEG = (0.0, 0.0, 0.0)
+DEFAULT_D455_REL_POS_M = (-0.327778, 0.252000, 1.288889)
+DEFAULT_D455_REL_EULER_DEG = (0.0, 140.0, 0.0)
 
 COARSE_TRANSLATION_RANGE_M = 1.5
 FINE_TRANSLATION_STEP_M = 0.001
@@ -267,12 +267,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nero-urdf", type=Path, default=harness.DEFAULT_NERO_URDF)
     parser.add_argument("--package-root", type=Path, default=harness.DEFAULT_PACKAGE_ROOT)
     parser.add_argument("--base-scale", type=float, default=harness.DEFAULT_BASE_SCALE)
-    parser.add_argument("--base-euler", type=harness._vec3, default=harness.DEFAULT_BASE_EULER)
+    parser.add_argument("--base-pos", type=harness._vec3, default=(0.0, 0.0, 0.0))
+    parser.add_argument("--base-euler", type=harness._vec3, default=(0.0, 0.0, 0.0))
+    parser.add_argument(
+        "--use-base-foot-anchor",
+        action="store_true",
+        help="Use --base-foot-center-mm as an anchor at world origin instead of --base-pos.",
+    )
     parser.add_argument("--base-foot-center-mm", type=harness._vec3, default=harness.DEFAULT_BASE_FOOT_CENTER_MM)
     parser.add_argument("--assembly-origin", type=harness._vec3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--connector-mesh", type=Path, default=harness.DEFAULT_CONNECTOR_MESH)
     parser.add_argument("--connector-scale", type=float, default=harness.DEFAULT_CONNECTOR_SCALE)
-    parser.add_argument("--no-connectors", action="store_true")
+    parser.add_argument("--show-connectors", action="store_true", help="Show EEF connectors while tuning D455.")
     parser.add_argument("--no-revo2-flange", action="store_true")
     parser.add_argument("--no-viewer", action="store_true", help="Build once and print the initial D455 pose.")
     return parser.parse_args()
@@ -285,6 +291,17 @@ def main() -> None:
         raise FileNotFoundError(f"D455 JSON not found: {d455_json}")
     body_size = _load_d455_body_size(d455_json)
     initial_values = tuple(float(v) for v in (*args.initial_pos, *args.initial_euler))
+    base_world_pos = (
+        harness._pose_from_local_anchor(
+            tuple(float(v) for v in args.base_foot_center_mm),
+            tuple(float(v) for v in args.base_euler),
+            float(args.base_scale),
+            tuple(float(v) for v in args.assembly_origin),
+        )
+        if args.use_base_foot_anchor
+        else tuple(float(v) for v in args.base_pos)
+    )
+    base_world_euler = tuple(float(v) for v in args.base_euler)
 
     gs.init(backend=gs.gpu if args.backend == "gpu" else gs.cpu)
     scene = gs.Scene(
@@ -306,7 +323,7 @@ def main() -> None:
         nero_urdf=args.nero_urdf,
         package_root=args.package_root,
         linker_hand_urdf=None,
-        connector_mesh=None if args.no_connectors else args.connector_mesh,
+        connector_mesh=args.connector_mesh if args.show_connectors else None,
         connector_scale=float(args.connector_scale),
         origin=args.assembly_origin,
         base_scale=float(args.base_scale),
@@ -337,9 +354,12 @@ def main() -> None:
     )
 
     scene.build()
-    left_arm = assembly["left"]
-    right_arm = assembly["right"]
-    harness._mount_connectors_to_arms(assembly, left_arm, right_arm)
+    harness._apply_base_world_pose(assembly, base_world_pos, base_world_euler)
+    scene.step()
+    if args.show_connectors:
+        left_arm = assembly["left"]
+        right_arm = assembly["right"]
+        harness._mount_connectors_to_arms(assembly, left_arm, right_arm)
 
     base = assembly["base"]
     base_pos = harness._tensor_to_np(base.get_pos()).reshape(3).astype(np.float64)

@@ -19,14 +19,15 @@ import add_scene_glb as harness
 
 DEFAULT_OUTPUT = ROOT_DIR / "assets" / "nero_twin" / "arm_base_relative_pose_debug.json"
 
-DEFAULT_LEFT_ARM_REL_POS_M = (0.252915, 1.078233, 0.193274)
-DEFAULT_LEFT_ARM_REL_EULER_DEG = (180.0, 0.0, 90.0)
-DEFAULT_RIGHT_ARM_REL_POS_M = (0.252915, 1.078472, 0.311659)
-DEFAULT_RIGHT_ARM_REL_EULER_DEG = (0.0, 0.0, 90.0)
+DEFAULT_LEFT_ARM_REL_POS_M = (-0.253000, 0.194000, 1.078000)
+DEFAULT_LEFT_ARM_REL_EULER_DEG = (90.0, -90.0, 0.0)
+DEFAULT_RIGHT_ARM_REL_POS_M = (-0.253000, 0.312000, 1.078000)
+DEFAULT_RIGHT_ARM_REL_EULER_DEG = (-90.0, -90.0, 0.0)
 
-FINE_TUNE_TRANSLATION_RANGE_M = 0.10
-FINE_TUNE_TRANSLATION_STEP_M = 0.001
-FINE_TUNE_ROTATION_RANGE_DEG = 15.0
+FINE_TUNE_TRANSLATION_RANGE_M = 1.0
+FINE_TUNE_TRANSLATION_SLIDER_STEP_M = 0.01
+FINE_TUNE_TRANSLATION_BUTTON_STEP_M = 0.001
+FINE_TUNE_ROTATION_RANGE_DEG = 90.0
 FINE_TUNE_ROTATION_STEP_DEG = 0.1
 
 
@@ -148,35 +149,46 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
     from tkinter import ttk
 
     specs = (
-        ("left x", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_STEP_M, "m"),
-        ("left y", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_STEP_M, "m"),
-        ("left z", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_STEP_M, "m"),
-        ("left roll", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
-        ("left pitch", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
-        ("left yaw", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
-        ("right x", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_STEP_M, "m"),
-        ("right y", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_STEP_M, "m"),
-        ("right z", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_STEP_M, "m"),
-        ("right roll", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
-        ("right pitch", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
-        ("right yaw", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
+        ("left x", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_SLIDER_STEP_M, FINE_TUNE_TRANSLATION_BUTTON_STEP_M, "m"),
+        ("left y", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_SLIDER_STEP_M, FINE_TUNE_TRANSLATION_BUTTON_STEP_M, "m"),
+        ("left z", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_SLIDER_STEP_M, FINE_TUNE_TRANSLATION_BUTTON_STEP_M, "m"),
+        ("left roll", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
+        ("left pitch", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
+        ("left yaw", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
+        ("right x", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_SLIDER_STEP_M, FINE_TUNE_TRANSLATION_BUTTON_STEP_M, "m"),
+        ("right y", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_SLIDER_STEP_M, FINE_TUNE_TRANSLATION_BUTTON_STEP_M, "m"),
+        ("right z", FINE_TUNE_TRANSLATION_RANGE_M, FINE_TUNE_TRANSLATION_SLIDER_STEP_M, FINE_TUNE_TRANSLATION_BUTTON_STEP_M, "m"),
+        ("right roll", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
+        ("right pitch", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
+        ("right yaw", FINE_TUNE_ROTATION_RANGE_DEG, FINE_TUNE_ROTATION_STEP_DEG, FINE_TUNE_ROTATION_STEP_DEG, "deg"),
     )
+    programmatic_slider_update = [False]
 
-    def set_delta(idx: int, delta: float | str) -> None:
-        span = float(specs[idx][1])
+    def set_delta(idx: int, delta: float | str, *, snap_to_slider: bool = False) -> None:
+        _, span, slider_step, _, _ = specs[idx]
+        span = float(span)
         delta_value = max(-span, min(span, float(delta)))
+        if snap_to_slider and not programmatic_slider_update[0]:
+            delta_value = round(delta_value / float(slider_step)) * float(slider_step)
+            delta_value = max(-span, min(span, delta_value))
+            if abs(float(sliders[idx].get()) - delta_value) > 1.0e-9:
+                sliders[idx].set(delta_value)
         absolute_value = float(initial_values[idx]) + delta_value
         values[idx] = absolute_value
         delta_labels[idx].config(text=f"{delta_value:+.5f}")
         value_labels[idx].config(text=f"{absolute_value: .5f}")
 
     def step_delta(idx: int, direction: int) -> None:
-        step = float(specs[idx][2])
+        step = float(specs[idx][3])
         delta_value = float(sliders[idx].get()) + float(direction) * step
         span = float(specs[idx][1])
         delta_value = max(-span, min(span, delta_value))
-        sliders[idx].set(delta_value)
-        set_delta(idx, delta_value)
+        programmatic_slider_update[0] = True
+        try:
+            sliders[idx].set(delta_value)
+        finally:
+            programmatic_slider_update[0] = False
+        set_delta(idx, delta_value, snap_to_slider=False)
 
     def reset() -> None:
         for idx, slider in enumerate(sliders):
@@ -203,7 +215,7 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
     sliders = []
     delta_labels = []
     value_labels = []
-    for idx, (label, span, step, unit) in enumerate(specs):
+    for idx, (label, span, _slider_step, _button_step, unit) in enumerate(specs):
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, pady=3)
         ttk.Label(row, text=f"{label} ({unit})", width=14).pack(side=tk.LEFT)
@@ -213,7 +225,7 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
             from_=-float(span),
             to=float(span),
             orient=tk.HORIZONTAL,
-            command=lambda value, i=idx: set_delta(i, value),
+            command=lambda value, i=idx: set_delta(i, value, snap_to_slider=True),
         )
         slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         ttk.Button(row, text="+", width=3, command=lambda i=idx: step_delta(i, 1)).pack(side=tk.LEFT)
@@ -284,10 +296,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--base-pos",
         type=harness._vec3,
-        default=None,
-        help="Base world position as x,y,z. Default uses --base-foot-center-mm as an anchor at world origin.",
+        default=(0.0, 0.0, 0.0),
+        help="Base world position as x,y,z. Defaults to 0,0,0.",
     )
-    parser.add_argument("--base-euler", type=harness._vec3, default=harness.DEFAULT_BASE_EULER)
+    parser.add_argument("--base-euler", type=harness._vec3, default=(0.0, 0.0, 0.0))
+    parser.add_argument(
+        "--use-base-foot-anchor",
+        action="store_true",
+        help="Use --base-foot-center-mm as an anchor at world origin instead of --base-pos.",
+    )
     parser.add_argument(
         "--base-foot-center-mm",
         type=harness._vec3,
@@ -313,13 +330,13 @@ def main() -> None:
         raise FileNotFoundError(f"Nero URDF not found: {nero_urdf}")
 
     base_pos = (
-        tuple(float(v) for v in args.base_pos)
-        if args.base_pos is not None
-        else harness._pose_from_local_anchor(
+        harness._pose_from_local_anchor(
             tuple(float(v) for v in args.base_foot_center_mm),
             tuple(float(v) for v in args.base_euler),
             float(args.base_scale),
         )
+        if args.use_base_foot_anchor
+        else tuple(float(v) for v in args.base_pos)
     )
     base_euler = tuple(float(v) for v in args.base_euler)
     initial_values = tuple(

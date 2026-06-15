@@ -61,17 +61,17 @@ DEFAULT_MOUNT_HOLE_YAW_DEG = 90.0
 DEFAULT_ARM_LIFT_M = 0.005
 FIXED_ASSEMBLY_TRANSLATION = (-0.235556, -0.486667, -0.805556)
 FIXED_ASSEMBLY_EULER = (0.0, 0.0, 96.0)
-LEFT_ARM_REL_POS_M = (0.252915, 1.078233, 0.193274)
-LEFT_ARM_REL_EULER_DEG = (180.0, 0.0, 90.0)
-RIGHT_ARM_REL_POS_M = (0.252915, 1.078472, 0.311659)
-RIGHT_ARM_REL_EULER_DEG = (0.0, 0.0, 90.0)
+LEFT_ARM_REL_POS_M = (-0.253000, 0.194000, 1.078000)
+LEFT_ARM_REL_EULER_DEG = (90.0, -90.0, 0.0)
+RIGHT_ARM_REL_POS_M = (-0.253000, 0.312000, 1.078000)
+RIGHT_ARM_REL_EULER_DEG = (-90.0, -90.0, 0.0)
 DEFAULT_CONNECTOR_SCALE = 0.001
-LEFT_CONNECTOR_MOUNT_OFFSET_XYZ = (-0.021481, -0.088889, 0.037778)
-LEFT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, 0.0, 0.0)
-RIGHT_CONNECTOR_MOUNT_OFFSET_XYZ = (0.022963, 0.089630, 0.037778)
+LEFT_CONNECTOR_MOUNT_OFFSET_XYZ = (-0.023000, -0.089000, 0.038000)
+LEFT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, -0.3, 0.0)
+RIGHT_CONNECTOR_MOUNT_OFFSET_XYZ = (0.022000, 0.089000, 0.038000)
 RIGHT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, 0.0, 180.0)
-D455_BASE_REL_POS_M = (0.327778, 1.288889, 0.252556)
-D455_BASE_REL_EULER_DEG = (-90.0, 0.0, -40.0)
+D455_BASE_REL_POS_M = (-0.327778, 0.252000, 1.288889)
+D455_BASE_REL_EULER_DEG = (0.0, 140.0, 0.0)
 D455_BODY_SIZE_FALLBACK = (0.026, 0.124, 0.029)
 D455_RGB_LOCAL_POS_RATIO = (0.5, 0.0, 0.0)
 DEFAULT_D455_RGB_GUI = True
@@ -167,6 +167,21 @@ def _rotation_z(theta: float) -> np.ndarray:
 def _rotation_from_euler_deg(euler_deg: tuple[float, float, float]) -> np.ndarray:
     x, y, z = (np.deg2rad(v) for v in euler_deg)
     return _rotation_z(z) @ _rotation_y(y) @ _rotation_x(x)
+
+
+def _euler_deg_from_rotation(rotation: np.ndarray) -> tuple[float, float, float]:
+    rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
+    sy = -float(rotation[2, 0])
+    sy = max(-1.0, min(1.0, sy))
+    y = math.asin(sy)
+    cy = math.cos(y)
+    if abs(cy) > 1.0e-8:
+        x = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
+        z = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+    else:
+        x = 0.0
+        z = math.atan2(-float(rotation[0, 1]), float(rotation[1, 1]))
+    return tuple(float(np.rad2deg(v)) for v in (x, y, z))
 
 
 def _rotation_about_axis(axis: np.ndarray, angle_rad: float) -> np.ndarray:
@@ -578,16 +593,54 @@ def _apply_assembly_transform(
     translation: tuple[float, float, float],
     euler_deg: tuple[float, float, float],
 ) -> None:
+    _apply_assembly_matrix_transform(
+        assembly,
+        np.asarray(translation, dtype=np.float64),
+        _rotation_from_euler_deg(euler_deg),
+    )
+
+
+def _apply_assembly_matrix_transform(
+    assembly: dict[str, object] | None,
+    translation_vec: np.ndarray,
+    rotation: np.ndarray,
+) -> None:
     if not assembly:
         return
     origin = np.asarray(assembly["origin"], dtype=np.float64)
-    translation_vec = np.asarray(translation, dtype=np.float64)
-    rotation = _rotation_from_euler_deg(euler_deg)
+    translation_vec = np.asarray(translation_vec, dtype=np.float64).reshape(3)
+    rotation = np.asarray(rotation, dtype=np.float64).reshape(3, 3)
     for item in assembly["pose_items"]:
         original_pos = np.asarray(item["pos"], dtype=np.float64)
         original_rotation = np.asarray(item["rotation"], dtype=np.float64)
         pos = origin + translation_vec + rotation @ (original_pos - origin)
         _set_entity_pose(item["entity"], pos, rotation @ original_rotation)
+
+
+def _assembly_transform_for_base_world_pose(
+    assembly: dict[str, object],
+    base_pos: tuple[float, float, float],
+    base_euler: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    origin = np.asarray(assembly["origin"], dtype=np.float64)
+    initial_pos = np.asarray(assembly["base_initial_pos"], dtype=np.float64)
+    initial_rotation = np.asarray(assembly["base_initial_rotation"], dtype=np.float64)
+    target_pos = np.asarray(base_pos, dtype=np.float64)
+    target_rotation = _rotation_from_euler_deg(base_euler)
+    assembly_rotation = target_rotation @ initial_rotation.T
+    assembly_translation = target_pos - origin - assembly_rotation @ (initial_pos - origin)
+    return assembly_translation, assembly_rotation
+
+
+def _apply_base_world_pose(
+    assembly: dict[str, object] | None,
+    base_pos: tuple[float, float, float],
+    base_euler: tuple[float, float, float],
+) -> None:
+    if not assembly:
+        return
+    translation, rotation = _assembly_transform_for_base_world_pose(assembly, base_pos, base_euler)
+    _apply_assembly_matrix_transform(assembly, translation, rotation)
 
 
 def _get_joint_dofs(robot: object, joint_name: str) -> list[int]:
@@ -1008,10 +1061,16 @@ def _step_scene_with_attached_parts(scene: gs.Scene) -> None:
         _refresh_scene_attached_parts(scene)
 
 
-def _initialize_nero_linker_assembly(scene: gs.Scene, assembly: dict[str, object] | None) -> None:
+def _initialize_nero_linker_assembly(
+    scene: gs.Scene,
+    assembly: dict[str, object] | None,
+    *,
+    initial_base_pos: tuple[float, float, float],
+    initial_base_euler: tuple[float, float, float],
+) -> None:
     if not assembly:
         return
-    _apply_assembly_transform(assembly, FIXED_ASSEMBLY_TRANSLATION, FIXED_ASSEMBLY_EULER)
+    _apply_base_world_pose(assembly, initial_base_pos, initial_base_euler)
     left_arm = assembly["left"]
     right_arm = assembly["right"]
     _set_arm_initial_pose(left_arm, INITIAL_LEFT_ARM_Q)
@@ -1025,12 +1084,12 @@ def _initialize_nero_linker_assembly(scene: gs.Scene, assembly: dict[str, object
 def _apply_assembly_debug_pose(
     scene: gs.Scene,
     assembly: dict[str, object] | None,
-    translation: tuple[float, float, float],
-    euler_deg: tuple[float, float, float],
+    base_pos: tuple[float, float, float],
+    base_euler_deg: tuple[float, float, float],
 ) -> None:
     if not assembly:
         return
-    _apply_assembly_transform(assembly, translation, euler_deg)
+    _apply_base_world_pose(assembly, base_pos, base_euler_deg)
     scene.step()
     _mount_assembly_attached_parts(assembly)
 
@@ -1965,12 +2024,12 @@ def _base_pose_panel_main(initial_values, values, running, reset_counter, stop_f
     def print_pose() -> None:
         current = [float(values[idx]) for idx in range(6)]
         print(
-            "[base-debug] relative_to_assembly_origin\n"
-            f"  translation={tuple(round(v, 6) for v in current[:3])} "
+            "[base-debug] base_world_pose\n"
+            f"  pos={tuple(round(v, 6) for v in current[:3])} "
             f"euler_deg={tuple(round(v, 3) for v in current[3:])}\n"
-            "  python_constants:\n"
-            f"    FIXED_ASSEMBLY_TRANSLATION = ({current[0]:.6f}, {current[1]:.6f}, {current[2]:.6f})\n"
-            f"    FIXED_ASSEMBLY_EULER = ({current[3]:.3f}, {current[4]:.3f}, {current[5]:.3f})",
+            "  add_scene_glb_args:\n"
+            f"    --initial-base-pos {current[0]:.6f},{current[1]:.6f},{current[2]:.6f} "
+            f"--initial-base-euler {current[3]:.3f},{current[4]:.3f},{current[5]:.3f}",
             flush=True,
         )
 
@@ -1980,11 +2039,11 @@ def _base_pose_panel_main(initial_values, values, running, reset_counter, stop_f
         root.quit()
 
     root = tk.Tk()
-    root.title("Base Pose Debug")
+    root.title("Base World Pose Debug")
     root.geometry("760x430")
     root.minsize(660, 380)
 
-    title = ttk.Label(root, text="Base assembly pose", font=("Arial", 12, "bold"))
+    title = ttk.Label(root, text="Base world pose", font=("Arial", 12, "bold"))
     title.pack(fill=tk.X, padx=12, pady=(12, 4))
 
     frame = ttk.Frame(root)
@@ -2280,6 +2339,8 @@ def _add_dual_nero_arm_assembly(
     ]
     return {
         "base": base,
+        "base_initial_pos": np.asarray(base_pos, dtype=np.float64),
+        "base_initial_rotation": _rotation_from_euler_deg(base_euler),
         "left": left_arm,
         "right": right_arm,
         "connectors": connectors,
@@ -2321,6 +2382,8 @@ def create_scene(
     show_table_collider: bool = False,
     add_arm_assembly: bool = True,
     assembly_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    initial_base_pos: tuple[float, float, float] | None = None,
+    initial_base_euler: tuple[float, float, float] | None = None,
     base_mesh: str | Path = DEFAULT_BASE_MESH,
     nero_urdf: str | Path = DEFAULT_NERO_URDF,
     package_root: str | Path = DEFAULT_PACKAGE_ROOT,
@@ -2489,7 +2552,14 @@ def create_scene(
         )
 
     scene.build()
-    _initialize_nero_linker_assembly(scene, assembly_info)
+    initial_base_pos = tuple(float(v) for v in (pos if initial_base_pos is None else initial_base_pos))
+    initial_base_euler = tuple(float(v) for v in (euler if initial_base_euler is None else initial_base_euler))
+    _initialize_nero_linker_assembly(
+        scene,
+        assembly_info,
+        initial_base_pos=initial_base_pos,
+        initial_base_euler=initial_base_euler,
+    )
     _apply_bottle_pose(bottle_entity, bottle_pos, bottle_euler)
     scene.nero_assembly_info = assembly_info
     scene.d455_info = assembly_info.get("d455") if isinstance(assembly_info, dict) else None
@@ -2502,6 +2572,8 @@ def create_scene(
     scene.table_collider_entity = table_collider_entity
     scene.bottle_initial_pos = bottle_pos
     scene.bottle_initial_euler = bottle_euler
+    scene.initial_base_debug_pos = initial_base_pos
+    scene.initial_base_debug_euler = initial_base_euler
     return scene, scene_entity
 
 
@@ -2573,6 +2645,18 @@ def main() -> None:
         help="Render the table collision proxy for alignment debugging.",
     )
     parser.add_argument("--assembly-origin", type=_vec3, default=(0.0, 0.0, 0.0), help="Dual-arm assembly origin as x,y,z.")
+    parser.add_argument(
+        "--initial-base-pos",
+        type=_vec3,
+        default=None,
+        help="Initial base world position for the debug panel. Defaults to scene.glb --pos.",
+    )
+    parser.add_argument(
+        "--initial-base-euler",
+        type=_vec3,
+        default=None,
+        help="Initial base world XYZ Euler degrees for the debug panel. Defaults to scene.glb --euler.",
+    )
     parser.add_argument("--base-mesh", type=Path, default=DEFAULT_BASE_MESH)
     parser.add_argument("--nero-urdf", type=Path, default=DEFAULT_NERO_URDF)
     parser.add_argument("--package-root", type=Path, default=DEFAULT_PACKAGE_ROOT)
@@ -2736,6 +2820,8 @@ def main() -> None:
         show_table_collider=args.show_table_collider,
         add_arm_assembly=not args.no_arm_assembly,
         assembly_origin=args.assembly_origin,
+        initial_base_pos=args.initial_base_pos,
+        initial_base_euler=args.initial_base_euler,
         base_mesh=args.base_mesh,
         nero_urdf=args.nero_urdf,
         package_root=args.package_root,
@@ -2764,11 +2850,16 @@ def main() -> None:
 
     base_pose_panel = _create_base_pose_panel(
         not args.enable_vr_teleop and not args.no_arm_assembly and not args.no_base_pose_panel,
-        FIXED_ASSEMBLY_TRANSLATION,
-        FIXED_ASSEMBLY_EULER,
+        tuple(float(v) for v in getattr(scene, "initial_base_debug_pos", args.pos)),
+        tuple(float(v) for v in getattr(scene, "initial_base_debug_euler", args.euler)),
     )
     last_panel_pose: tuple[tuple[float, float, float], tuple[float, float, float]] | None = (
-        (FIXED_ASSEMBLY_TRANSLATION, FIXED_ASSEMBLY_EULER) if base_pose_panel else None
+        (
+            tuple(float(v) for v in getattr(scene, "initial_base_debug_pos", args.pos)),
+            tuple(float(v) for v in getattr(scene, "initial_base_debug_euler", args.euler)),
+        )
+        if base_pose_panel
+        else None
     )
     last_reset_counter = 0
     ego_view_enabled = bool(args.d455_rgb_gui and not args.no_d455)
@@ -2891,7 +2982,7 @@ def main() -> None:
                     if reset_requested:
                         print(
                             "[base-reset] "
-                            f"translation={tuple(round(v, 6) for v in panel_translation)} "
+                            f"pos={tuple(round(v, 6) for v in panel_translation)} "
                             f"euler_deg={tuple(round(v, 3) for v in panel_euler)}",
                             flush=True,
                         )

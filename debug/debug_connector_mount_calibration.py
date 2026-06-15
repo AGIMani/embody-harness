@@ -22,15 +22,22 @@ DEFAULT_OUTPUT = ROOT_DIR / "assets" / "connector_mount_debug.json"
 
 DEFAULT_SIDE = "left"
 
-RIGHT_CONNECTOR_MOUNT_OFFSET_XYZ = (0.022963, 0.089630, 0.037778)
+EXPECTED_LEFT_ARM_REL_POS_M = (-0.253000, 0.194000, 1.078000)
+EXPECTED_LEFT_ARM_REL_EULER_DEG = (90.0, -90.0, 0.0)
+EXPECTED_RIGHT_ARM_REL_POS_M = (-0.253000, 0.312000, 1.078000)
+EXPECTED_RIGHT_ARM_REL_EULER_DEG = (-90.0, -90.0, 0.0)
+
+RIGHT_CONNECTOR_MOUNT_OFFSET_XYZ = (0.022000, 0.089000, 0.038000)
 RIGHT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, 0.0, 180.0)
 
-LEFT_CONNECTOR_MOUNT_OFFSET_XYZ = (-0.021481, -0.088889, 0.037778)
-LEFT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, 0.0, 0.0)
+LEFT_CONNECTOR_MOUNT_OFFSET_XYZ = (-0.023000, -0.089000, 0.038000)
+LEFT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, -0.3, 0.0)
 
-COARSE_TRANSLATION_RANGE_M = 0.20
+COARSE_TRANSLATION_RANGE_M = 1.0
+COARSE_TRANSLATION_SLIDER_STEP_M = 0.01
 FINE_TRANSLATION_STEP_M = 0.001
-COARSE_ROTATION_RANGE_DEG = 180.0
+COARSE_ROTATION_RANGE_DEG = 90.0
+YAW_ROTATION_RANGE_DEG = 180.0
 FINE_ROTATION_STEP_DEG = 0.1
 
 
@@ -126,29 +133,40 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
     from tkinter import ttk
 
     specs = (
-        ("x", -COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_RANGE_M, FINE_TRANSLATION_STEP_M, "m"),
-        ("y", -COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_RANGE_M, FINE_TRANSLATION_STEP_M, "m"),
-        ("z", -COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_RANGE_M, FINE_TRANSLATION_STEP_M, "m"),
-        ("roll", -COARSE_ROTATION_RANGE_DEG, COARSE_ROTATION_RANGE_DEG, FINE_ROTATION_STEP_DEG, "deg"),
-        ("pitch", -COARSE_ROTATION_RANGE_DEG, COARSE_ROTATION_RANGE_DEG, FINE_ROTATION_STEP_DEG, "deg"),
-        ("yaw", -COARSE_ROTATION_RANGE_DEG, COARSE_ROTATION_RANGE_DEG, FINE_ROTATION_STEP_DEG, "deg"),
+        ("x", -COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_SLIDER_STEP_M, FINE_TRANSLATION_STEP_M, "m"),
+        ("y", -COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_SLIDER_STEP_M, FINE_TRANSLATION_STEP_M, "m"),
+        ("z", -COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_RANGE_M, COARSE_TRANSLATION_SLIDER_STEP_M, FINE_TRANSLATION_STEP_M, "m"),
+        ("roll", -COARSE_ROTATION_RANGE_DEG, COARSE_ROTATION_RANGE_DEG, FINE_ROTATION_STEP_DEG, FINE_ROTATION_STEP_DEG, "deg"),
+        ("pitch", -COARSE_ROTATION_RANGE_DEG, COARSE_ROTATION_RANGE_DEG, FINE_ROTATION_STEP_DEG, FINE_ROTATION_STEP_DEG, "deg"),
+        ("yaw", -YAW_ROTATION_RANGE_DEG, YAW_ROTATION_RANGE_DEG, FINE_ROTATION_STEP_DEG, FINE_ROTATION_STEP_DEG, "deg"),
     )
+    programmatic_slider_update = [False]
 
-    def set_value(idx: int, value: float | str) -> None:
+    def set_value(idx: int, value: float | str, *, snap_to_slider: bool = False) -> None:
         lower = float(specs[idx][1])
         upper = float(specs[idx][2])
+        slider_step = float(specs[idx][3])
         clamped = max(lower, min(upper, float(value)))
+        if snap_to_slider and not programmatic_slider_update[0]:
+            clamped = round(clamped / slider_step) * slider_step
+            clamped = max(lower, min(upper, clamped))
+            if abs(float(sliders[idx].get()) - clamped) > 1.0e-9:
+                sliders[idx].set(clamped)
         values[idx] = clamped
         value_labels[idx].config(text=f"{clamped: .5f}")
 
     def step_value(idx: int, direction: int) -> None:
         current = float(sliders[idx].get())
-        step = float(specs[idx][3])
+        step = float(specs[idx][4])
         lower = float(specs[idx][1])
         upper = float(specs[idx][2])
         next_value = max(lower, min(upper, current + float(direction) * step))
-        sliders[idx].set(next_value)
-        set_value(idx, next_value)
+        programmatic_slider_update[0] = True
+        try:
+            sliders[idx].set(next_value)
+        finally:
+            programmatic_slider_update[0] = False
+        set_value(idx, next_value, snap_to_slider=False)
 
     def reset() -> None:
         for idx, slider in enumerate(sliders):
@@ -174,7 +192,7 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
 
     sliders = []
     value_labels = []
-    for idx, (label, lower, upper, step, unit) in enumerate(specs):
+    for idx, (label, lower, upper, _slider_step, _button_step, unit) in enumerate(specs):
         row = ttk.Frame(frame)
         row.pack(fill=tk.X, pady=5)
         ttk.Label(row, text=f"{label} ({unit})", width=12).pack(side=tk.LEFT)
@@ -183,7 +201,7 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
             from_=float(lower),
             to=float(upper),
             orient=tk.HORIZONTAL,
-            command=lambda value, i=idx: set_value(i, value),
+            command=lambda value, i=idx: set_value(i, value, snap_to_slider=True),
         )
         slider.set(float(initial_values[idx]))
         slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
@@ -257,6 +275,21 @@ def _default_mount_for_side(side: str) -> tuple[tuple[float, float, float], tupl
     return LEFT_CONNECTOR_MOUNT_OFFSET_XYZ, LEFT_CONNECTOR_MOUNT_EULER_DEG
 
 
+def _require_expected_arm_mounts() -> None:
+    checks = (
+        ("LEFT_ARM_REL_POS_M", harness.LEFT_ARM_REL_POS_M, EXPECTED_LEFT_ARM_REL_POS_M),
+        ("LEFT_ARM_REL_EULER_DEG", harness.LEFT_ARM_REL_EULER_DEG, EXPECTED_LEFT_ARM_REL_EULER_DEG),
+        ("RIGHT_ARM_REL_POS_M", harness.RIGHT_ARM_REL_POS_M, EXPECTED_RIGHT_ARM_REL_POS_M),
+        ("RIGHT_ARM_REL_EULER_DEG", harness.RIGHT_ARM_REL_EULER_DEG, EXPECTED_RIGHT_ARM_REL_EULER_DEG),
+    )
+    mismatches = []
+    for name, actual, expected in checks:
+        if not np.allclose(np.asarray(actual, dtype=np.float64), np.asarray(expected, dtype=np.float64), atol=1.0e-9):
+            mismatches.append(f"{name}: actual={actual} expected={expected}")
+    if mismatches:
+        raise RuntimeError("add_scene_glb arm/base mount constants do not match this connector calibration:\n  " + "\n  ".join(mismatches))
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Tune connector.STL pose relative to a Nero arm end-effector frame.")
     parser.add_argument("--backend", choices=("cpu", "gpu"), default="cpu")
@@ -271,7 +304,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nero-urdf", type=Path, default=harness.DEFAULT_NERO_URDF)
     parser.add_argument("--package-root", type=Path, default=harness.DEFAULT_PACKAGE_ROOT)
     parser.add_argument("--base-scale", type=float, default=harness.DEFAULT_BASE_SCALE)
-    parser.add_argument("--base-euler", type=harness._vec3, default=harness.DEFAULT_BASE_EULER)
+    parser.add_argument("--base-pos", type=harness._vec3, default=(0.0, 0.0, 0.0))
+    parser.add_argument("--base-euler", type=harness._vec3, default=(0.0, 0.0, 0.0))
+    parser.add_argument(
+        "--use-base-foot-anchor",
+        action="store_true",
+        help="Use --base-foot-center-mm as an anchor at world origin instead of --base-pos.",
+    )
     parser.add_argument("--base-foot-center-mm", type=harness._vec3, default=harness.DEFAULT_BASE_FOOT_CENTER_MM)
     parser.add_argument("--assembly-origin", type=harness._vec3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--no-revo2-flange", action="store_true")
@@ -281,6 +320,7 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    _require_expected_arm_mounts()
     connector_mesh = args.connector_mesh.expanduser().resolve()
     if not connector_mesh.exists():
         raise FileNotFoundError(f"Connector mesh not found: {connector_mesh}")
@@ -289,6 +329,17 @@ def main() -> None:
     initial_offset = args.initial_offset if args.initial_offset is not None else default_offset
     initial_euler = args.initial_euler if args.initial_euler is not None else default_euler
     initial_values = tuple(float(v) for v in (*initial_offset, *initial_euler))
+    base_world_pos = (
+        harness._pose_from_local_anchor(
+            tuple(float(v) for v in args.base_foot_center_mm),
+            tuple(float(v) for v in args.base_euler),
+            float(args.base_scale),
+            tuple(float(v) for v in args.assembly_origin),
+        )
+        if args.use_base_foot_anchor
+        else tuple(float(v) for v in args.base_pos)
+    )
+    base_world_euler = tuple(float(v) for v in args.base_euler)
 
     gs.init(backend=gs.gpu if args.backend == "gpu" else gs.cpu)
     scene = gs.Scene(
@@ -310,6 +361,9 @@ def main() -> None:
         nero_urdf=args.nero_urdf,
         package_root=args.package_root,
         linker_hand_urdf=None,
+        connector_mesh=None,
+        d455_json=None,
+        d405_json=None,
         origin=args.assembly_origin,
         base_scale=float(args.base_scale),
         base_euler=tuple(float(v) for v in args.base_euler),
@@ -330,6 +384,8 @@ def main() -> None:
     )
 
     scene.build()
+    harness._apply_base_world_pose(assembly, base_world_pos, base_world_euler)
+    scene.step()
     mount_arm = assembly["left"] if args.side == "left" else assembly["right"]
     _apply_connector_pose(connector, mount_arm, eef_link_name=str(args.eef_link), values=initial_values)
 
