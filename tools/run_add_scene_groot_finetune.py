@@ -106,8 +106,9 @@ L10_HAND_MASKED_LOCAL_INDICES = (1, 6, 7, 8)
 DEFAULT_IK_J4_LIMIT_RAD = (0.0, 2.14)
 DEFAULT_POLICY_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_policy_debug.jsonl"
 DEFAULT_POLICY_TELEOP_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_teleop_bridge.jsonl"
-DEFAULT_POLICY_TRANSLATION_SCALE = (1.0, 1.0, 1.0)
-DEFAULT_POLICY_ORIENTATION_MAX_SPEED_RAD_S = 8.0
+DEFAULT_POLICY_TRACE_DIR = ROOT_DIR / "logs" / "groot_finetune_policy_trace"
+DEFAULT_POLICY_TRANSLATION_SCALE = (0.6, 0.6, 0.6)
+DEFAULT_POLICY_ORIENTATION_MAX_SPEED_RAD_S = 4.0
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -940,6 +941,7 @@ class PolicyTeleopBridge:
         orientation_max_speed_rad_s: float,
         workspace_min: tuple[float, float, float],
         workspace_max: tuple[float, float, float],
+        workspace_clamp: bool,
     ) -> None:
         self.coordinate_adapter = str(coordinate_adapter)
         if self.coordinate_adapter not in {"openxr_genesis", "none"}:
@@ -949,6 +951,7 @@ class PolicyTeleopBridge:
         self.yaw_recenter_enabled = bool(yaw_recenter)
         self.workspace_min = np.asarray(workspace_min, dtype=np.float64).reshape(3)
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64).reshape(3)
+        self.workspace_clamp = bool(workspace_clamp)
         self.orientation_tracker = OrientationTargetTracker(
             OrientationTrackerConfig(
                 axis_map=tuple(str(v) for v in orientation_axis_map),  # type: ignore[arg-type]
@@ -963,6 +966,7 @@ class PolicyTeleopBridge:
         self.target_anchor_xyz = np.zeros(3, dtype=np.float64)
         self.target_anchor_quat_wxyz = (1.0, 0.0, 0.0, 0.0)
         self.yaw_correction_rad: float | None = None
+        self.source_anchor_pending = True
         self.last_debug: dict[str, Any] = {}
         self.reset_generation = 0
 
@@ -978,12 +982,14 @@ class PolicyTeleopBridge:
         self._reset_yaw_correction(source_quat)
         source_quat = _apply_yaw_to_quat_xyzw(source_quat, self.yaw_correction_rad)
         self.orientation_tracker.reset_anchor(source_quat, self.target_anchor_quat_wxyz)
+        self.source_anchor_pending = True
         self.reset_generation += 1
         self.last_debug = {
             "event": "reset",
             "coordinate_adapter": self.coordinate_adapter,
             "adapter_payload": self._adapter_debug_payload(),
             "source_anchor_xyz": self.source_anchor_xyz.tolist(),
+            "source_anchor_pending": bool(self.source_anchor_pending),
             "target_anchor_xyz": self.target_anchor_xyz.tolist(),
             "target_anchor_quat_wxyz": list(self.target_anchor_quat_wxyz),
             "yaw_correction_rad": self.yaw_correction_rad,
@@ -993,6 +999,36 @@ class PolicyTeleopBridge:
             "[policy-teleop] reset "
             f"adapter={self.coordinate_adapter} "
             f"target_anchor={tuple(round(float(v), 4) for v in self.target_anchor_xyz)} "
+            f"yaw_deg={None if self.yaw_correction_rad is None else round(math.degrees(self.yaw_correction_rad), 3)}",
+            flush=True,
+        )
+
+    def reset_source_anchor(self, source_xyz: np.ndarray, source_rotation: np.ndarray, *, reason: str) -> None:
+        self.source_anchor_xyz = np.asarray(source_xyz, dtype=np.float64).reshape(3).copy()
+        self.source_anchor_rotation = np.asarray(source_rotation, dtype=np.float64).reshape(3, 3).copy()
+        self.source_command_xyz = self.source_anchor_xyz.copy()
+        self.source_command_rotation = self.source_anchor_rotation.copy()
+        source_quat = self._source_rotation_to_genesis_quat(self.source_anchor_rotation)
+        self._reset_yaw_correction(source_quat)
+        source_quat = _apply_yaw_to_quat_xyzw(source_quat, self.yaw_correction_rad)
+        self.orientation_tracker.reset_anchor(source_quat, self.target_anchor_quat_wxyz)
+        self.source_anchor_pending = False
+        self.last_debug = {
+            "event": "source_anchor_reset",
+            "reason": str(reason),
+            "coordinate_adapter": self.coordinate_adapter,
+            "source_anchor_xyz": self.source_anchor_xyz.tolist(),
+            "source_anchor_rot6d": _rotmat_to_rot6d(self.source_anchor_rotation).tolist(),
+            "target_anchor_xyz": self.target_anchor_xyz.tolist(),
+            "target_anchor_quat_wxyz": list(self.target_anchor_quat_wxyz),
+            "yaw_correction_rad": self.yaw_correction_rad,
+            "yaw_correction_deg": None if self.yaw_correction_rad is None else math.degrees(self.yaw_correction_rad),
+        }
+        print(
+            "[policy-teleop] source_anchor "
+            f"reason={reason} "
+            f"source={tuple(round(float(v), 4) for v in self.source_anchor_xyz)} "
+            f"target={tuple(round(float(v), 4) for v in self.target_anchor_xyz)} "
             f"yaw_deg={None if self.yaw_correction_rad is None else round(math.degrees(self.yaw_correction_rad), 3)}",
             flush=True,
         )
@@ -1007,6 +1043,8 @@ class PolicyTeleopBridge:
 
     def step_source_eef(self, eef_9d: np.ndarray, *, dt_s: float) -> tuple[np.ndarray, np.ndarray]:
         source_xyz, source_rotation = self._decode_source_eef(eef_9d)
+        if self.source_anchor_pending:
+            self.reset_source_anchor(source_xyz, source_rotation, reason="first_policy_source_sample")
         target_xyz, mapped_delta, source_delta = self._target_position_from_source(source_xyz)
         source_quat = self._source_rotation_to_genesis_quat(source_rotation)
         source_quat = _apply_yaw_to_quat_xyzw(source_quat, self.yaw_correction_rad)
@@ -1018,6 +1056,8 @@ class PolicyTeleopBridge:
             "event": "step",
             "coordinate_adapter": self.coordinate_adapter,
             "source_xyz": source_xyz.tolist(),
+            "source_anchor_xyz": self.source_anchor_xyz.tolist(),
+            "source_anchor_pending": bool(self.source_anchor_pending),
             "source_delta_openxr": source_delta.tolist(),
             "mapped_delta_genesis": mapped_delta.tolist(),
             "target_xyz": target_xyz.tolist(),
@@ -1072,7 +1112,9 @@ class PolicyTeleopBridge:
         if self.yaw_correction_rad is not None:
             mapped = _yaw_rotation_matrix(self.yaw_correction_rad) @ mapped
         mapped = mapped * self.translation_scale_xyz
-        target = np.clip(self.target_anchor_xyz + mapped, self.workspace_min, self.workspace_max)
+        target = self.target_anchor_xyz + mapped
+        if self.workspace_clamp:
+            target = np.clip(target, self.workspace_min, self.workspace_max)
         return target, mapped, source_delta
 
     def _source_rotation_to_genesis_quat(self, source_rotation: np.ndarray) -> tuple[float, float, float, float]:
@@ -1086,7 +1128,7 @@ class PolicyTeleopBridge:
             self.yaw_correction_rad = None
             return
         rotation = _quat_xyzw_to_rotation(source_quat_xyzw)
-        source_forward = -rotation[:, 2]
+        source_forward = rotation[:, 2]
         horizontal = np.asarray((source_forward[0], source_forward[1]), dtype=np.float64)
         norm = float(np.linalg.norm(horizontal))
         if norm <= 1.0e-9:
@@ -1141,6 +1183,7 @@ class RightArmPolicyExecutor:
         ik_differential_max_joint_acceleration_rad_s2: float,
         workspace_min: tuple[float, float, float],
         workspace_max: tuple[float, float, float],
+        workspace_clamp: bool,
         print_hand_every: int,
         max_hand_joint_delta: float,
         initial_hand_q: tuple[float, ...],
@@ -1148,6 +1191,7 @@ class RightArmPolicyExecutor:
         initial_reference_hand_q: tuple[float, ...],
         initial_right_arm_q: tuple[float, ...],
         initial_left_arm_q: tuple[float, ...],
+        policy_eef_link: str,
         policy_execution_mode: str,
         policy_openxr_coordinate_adapter: str,
         policy_input_axis_map: tuple[str, str, str],
@@ -1165,7 +1209,11 @@ class RightArmPolicyExecutor:
         self.assembly = assembly
         self.arm = assembly["right"]
         self.left_arm = assembly.get("left")
-        self.eef_link = self.arm.get_link(str(assembly.get("eef_link", harness.DEFAULT_EEF_LINK)))
+        self.policy_eef_link_name = str(policy_eef_link)
+        if self.policy_eef_link_name not in {"revo2_flange", "link7"}:
+            raise ValueError(f"unsupported policy_eef_link: {self.policy_eef_link_name!r}")
+        self.assembly_eef_link_name = str(assembly.get("eef_link", harness.DEFAULT_EEF_LINK))
+        self.eef_link = self.arm.get_link(self.policy_eef_link_name)
         self.arm_dofs = harness._arm_dofs(self.arm)  # noqa: SLF001
         self.arm_ik_mode = str(arm_ik_mode)
         if self.arm_ik_mode not in {"genesis_pose", "differential_full_pose"}:
@@ -1196,6 +1244,7 @@ class RightArmPolicyExecutor:
         self.last_differential_ik_debug: dict[str, Any] | None = None
         self.workspace_min = np.asarray(workspace_min, dtype=np.float64)
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64)
+        self.workspace_clamp = bool(workspace_clamp)
         self.max_hand_joint_delta = max(0.0, float(max_hand_joint_delta))
         self.policy_execution_mode = str(policy_execution_mode)
         if self.policy_execution_mode not in {"teleop_source", "robot_target"}:
@@ -1231,6 +1280,7 @@ class RightArmPolicyExecutor:
                 orientation_max_speed_rad_s=policy_orientation_max_speed_rad_s,
                 workspace_min=workspace_min,
                 workspace_max=workspace_max,
+                workspace_clamp=self.workspace_clamp,
             )
             if self.policy_execution_mode == "teleop_source"
             else None
@@ -1242,16 +1292,32 @@ class RightArmPolicyExecutor:
         print(
             "[policy-ik] "
             f"mode={self.arm_ik_mode} "
-            f"eef_link={getattr(self.eef_link, 'name', 'revo2_flange')} "
+            f"eef_link={self.policy_eef_link_name} "
+            f"assembly_eef_link={self.assembly_eef_link_name} "
             f"max_joint_step={self.max_joint_step:.4f} "
             f"ik_solver_max_joint_step={self.ik_solver_max_joint_step:.4f} "
             f"min_joint_step={self.min_joint_step:.4f} "
             f"pos_tol={self.pos_tol:.1e} "
             f"ik_j4_limit={self.ik_j4_limit} range={self.ik_j4_limit_rad} "
             f"ik_command_hz={self.ik_command_hz:.1f} "
-            f"policy_execution_mode={self.policy_execution_mode}",
+            f"policy_execution_mode={self.policy_execution_mode} "
+            f"workspace_clamp={self.workspace_clamp}",
             flush=True,
         )
+        print(
+            "[policy-eef] remote_semantics="
+            "teleop_source mode treats policy eef_9d as OpenXR wrist/source pose; "
+            "it is anchored like remote engage_teleop and mapped to the selected robot TCP/control-link. "
+            "rot6d=[R00,R10,R20,R01,R11,R21]",
+            flush=True,
+        )
+        if self.policy_eef_link_name == "revo2_flange":
+            print(
+                "[policy-eef] revo2_flange_joint parent=link7 "
+                "xyz=(0.032,0,-0.0235) rpy=(-1.5708,0,-1.5708); "
+                "axes: flange +X=link7 -Y, +Y=link7 -Z, +Z=link7 +X",
+                flush=True,
+            )
         if self.teleop_bridge is not None:
             print(
                 "[policy-teleop] "
@@ -1266,6 +1332,7 @@ class RightArmPolicyExecutor:
             + str(tuple(round(float(v), 6) for v in self.initial_right_arm_q)),
             flush=True,
         )
+        self._warn_if_reference_outside_workspace()
         print(f"[policy-hand] canonical_order={POLICY_HAND_JOINT_NAMES}", flush=True)
         print(
             "[policy-hand] gr00t_l10_groups "
@@ -1325,6 +1392,14 @@ class RightArmPolicyExecutor:
             self.teleop_bridge.reset_from_eef(self.current_eef_pose())
         self._warmup_ik()
         self.reset_generation += 1
+
+    def reset_policy_source_anchor(self) -> None:
+        if self.teleop_bridge is None:
+            return
+        self._freeze_target_at_current_eef()
+        self.reference_eef_9d = self.target_policy_eef_9d()
+        self.teleop_bridge.reset_from_eef(self.current_eef_pose())
+        self._reset_differential_ik_controller()
 
     def current_arm_q(self) -> np.ndarray:
         return self.current_actual_arm_q()
@@ -1412,9 +1487,28 @@ class RightArmPolicyExecutor:
 
     def _clamp_policy_eef_command(self, eef_9d: np.ndarray) -> np.ndarray:
         out = np.asarray(eef_9d, dtype=np.float32).reshape(-1).copy()
-        if out.size >= 3:
+        if self.workspace_clamp and out.size >= 3:
             out[:3] = np.clip(out[:3], self.workspace_min.astype(np.float32), self.workspace_max.astype(np.float32))
         return out
+
+    def _warn_if_reference_outside_workspace(self) -> None:
+        if not self.workspace_clamp:
+            return
+        current = np.asarray(self.reference_eef_9d[:3], dtype=np.float64)
+        low = current < self.workspace_min
+        high = current > self.workspace_max
+        if not bool(np.any(low | high)):
+            return
+        clipped = np.clip(current, self.workspace_min, self.workspace_max)
+        print(
+            "[policy-workspace] warning: initial EEF is outside workspace; "
+            f"current_policy_xyz={tuple(round(float(v), 6) for v in current)} "
+            f"workspace_min={tuple(round(float(v), 6) for v in self.workspace_min)} "
+            f"workspace_max={tuple(round(float(v), 6) for v in self.workspace_max)} "
+            f"clipped_xyz={tuple(round(float(v), 6) for v in clipped)} "
+            f"clip_delta={tuple(round(float(v), 6) for v in clipped - current)}",
+            flush=True,
+        )
 
     def current_reference_action(self) -> dict[str, np.ndarray]:
         if self.teleop_bridge is not None:
@@ -1545,16 +1639,32 @@ class RightArmPolicyExecutor:
         arm_pos, arm_rotation = self._arm_root_pose()
         return {
             "frame": "right_arm_entity_local_rokae_base",
+            "eef_link": self.policy_eef_link_name,
+            "assembly_eef_link": self.assembly_eef_link_name,
+            "policy_action_eef_semantics": (
+                "openxr_wrist_source_pose_mapped_by_remote_teleop_chain"
+                if self.teleop_bridge is not None
+                else "direct_robot_tcp_control_link_pose"
+            ),
+            "rot6d_convention": "[R00,R10,R20,R01,R11,R21]",
+            "teleop_bridge": None if self.teleop_bridge is None else dict(self.teleop_bridge.last_debug),
             "arm_root_world_pos": arm_pos.tolist(),
             "arm_root_world_rot6d": _rotmat_to_rot6d(arm_rotation).tolist(),
             "current_world_xyz": current_world[:3, 3].tolist(),
+            "current_world_rot6d": _rotmat_to_rot6d(current_world[:3, :3]).tolist(),
             "current_policy_xyz": current_policy[:3, 3].tolist(),
+            "current_policy_rot6d": _rotmat_to_rot6d(current_policy[:3, :3]).tolist(),
             "target_world_xyz": target_world[:3, 3].tolist(),
+            "target_world_rot6d": _rotmat_to_rot6d(target_world[:3, :3]).tolist(),
             "target_policy_xyz": target_policy[:3, 3].tolist(),
+            "target_policy_rot6d": _rotmat_to_rot6d(target_policy[:3, :3]).tolist(),
             "reference_action_policy_xyz": self.reference_eef_9d[:3].tolist(),
             "reference_action_policy_rot6d": self.reference_eef_9d[3:9].tolist(),
             "arm_ik_mode": self.arm_ik_mode,
             "differential_ik": self.last_differential_ik_debug,
+            "workspace_clamp": self.workspace_clamp,
+            "workspace_min": self.workspace_min.tolist(),
+            "workspace_max": self.workspace_max.tolist(),
         }
 
     def hand_policy_clip_delta(self, action: dict[str, np.ndarray]) -> float:
@@ -2201,6 +2311,165 @@ def _append_jsonl(path: Path | None, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(json.dumps(_jsonable(row), ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _trace_jsonl_path(trace_dir: Path | None) -> Path | None:
+    if trace_dir is None:
+        return None
+    return trace_dir.expanduser() / "trace.jsonl"
+
+
+def _array_stats(value: Any) -> dict[str, Any]:
+    arr = np.asarray(value)
+    stats: dict[str, Any] = {"shape": list(arr.shape), "dtype": str(arr.dtype)}
+    if arr.size and np.issubdtype(arr.dtype, np.number):
+        finite = arr[np.isfinite(arr)]
+        if finite.size:
+            stats.update(
+                {
+                    "min": float(np.min(finite)),
+                    "max": float(np.max(finite)),
+                    "mean": float(np.mean(finite)),
+                }
+            )
+    return stats
+
+
+def _collect_npz_arrays(prefix: str, value: Any, out: dict[str, np.ndarray]) -> None:
+    if value is None:
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _collect_npz_arrays(f"{prefix}.{key}", item, out)
+        return
+    if isinstance(value, np.ndarray):
+        out[prefix] = np.asarray(value)
+        return
+    if isinstance(value, np.generic):
+        out[prefix] = np.asarray(value)
+        return
+    if isinstance(value, (int, float, bool)):
+        out[prefix] = np.asarray(value)
+
+
+def _summarize_npz_arrays(arrays: dict[str, np.ndarray]) -> dict[str, Any]:
+    return {key: _array_stats(value) for key, value in sorted(arrays.items())}
+
+
+def _new_policy_trace_session_id(session_index: int) -> str:
+    return f"{time.strftime('%Y%m%d_%H%M%S')}_{int(session_index):03d}"
+
+
+def _append_policy_trace_event(
+    trace_dir: Path | None,
+    *,
+    session_id: str,
+    event: str,
+    step_count: int,
+    action_index: int,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    if trace_dir is None:
+        return
+    row = {
+        "schema_version": "harness.groot_finetune_policy_trace.v1",
+        "record_type": "event",
+        "event": str(event),
+        "session_id": str(session_id),
+        "wall_time_s": time.time(),
+        "monotonic_s": time.monotonic(),
+        "step_count": int(step_count),
+        "action_index": int(action_index),
+    }
+    if extra:
+        row.update(extra)
+    _append_jsonl(_trace_jsonl_path(trace_dir), row)
+
+
+def _write_policy_replan_trace(
+    trace_dir: Path | None,
+    *,
+    session_id: str,
+    replan_index: int,
+    step_count: int,
+    action_index: int,
+    observation_ts_s: float,
+    observation: dict[str, Any],
+    observation_arm_q: np.ndarray,
+    observation_hand_q: np.ndarray,
+    observation_eef_pose: np.ndarray,
+    reference_action: dict[str, np.ndarray],
+    reference_action_source: str,
+    rtc_seed_action: dict[str, np.ndarray] | None,
+    rtc_options: dict[str, Any] | None,
+    rtc_metadata: dict[str, Any],
+    rtc_seed_metadata: dict[str, Any],
+    policy_action_chunk: dict[str, np.ndarray],
+    raw_stored_action: dict[str, np.ndarray],
+    clipped_action_chunk: dict[str, np.ndarray],
+    execution_action_chunk: dict[str, np.ndarray],
+    rtc_store_action_chunk: dict[str, np.ndarray],
+    policy_info: dict[str, Any] | None,
+    executor_debug: dict[str, Any],
+    hand_debug: dict[str, Any],
+    action_storage_metadata: dict[str, Any],
+    inference_dt_s: float,
+) -> None:
+    if trace_dir is None:
+        return
+    trace_dir = trace_dir.expanduser()
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {}
+    _collect_npz_arrays("observation.video", observation.get("video", {}), arrays)
+    _collect_npz_arrays("observation.state", observation.get("state", {}), arrays)
+    _collect_npz_arrays("observation.arm_q", observation_arm_q, arrays)
+    _collect_npz_arrays("observation.hand_q", observation_hand_q, arrays)
+    _collect_npz_arrays("observation.eef_pose", observation_eef_pose, arrays)
+    _collect_npz_arrays("reference_action", reference_action, arrays)
+    _collect_npz_arrays("rtc_seed_action", rtc_seed_action, arrays)
+    _collect_npz_arrays("policy_raw_action", policy_action_chunk, arrays)
+    _collect_npz_arrays("raw_stored_action", raw_stored_action, arrays)
+    _collect_npz_arrays("probe_clipped_action", clipped_action_chunk, arrays)
+    _collect_npz_arrays("execution_action", execution_action_chunk, arrays)
+    _collect_npz_arrays("rtc_store_action", rtc_store_action_chunk, arrays)
+    npz_name = f"{session_id}_replan_{int(replan_index):06d}_step_{int(step_count):06d}.npz"
+    npz_path = trace_dir / npz_name
+    np.savez_compressed(npz_path, **arrays)
+    _append_jsonl(
+        _trace_jsonl_path(trace_dir),
+        {
+            "schema_version": "harness.groot_finetune_policy_trace.v1",
+            "record_type": "replan",
+            "session_id": str(session_id),
+            "replan_index": int(replan_index),
+            "wall_time_s": time.time(),
+            "monotonic_s": time.monotonic(),
+            "step_count": int(step_count),
+            "action_index": int(action_index),
+            "observation_ts_s": float(observation_ts_s),
+            "npz_path": str(npz_path),
+            "arrays": _summarize_npz_arrays(arrays),
+            "language": _jsonable(observation.get("language", {})),
+            "reference_action_source": str(reference_action_source),
+            "rtc": {
+                "options": rtc_options,
+                "metadata": rtc_metadata,
+                "seed_metadata": rtc_seed_metadata,
+                "storage": action_storage_metadata,
+            },
+            "policy_info": _jsonable(policy_info or {}),
+            "executor": executor_debug,
+            "hand": hand_debug,
+            "inference_dt_s": float(inference_dt_s),
+            "action_summary": {
+                "policy_raw": _summarize_action_chunk(policy_action_chunk),
+                "raw_stored": _summarize_action_chunk(raw_stored_action),
+                "probe_clipped": _summarize_action_chunk(clipped_action_chunk),
+                "execution": _summarize_action_chunk(execution_action_chunk),
+                "rtc_store": _summarize_action_chunk(rtc_store_action_chunk),
+            },
+        },
+    )
 
 
 class DryRunPolicy:
@@ -3030,13 +3299,19 @@ def main() -> int:
         "--workspace-min",
         type=_vec3,
         default=(-0.85, -0.60, 0.50),
-        help="Policy robot-base frame EEF command minimum xyz, matching remote RealShadow defaults.",
+        help="Policy robot-base frame EEF command minimum xyz used only when --workspace-clamp is enabled.",
     )
     parser.add_argument(
         "--workspace-max",
         type=_vec3,
         default=(-0.20, 0.60, 0.70),
-        help="Policy robot-base frame EEF command maximum xyz, matching remote RealShadow defaults.",
+        help="Policy robot-base frame EEF command maximum xyz used only when --workspace-clamp is enabled.",
+    )
+    parser.add_argument(
+        "--workspace-clamp",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Clamp decoded policy eef_9d xyz to --workspace-min/max before execution.",
     )
     parser.add_argument("--bottle-pos", type=_vec3, default=DEFAULT_BOTTLE_POS)
     parser.add_argument("--bottle-euler", type=_vec3, default=DEFAULT_BOTTLE_EULER)
@@ -3060,15 +3335,37 @@ def main() -> int:
     )
     parser.add_argument("--initial-right-arm-q", type=_vec7, default=DEFAULT_INITIAL_RIGHT_ARM_Q)
     parser.add_argument("--initial-left-arm-q", type=_vec7, default=DEFAULT_INITIAL_LEFT_ARM_Q)
+    parser.add_argument(
+        "--policy-eef-link",
+        choices=("revo2_flange", "link7"),
+        default=harness.DEFAULT_EEF_LINK,
+        help=(
+            "Robot control-link/TCP used for policy eef_9d pose semantics. "
+            "Remote Nero Teleop defaults to revo2_flange."
+        ),
+    )
     parser.add_argument("--policy-debug-jsonl", type=Path, default=DEFAULT_POLICY_DEBUG_JSONL)
     parser.add_argument("--policy-teleop-debug-jsonl", type=Path, default=DEFAULT_POLICY_TELEOP_DEBUG_JSONL)
     parser.add_argument(
+        "--policy-trace",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record every model inference input/output after policy start.",
+    )
+    parser.add_argument(
+        "--policy-trace-dir",
+        type=Path,
+        default=DEFAULT_POLICY_TRACE_DIR,
+        help="Directory for policy trace.jsonl and per-replan compressed NPZ snapshots.",
+    )
+    parser.add_argument(
         "--policy-execution-mode",
         choices=("teleop_source", "robot_target"),
-        default="robot_target",
+        default="teleop_source",
         help=(
-            "robot_target matches remote GR00T/Teleop: decoded eef_9d is the robot-frame EEF command target. "
-            "teleop_source is only for explicit OpenXR-source debug."
+            "teleop_source matches the remote live OpenXR teleop path: decoded eef_9d is an OpenXR wrist/source pose "
+            "that is anchored and mapped into the robot EEF target. robot_target treats eef_9d as a direct robot-frame "
+            "EEF command target for A/B debugging."
         ),
     )
     parser.add_argument(
@@ -3206,6 +3503,7 @@ def main() -> int:
         ik_differential_max_joint_acceleration_rad_s2=float(args.ik_differential_max_joint_acceleration_rad_s2),
         workspace_min=args.workspace_min,
         workspace_max=args.workspace_max,
+        workspace_clamp=bool(args.workspace_clamp),
         print_hand_every=int(args.print_hand_every),
         max_hand_joint_delta=float(args.max_hand_joint_delta),
         initial_hand_q=args.initial_hand_q,
@@ -3213,6 +3511,7 @@ def main() -> int:
         initial_reference_hand_q=args.initial_reference_hand_q,
         initial_right_arm_q=args.initial_right_arm_q,
         initial_left_arm_q=args.initial_left_arm_q,
+        policy_eef_link=str(args.policy_eef_link),
         policy_execution_mode=str(args.policy_execution_mode),
         policy_openxr_coordinate_adapter=str(args.policy_openxr_coordinate_adapter),
         policy_input_axis_map=args.policy_input_axis_map,
@@ -3272,12 +3571,58 @@ def main() -> int:
     last_reset_counter = -1
     step_count = 0
     last_executor_reset_generation = int(executor.reset_generation)
+    policy_trace_dir = args.policy_trace_dir if bool(args.policy_trace) else None
+    trace_session_index = 0
+    trace_session_id = ""
+    trace_replan_index = 0
+    last_policy_running = False
+    if policy_trace_dir is not None:
+        policy_trace_dir = policy_trace_dir.expanduser()
+        policy_trace_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[policy-trace] enabled dir={policy_trace_dir} index={_trace_jsonl_path(policy_trace_dir)}", flush=True)
 
     try:
         while bool(args.no_viewer) or scene.viewer.is_alive():
             console.update(executor)
             if console.quit_requested:
                 break
+            current_policy_running = bool(console.policy_running)
+            if current_policy_running and not last_policy_running:
+                action_chunk = None
+                action_index = 0
+                seed_manager.clear()
+                eef_trajectory_overlay.clear()
+                executor.reset_policy_source_anchor()
+                trace_session_index += 1
+                trace_session_id = _new_policy_trace_session_id(trace_session_index)
+                trace_replan_index = 0
+                _append_policy_trace_event(
+                    policy_trace_dir,
+                    session_id=trace_session_id,
+                    event="policy_start",
+                    step_count=int(step_count),
+                    action_index=int(action_index),
+                    extra={
+                        "instruction": str(args.instruction),
+                        "checkpoint": str(args.policy_checkpoint),
+                        "dry_run_policy": bool(args.dry_run_policy),
+                        "action_fps": float(args.action_fps),
+                        "replan_horizon": int(args.replan_horizon),
+                    },
+                )
+                if policy_trace_dir is not None:
+                    print(f"[policy-trace] session_start id={trace_session_id}", flush=True)
+            elif (not current_policy_running) and last_policy_running:
+                _append_policy_trace_event(
+                    policy_trace_dir,
+                    session_id=trace_session_id,
+                    event="policy_stop",
+                    step_count=int(step_count),
+                    action_index=int(action_index),
+                )
+                if policy_trace_dir is not None:
+                    print(f"[policy-trace] session_stop id={trace_session_id}", flush=True)
+            last_policy_running = current_policy_running
             if int(executor.reset_generation) != last_executor_reset_generation:
                 action_chunk = None
                 action_index = 0
@@ -3361,7 +3706,7 @@ def main() -> int:
                     if rtc_reference_action is not None:
                         reference_action = rtc_reference_action
                     tic = time.perf_counter()
-                    policy_action_chunk, _ = _policy_get_action_cpu_processor(
+                    policy_action_chunk, policy_info = _policy_get_action_cpu_processor(
                         policy,
                         observation,
                         reference_action=reference_action,
@@ -3393,6 +3738,36 @@ def main() -> int:
                         action_chunk,
                         observation_arm_q=observation_arm_q,
                     )
+                    inference_dt_s = time.perf_counter() - tic
+                    _write_policy_replan_trace(
+                        policy_trace_dir,
+                        session_id=trace_session_id,
+                        replan_index=int(trace_replan_index),
+                        step_count=int(step_count),
+                        action_index=int(action_index),
+                        observation_ts_s=float(observation_ts_s),
+                        observation=observation,
+                        observation_arm_q=observation_arm_q,
+                        observation_hand_q=observation_hand_q,
+                        observation_eef_pose=executor.current_eef_pose(),
+                        reference_action=reference_action,
+                        reference_action_source=reference_action_source,
+                        rtc_seed_action=rtc_seed_action,
+                        rtc_options=rtc_options,
+                        rtc_metadata=rtc_metadata,
+                        rtc_seed_metadata=rtc_seed_metadata,
+                        policy_action_chunk=policy_action_chunk,
+                        raw_stored_action=raw_stored_action,
+                        clipped_action_chunk=clipped_action_chunk,
+                        execution_action_chunk=action_chunk,
+                        rtc_store_action_chunk=rtc_store_action_chunk,
+                        policy_info=policy_info,
+                        executor_debug=executor.eef_frame_debug_snapshot(),
+                        hand_debug=hand_debug,
+                        action_storage_metadata=action_storage_metadata,
+                        inference_dt_s=float(inference_dt_s),
+                    )
+                    trace_replan_index += 1
                     seed_manager.push(
                         rtc_store_action_chunk,
                         start_monotonic_s=observation_ts_s,
@@ -3437,7 +3812,7 @@ def main() -> int:
                             flush=True,
                         )
                     print(
-                        f"[policy] replan dt={time.perf_counter() - tic:.3f}s "
+                        f"[policy] replan dt={inference_dt_s:.3f}s "
                         f"rtc={'off' if rtc_options is None else 'on'} "
                         f"rtc_reason={rtc_metadata.get('reason')} "
                         f"seed_reason={rtc_seed_metadata.get('reason')} "
@@ -3475,6 +3850,15 @@ def main() -> int:
 
             time.sleep(1.0 / 60.0)
     finally:
+        if last_policy_running:
+            _append_policy_trace_event(
+                policy_trace_dir,
+                session_id=trace_session_id,
+                event="policy_stop",
+                step_count=int(step_count),
+                action_index=int(action_index),
+                extra={"reason": "shutdown"},
+            )
         eef_trajectory_overlay.clear()
         camera_preview.close()
         _shutdown_panel(panel)
