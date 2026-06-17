@@ -46,6 +46,8 @@ ROOT_DIR = Path(__file__).resolve().parent
 NERO_LINKER_CONFIG = make_runtime_config(backend="cpu", show_viewer=False)
 DEFAULT_GLB = ROOT_DIR / "scene" / "scene.glb"
 DEFAULT_BOTTLE_GLB = ROOT_DIR / "scene" / "bottle.glb"
+DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.805556)
+DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
 DEFAULT_CONNECTOR_MESH = ROOT_DIR / "assets" / "connector.STL"
 DEFAULT_D455_JSON = ROOT_DIR / "assets" / "d455json.json"
 DEFAULT_D405_JSON = ROOT_DIR / "assets" / "d405json.json"
@@ -2157,7 +2159,7 @@ def _apply_bottle_pose(
     _set_entity_pose(bottle_entity, np.asarray(pos, dtype=np.float64), _rotation_from_euler_deg(euler_deg))
 
 
-def _base_pose_panel_main(initial_values, values, running, reset_counter, stop_flag) -> None:
+def _bottle_pose_panel_main(initial_values, values, running, reset_counter, stop_flag) -> None:
     import tkinter as tk
     from tkinter import ttk
 
@@ -2201,12 +2203,12 @@ def _base_pose_panel_main(initial_values, values, running, reset_counter, stop_f
     def print_pose() -> None:
         current = [float(values[idx]) for idx in range(6)]
         print(
-            "[base-debug] base_world_pose\n"
+            "[bottle-debug] bottle_world_pose\n"
             f"  pos={tuple(round(v, 6) for v in current[:3])} "
             f"euler_deg={tuple(round(v, 3) for v in current[3:])}\n"
             "  add_scene_glb_args:\n"
-            f"    --initial-base-pos {current[0]:.6f},{current[1]:.6f},{current[2]:.6f} "
-            f"--initial-base-euler {current[3]:.3f},{current[4]:.3f},{current[5]:.3f}",
+            f"    --bottle-pos {current[0]:.6f},{current[1]:.6f},{current[2]:.6f} "
+            f"--bottle-euler {current[3]:.3f},{current[4]:.3f},{current[5]:.3f}",
             flush=True,
         )
 
@@ -2216,11 +2218,11 @@ def _base_pose_panel_main(initial_values, values, running, reset_counter, stop_f
         root.quit()
 
     root = tk.Tk()
-    root.title("Base World Pose Debug")
+    root.title("Bottle Pose Debug")
     root.geometry("760x430")
     root.minsize(660, 380)
 
-    title = ttk.Label(root, text="Base world pose", font=("Arial", 12, "bold"))
+    title = ttk.Label(root, text="Bottle pose", font=("Arial", 12, "bold"))
     title.pack(fill=tk.X, padx=12, pady=(12, 4))
 
     frame = ttk.Frame(root)
@@ -2260,7 +2262,7 @@ def _base_pose_panel_main(initial_values, values, running, reset_counter, stop_f
     root.mainloop()
 
 
-def _create_base_pose_panel(
+def _create_bottle_pose_panel(
     enabled: bool,
     initial_translation: tuple[float, float, float],
     initial_euler: tuple[float, float, float],
@@ -2273,7 +2275,7 @@ def _create_base_pose_panel(
     reset_counter = multiprocessing.RawValue("i", 0)
     stop_flag = multiprocessing.RawValue("b", False)
     process = multiprocessing.Process(
-        target=_base_pose_panel_main,
+        target=_bottle_pose_panel_main,
         args=(initial_values, values, running, reset_counter, stop_flag),
         daemon=True,
     )
@@ -2287,7 +2289,7 @@ def _create_base_pose_panel(
     }
 
 
-def _shutdown_base_pose_panel(panel: dict[str, object] | None) -> None:
+def _shutdown_bottle_pose_panel(panel: dict[str, object] | None) -> None:
     if not panel:
         return
     panel["stop_flag"].value = True
@@ -2296,7 +2298,7 @@ def _shutdown_base_pose_panel(panel: dict[str, object] | None) -> None:
         process.join(timeout=1.0)
 
 
-def _read_base_pose_panel(
+def _read_bottle_pose_panel(
     panel: dict[str, object],
 ) -> tuple[tuple[float, float, float], tuple[float, float, float], bool, int, bool]:
     values = panel["values"]
@@ -2548,8 +2550,8 @@ def create_scene(
     fixed: bool = True,
     add_bottle: bool = True,
     bottle_path: str | Path = DEFAULT_BOTTLE_GLB,
-    bottle_pos: tuple[float, float, float] | None = None,
-    bottle_euler: tuple[float, float, float] | None = None,
+    bottle_pos: tuple[float, float, float] | None = DEFAULT_BOTTLE_POS,
+    bottle_euler: tuple[float, float, float] | None = DEFAULT_BOTTLE_EULER,
     bottle_scale: float | tuple[float, float, float] = 1.0,
     bottle_collision: bool = True,
     seed: int | None = None,
@@ -2778,8 +2780,8 @@ def main() -> None:
     )
     parser.add_argument("--no-bottle", action="store_true", help="Do not load scene/bottle.glb.")
     parser.add_argument("--bottle-glb", type=Path, default=DEFAULT_BOTTLE_GLB)
-    parser.add_argument("--bottle-pos", type=_vec3, default=None, help="Override bottle position as x,y,z in meters.")
-    parser.add_argument("--bottle-euler", type=_vec3, default=None, help="Override bottle Euler angles in degrees.")
+    parser.add_argument("--bottle-pos", type=_vec3, default=DEFAULT_BOTTLE_POS, help="Bottle position as x,y,z in meters.")
+    parser.add_argument("--bottle-euler", type=_vec3, default=DEFAULT_BOTTLE_EULER, help="Bottle Euler angles in degrees.")
     parser.add_argument("--bottle-scale", type=float, default=1.0, help="Uniform scale for the bottle.")
     parser.add_argument(
         "--bottle-collision",
@@ -2795,15 +2797,21 @@ def main() -> None:
         help="Load the bottle as visual-only.",
     )
     parser.add_argument(
-        "--no-base-pose-panel",
+        "--no-bottle-pose-panel",
         action="store_true",
-        help="Do not open the base pose debug panel in viewer mode.",
+        help="Do not open the bottle pose debug panel in viewer mode.",
+    )
+    parser.add_argument(
+        "--no-base-pose-panel",
+        dest="no_bottle_pose_panel",
+        action="store_true",
+        help="Deprecated alias for --no-bottle-pose-panel.",
     )
     parser.add_argument(
         "--no-bottle-release-panel",
-        dest="no_base_pose_panel",
+        dest="no_bottle_pose_panel",
         action="store_true",
-        help="Deprecated alias for --no-base-pose-panel.",
+        help="Deprecated alias for --no-bottle-pose-panel.",
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for bottle placement.")
     parser.add_argument("--no-arm-assembly", action="store_true", help="Only load the GLB scene.")
@@ -3060,17 +3068,17 @@ def main() -> None:
             _step_scene_with_attached_parts(scene)
         return
 
-    base_pose_panel = _create_base_pose_panel(
-        not args.enable_vr_teleop and not args.no_arm_assembly and not args.no_base_pose_panel,
-        tuple(float(v) for v in getattr(scene, "initial_base_debug_pos", args.pos)),
-        tuple(float(v) for v in getattr(scene, "initial_base_debug_euler", args.euler)),
+    bottle_pose_panel = _create_bottle_pose_panel(
+        not args.enable_vr_teleop and not args.no_bottle and not args.no_bottle_pose_panel,
+        tuple(float(v) for v in getattr(scene, "bottle_initial_pos", args.bottle_pos or (0.0, 0.0, 0.0))),
+        tuple(float(v) for v in getattr(scene, "bottle_initial_euler", args.bottle_euler or (0.0, 0.0, 0.0))),
     )
     last_panel_pose: tuple[tuple[float, float, float], tuple[float, float, float]] | None = (
         (
-            tuple(float(v) for v in getattr(scene, "initial_base_debug_pos", args.pos)),
-            tuple(float(v) for v in getattr(scene, "initial_base_debug_euler", args.euler)),
+            tuple(float(v) for v in getattr(scene, "bottle_initial_pos", args.bottle_pos or (0.0, 0.0, 0.0))),
+            tuple(float(v) for v in getattr(scene, "bottle_initial_euler", args.bottle_euler or (0.0, 0.0, 0.0))),
         )
-        if base_pose_panel
+        if bottle_pose_panel
         else None
     )
     last_reset_counter = 0
@@ -3182,26 +3190,21 @@ def main() -> None:
                     break
             if vr_session is not None:
                 vr_session.step()
-            elif base_pose_panel:
-                panel_translation, panel_euler, running, reset_counter, stop_requested = _read_base_pose_panel(
-                    base_pose_panel
+            elif bottle_pose_panel:
+                panel_translation, panel_euler, running, reset_counter, stop_requested = _read_bottle_pose_panel(
+                    bottle_pose_panel
                 )
                 panel_pose = (panel_translation, panel_euler)
                 if stop_requested:
-                    _shutdown_base_pose_panel(base_pose_panel)
-                    base_pose_panel = None
+                    _shutdown_bottle_pose_panel(bottle_pose_panel)
+                    bottle_pose_panel = None
                     _step_scene_with_attached_parts(scene)
                 elif reset_counter != last_reset_counter or panel_pose != last_panel_pose:
                     reset_requested = reset_counter != last_reset_counter
-                    _apply_assembly_debug_pose(
-                        scene,
-                        scene.nero_assembly_info,
-                        panel_translation,
-                        panel_euler,
-                    )
+                    _apply_bottle_pose(scene.bottle_entity, panel_translation, panel_euler)
                     if reset_requested:
                         print(
-                            "[base-reset] "
+                            "[bottle-reset] "
                             f"pos={tuple(round(v, 6) for v in panel_translation)} "
                             f"euler_deg={tuple(round(v, 3) for v in panel_euler)}",
                             flush=True,
@@ -3247,7 +3250,7 @@ def main() -> None:
                 cv2.waitKey(1)
             except Exception:
                 pass
-        _shutdown_base_pose_panel(base_pose_panel)
+        _shutdown_bottle_pose_panel(bottle_pose_panel)
 
 
 if __name__ == "__main__":
