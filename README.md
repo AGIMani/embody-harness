@@ -4,6 +4,9 @@
 
 终端 1：
 
+sudo modprobe v4l2loopback video_nr=44 card_label=teleop_sim_screen exclusive_caps=1 max_buffers=2
+ls -l /dev/video44
+
 ```bash
 cd /home/whf/Project/harness
 conda activate genesis

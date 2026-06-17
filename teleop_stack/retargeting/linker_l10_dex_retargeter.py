@@ -480,7 +480,6 @@ class LinkerL10HoloLayeredRetargeter:
                 qpos = self._clip_and_reset_filter(qpos)
             else:
                 qpos = self._filter_and_rate_limit(qpos)
-            qpos = self._apply_full_open_target(points, qpos)
             result = NamedJointValues(
                 joint_names=self.spec.active_joint_names,
                 joint_positions=tuple(float(value) for value in qpos),

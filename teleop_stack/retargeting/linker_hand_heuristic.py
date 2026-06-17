@@ -109,7 +109,7 @@ def _finger_curl_ratio(points: np.ndarray, indices: tuple[int, int, int, int, in
         _segment_angle(points, indices[1], indices[2], indices[3]),
         _segment_angle(points, indices[2], indices[3], indices[4]),
     )
-    weighted_angle = 0.55 * angles[0] + 0.30 * angles[1] + 0.15 * angles[2]
+    weighted_angle = sum(weight * angle for weight, angle in zip(_NON_THUMB_CURL_ANGLE_WEIGHTS, angles, strict=True))
     return _clamp01(weighted_angle / 1.35)
 
 
@@ -128,7 +128,20 @@ def _spread_ratio(direction_a: np.ndarray, direction_b: np.ndarray, *, max_angle
 
 _PINCH_PREPARE_DISTANCE_M = 0.015
 _PINCH_COMPLETE_DISTANCE_M = 0.007
-_NON_THUMB_CURL_OPEN_DEADZONE = 0.12
+_NON_THUMB_CURL_OPEN_DEADZONE = 0.0
+_NON_THUMB_CURL_ANGLE_WEIGHTS = (0.450625, 0.432410, 0.116965)
+_NON_THUMB_CURL_OPEN_BASELINE = {
+    "index_mcp_pitch": 0.081773,
+    "middle_mcp_pitch": 0.0,
+    "ring_mcp_pitch": 0.041509,
+    "pinky_mcp_pitch": 0.070462,
+}
+_NON_THUMB_MCP_PITCH_GAIN = {
+    "index_mcp_pitch": 1.001076,
+    "middle_mcp_pitch": 0.990150,
+    "ring_mcp_pitch": 0.992641,
+    "pinky_mcp_pitch": 1.002966,
+}
 
 
 def _apply_deadzone_ratio(value: float, deadzone: float) -> float:
@@ -136,6 +149,13 @@ def _apply_deadzone_ratio(value: float, deadzone: float) -> float:
     if value <= deadzone:
         return 0.0
     return _clamp01((value - deadzone) / max(1.0 - deadzone, 1e-6))
+
+
+def _remove_open_baseline_ratio(value: float, baseline: float) -> float:
+    baseline = _clamp01(baseline)
+    if value <= baseline:
+        return 0.0
+    return _clamp01((value - baseline) / max(1.0 - baseline, 1e-6))
 
 
 def _pose_from_joint_ratios(spec: DexHandModelSpec, joint_ratio_map: dict[str, float]) -> NamedJointValues:
@@ -257,6 +277,7 @@ def retarget_openxr_joint_positions_to_linker_l10_right(
         ),
     )
     index_curl = _apply_deadzone_ratio(index_curl, _NON_THUMB_CURL_OPEN_DEADZONE)
+    index_curl = _remove_open_baseline_ratio(index_curl, _NON_THUMB_CURL_OPEN_BASELINE["index_mcp_pitch"])
     middle_curl = _finger_curl_ratio(
         points,
         (
@@ -268,6 +289,7 @@ def retarget_openxr_joint_positions_to_linker_l10_right(
         ),
     )
     middle_curl = _apply_deadzone_ratio(middle_curl, _NON_THUMB_CURL_OPEN_DEADZONE)
+    middle_curl = _remove_open_baseline_ratio(middle_curl, _NON_THUMB_CURL_OPEN_BASELINE["middle_mcp_pitch"])
     ring_curl = _finger_curl_ratio(
         points,
         (
@@ -279,6 +301,7 @@ def retarget_openxr_joint_positions_to_linker_l10_right(
         ),
     )
     ring_curl = _apply_deadzone_ratio(ring_curl, _NON_THUMB_CURL_OPEN_DEADZONE)
+    ring_curl = _remove_open_baseline_ratio(ring_curl, _NON_THUMB_CURL_OPEN_BASELINE["ring_mcp_pitch"])
     pinky_curl = _finger_curl_ratio(
         points,
         (
@@ -290,6 +313,7 @@ def retarget_openxr_joint_positions_to_linker_l10_right(
         ),
     )
     pinky_curl = _apply_deadzone_ratio(pinky_curl, _NON_THUMB_CURL_OPEN_DEADZONE)
+    pinky_curl = _remove_open_baseline_ratio(pinky_curl, _NON_THUMB_CURL_OPEN_BASELINE["pinky_mcp_pitch"])
     thumb_curl = _thumb_curl_ratio(
         points,
         (
@@ -341,12 +365,12 @@ def retarget_openxr_joint_positions_to_linker_l10_right(
         "thumb_cmc_yaw": thumb_yaw_ratio,
         "thumb_cmc_pitch": thumb_pitch_ratio,
         "index_mcp_roll": _clamp01(0.95 * index_spread),
-        "index_mcp_pitch": _clamp01(0.96 * index_curl),
-        "middle_mcp_pitch": _clamp01(0.96 * middle_curl),
+        "index_mcp_pitch": _clamp01(_NON_THUMB_MCP_PITCH_GAIN["index_mcp_pitch"] * index_curl),
+        "middle_mcp_pitch": _clamp01(_NON_THUMB_MCP_PITCH_GAIN["middle_mcp_pitch"] * middle_curl),
         "ring_mcp_roll": _clamp01(0.95 * ring_spread),
-        "ring_mcp_pitch": _clamp01(0.96 * ring_curl),
+        "ring_mcp_pitch": _clamp01(_NON_THUMB_MCP_PITCH_GAIN["ring_mcp_pitch"] * ring_curl),
         "pinky_mcp_roll": _clamp01(1.00 * pinky_spread),
-        "pinky_mcp_pitch": _clamp01(0.96 * pinky_curl),
+        "pinky_mcp_pitch": _clamp01(_NON_THUMB_MCP_PITCH_GAIN["pinky_mcp_pitch"] * pinky_curl),
     }
 
     return _pose_from_joint_ratios(hand_spec, joint_ratio_map)
