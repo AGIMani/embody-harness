@@ -113,6 +113,17 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import add_scene_glb as harness  # noqa: E402
+from teleop_stack.ik.full_pose_controller import (  # noqa: E402
+    FullPoseDifferentialIkController,
+    FullPoseDifferentialIkControllerConfig,
+)
+from teleop_stack.ik.nero_genesis_kinematics import GenesisLinkKinematicsModel  # noqa: E402
+from teleop_stack.ik.nero_limits import (  # noqa: E402
+    nero_effective_joint_lower_limits,
+    nero_effective_joint_upper_limits,
+)
+from teleop_stack.ik.types import RobotStateSnapshot, TaskSpaceTarget  # noqa: E402
+from teleop_stack.models import Pose7  # noqa: E402
 from teleop_stack.teleop.openxr_genesis_adapter import (  # noqa: E402
     adapter_debug_payload as canonical_adapter_debug_payload,
 )
@@ -1095,17 +1106,39 @@ class PolicyTeleopBridge:
         return {"adapter": "none"}
 
 
+class _SingleArmGenesisIkRuntime:
+    """Runtime-shaped adapter expected by remote GenesisLinkKinematicsModel."""
+
+    def __init__(self, *, arm: object, eef_link: object, arm_dofs: list[int]) -> None:
+        self.robots = {"right": arm}
+        self.eef_links = {"right": eef_link}
+        self.arm_dofs = {"right": arm_dofs}
+
+
 class RightArmPolicyExecutor:
     def __init__(
         self,
         scene: object,
         *,
+        arm_ik_mode: str,
         max_joint_step: float,
         ik_solver_max_joint_step: float,
         min_joint_step: float,
         pos_tol: float,
         ik_j4_limit: bool,
         ik_j4_limit_rad: tuple[float, float],
+        ik_command_hz: float,
+        ik_differential_finite_difference_rad: float,
+        ik_differential_position_weight: float,
+        ik_differential_orientation_weight: float,
+        ik_differential_max_task_step_m: float,
+        ik_differential_max_rotation_step_rad: float,
+        ik_differential_damping_lambda: float,
+        ik_differential_posture_bias_gain: float,
+        ik_differential_joint_limit_bias_gain: float,
+        ik_differential_bias_weight: float,
+        ik_differential_joint_limit_soft_margin_rad: float,
+        ik_differential_max_joint_acceleration_rad_s2: float,
         workspace_min: tuple[float, float, float],
         workspace_max: tuple[float, float, float],
         print_hand_every: int,
@@ -1134,12 +1167,33 @@ class RightArmPolicyExecutor:
         self.left_arm = assembly.get("left")
         self.eef_link = self.arm.get_link(str(assembly.get("eef_link", harness.DEFAULT_EEF_LINK)))
         self.arm_dofs = harness._arm_dofs(self.arm)  # noqa: SLF001
+        self.arm_ik_mode = str(arm_ik_mode)
+        if self.arm_ik_mode not in {"genesis_pose", "differential_full_pose"}:
+            raise ValueError(f"unsupported arm IK mode: {self.arm_ik_mode!r}")
         self.max_joint_step = float(max_joint_step)
         self.ik_solver_max_joint_step = float(ik_solver_max_joint_step)
         self.min_joint_step = max(float(min_joint_step), 0.0)
         self.pos_tol = float(pos_tol)
         self.ik_j4_limit = bool(ik_j4_limit)
         self.ik_j4_limit_rad = tuple(float(v) for v in ik_j4_limit_rad)
+        self.ik_command_hz = max(float(ik_command_hz), 1.0)
+        self.ik_differential_finite_difference_rad = float(ik_differential_finite_difference_rad)
+        self.ik_differential_position_weight = float(ik_differential_position_weight)
+        self.ik_differential_orientation_weight = float(ik_differential_orientation_weight)
+        self.ik_differential_max_task_step_m = float(ik_differential_max_task_step_m)
+        self.ik_differential_max_rotation_step_rad = float(ik_differential_max_rotation_step_rad)
+        self.ik_differential_damping_lambda = float(ik_differential_damping_lambda)
+        self.ik_differential_posture_bias_gain = float(ik_differential_posture_bias_gain)
+        self.ik_differential_joint_limit_bias_gain = float(ik_differential_joint_limit_bias_gain)
+        self.ik_differential_bias_weight = float(ik_differential_bias_weight)
+        self.ik_differential_joint_limit_soft_margin_rad = float(ik_differential_joint_limit_soft_margin_rad)
+        self.ik_differential_max_joint_acceleration_rad_s2 = float(
+            ik_differential_max_joint_acceleration_rad_s2
+        )
+        self.differential_ik_runtime: _SingleArmGenesisIkRuntime | None = None
+        self.differential_ik_model: GenesisLinkKinematicsModel | None = None
+        self.differential_ik_controller: FullPoseDifferentialIkController | None = None
+        self.last_differential_ik_debug: dict[str, Any] | None = None
         self.workspace_min = np.asarray(workspace_min, dtype=np.float64)
         self.workspace_max = np.asarray(workspace_max, dtype=np.float64)
         self.max_hand_joint_delta = max(0.0, float(max_hand_joint_delta))
@@ -1187,12 +1241,14 @@ class RightArmPolicyExecutor:
         self.print_hand_every = int(print_hand_every)
         print(
             "[policy-ik] "
+            f"mode={self.arm_ik_mode} "
             f"eef_link={getattr(self.eef_link, 'name', 'revo2_flange')} "
             f"max_joint_step={self.max_joint_step:.4f} "
             f"ik_solver_max_joint_step={self.ik_solver_max_joint_step:.4f} "
             f"min_joint_step={self.min_joint_step:.4f} "
             f"pos_tol={self.pos_tol:.1e} "
             f"ik_j4_limit={self.ik_j4_limit} range={self.ik_j4_limit_rad} "
+            f"ik_command_hz={self.ik_command_hz:.1f} "
             f"policy_execution_mode={self.policy_execution_mode}",
             flush=True,
         )
@@ -1497,6 +1553,8 @@ class RightArmPolicyExecutor:
             "target_policy_xyz": target_policy[:3, 3].tolist(),
             "reference_action_policy_xyz": self.reference_eef_9d[:3].tolist(),
             "reference_action_policy_rot6d": self.reference_eef_9d[3:9].tolist(),
+            "arm_ik_mode": self.arm_ik_mode,
+            "differential_ik": self.last_differential_ik_debug,
         }
 
     def hand_policy_clip_delta(self, action: dict[str, np.ndarray]) -> float:
@@ -1671,6 +1729,12 @@ class RightArmPolicyExecutor:
         return arr.reshape(-1)
 
     def _solve_and_apply_eef_target(self) -> None:
+        if self.arm_ik_mode == "differential_full_pose":
+            self._solve_and_apply_eef_target_differential()
+            return
+        self._solve_and_apply_eef_target_genesis_pose()
+
+    def _solve_and_apply_eef_target_genesis_pose(self) -> None:
         target_quat = np.asarray(_rotation_to_quat_xyzw(self.target_rotation), dtype=np.float32)
         target_quat_wxyz = np.asarray(
             (target_quat[3], target_quat[0], target_quat[1], target_quat[2]),
@@ -1709,6 +1773,78 @@ class RightArmPolicyExecutor:
             )
         except Exception as exc:
             print(f"[policy-step] IK failed: {exc}", flush=True)
+
+    def _solve_and_apply_eef_target_differential(self) -> None:
+        if self.differential_ik_controller is None or self.differential_ik_model is None:
+            self._reset_differential_ik_controller()
+        if self.differential_ik_controller is None or self.differential_ik_model is None:
+            print("[policy-step] differential IK unavailable; falling back to Genesis pose IK", flush=True)
+            self._solve_and_apply_eef_target_genesis_pose()
+            return
+
+        target_quat_xyzw = tuple(float(v) for v in _rotation_to_quat_xyzw(self.target_rotation))
+        target_pose = Pose7(
+            position_xyz=tuple(float(v) for v in self.target_xyz),
+            quaternion_xyzw=target_quat_xyzw,  # type: ignore[arg-type]
+        )
+        current_q = tuple(float(v) for v in self.q_cmd[:7])
+        current_pose = self.differential_ik_model.forward_pose(current_q)
+        dt_s = self.action_dt_s if self.action_dt_s > 0.0 else 1.0 / self.ik_command_hz
+        timestamp_s = time.monotonic()
+
+        self.differential_ik_controller.set_target(
+            TaskSpaceTarget(
+                arm_side="right",
+                source_name="groot_finetune",
+                timestamp_s=float(timestamp_s),
+                frame_id=0,
+                ee_target=target_pose,
+                orientation_mode="track_full_orientation",
+                target_frame="genesis_world",
+            )
+        )
+        try:
+            result = self.differential_ik_controller.step(
+                RobotStateSnapshot(
+                    timestamp_s=float(timestamp_s),
+                    joint_positions_rad=current_q,
+                    ee_pose=current_pose,
+                ),
+                dt_s=float(dt_s),
+            )
+        except Exception as exc:
+            print(f"[policy-step] differential IK failed: {exc}; falling back to Genesis pose IK", flush=True)
+            self._reset_differential_ik_controller()
+            self._solve_and_apply_eef_target_genesis_pose()
+            return
+
+        self.q_cmd = np.asarray(result.q_cmd, dtype=np.float32).reshape(-1)[: len(self.arm_dofs)]
+        self.arm.set_dofs_position(self.q_cmd, self.arm_dofs, zero_velocity=True)
+        self.arm.control_dofs_position(self.q_cmd, self.arm_dofs)
+        self.last_differential_ik_debug = {
+            "mode": "differential_full_pose",
+            "status": result.status,
+            "events": list(result.events),
+            "dt_s": float(dt_s),
+            "target_position_error_m": result.target_position_error_m,
+            "target_orientation_error_rad": result.target_orientation_error_rad,
+            "residual_position_error_m": result.residual_position_error_m,
+            "residual_orientation_error_rad": result.residual_orientation_error_rad,
+            "limit_margin_min_rad": result.limit_margin_min_rad,
+            "singularity_metric": result.singularity_metric,
+            "damping_scale": result.damping_scale,
+            "dq_cmd": None if result.dq_cmd is None else [float(v) for v in result.dq_cmd],
+            "q_cmd": [float(v) for v in self.q_cmd],
+        }
+        print(
+            "[policy-step] "
+            f"eef_target={tuple(round(float(v), 4) for v in self.target_xyz)} "
+            f"diff_ik_status={result.status} "
+            f"pos_err={None if result.target_position_error_m is None else round(float(result.target_position_error_m), 5)} "
+            f"ori_err={None if result.target_orientation_error_rad is None else round(float(result.target_orientation_error_rad), 5)} "
+            f"events={','.join(result.events)} ik_seed_source=differential_full_pose_q_state",
+            flush=True,
+        )
 
     def _apply_joint_target(self, joint_target: np.ndarray) -> None:
         if joint_target.size < 7:
@@ -1808,6 +1944,12 @@ class RightArmPolicyExecutor:
         self.target_xyz = pose[:3, 3].copy()
 
     def _warmup_ik(self) -> None:
+        if self.arm_ik_mode == "differential_full_pose":
+            started = time.perf_counter()
+            self._reset_differential_ik_controller()
+            status = "ready" if self.differential_ik_controller is not None else "unavailable"
+            print(f"[policy-ik] differential_warmup status={status} warmup_s={time.perf_counter() - started:.4f}", flush=True)
+            return
         qpos_init = _tensor_to_np(self.arm.get_qpos()).reshape(-1).astype(np.float32)
         qpos_init[self.arm_dofs] = self.q_cmd
         qpos_init = self._apply_ik_joint4_search_limit(qpos_init)
@@ -1831,6 +1973,66 @@ class RightArmPolicyExecutor:
             print(f"[policy-ik] warmup_s={time.perf_counter() - started:.4f}", flush=True)
         except Exception as exc:
             print(f"[policy-ik] warmup failed: {exc}", flush=True)
+
+    def _reset_differential_ik_controller(self) -> None:
+        self.differential_ik_runtime = None
+        self.differential_ik_model = None
+        self.differential_ik_controller = None
+        self.last_differential_ik_debug = None
+        if self.arm_ik_mode != "differential_full_pose":
+            return
+        runtime = _SingleArmGenesisIkRuntime(
+            arm=self.arm,
+            eef_link=self.eef_link,
+            arm_dofs=list(self.arm_dofs),
+        )
+        model = GenesisLinkKinematicsModel(
+            runtime=runtime,
+            side="right",
+            finite_difference_rad=float(self.ik_differential_finite_difference_rad),
+        )
+        joint4_lower, joint4_upper = (float(v) for v in self.ik_j4_limit_rad)
+        lower_limits = nero_effective_joint_lower_limits(
+            joint4_limit_enabled=bool(self.ik_j4_limit),
+            joint4_lower_rad=min(joint4_lower, joint4_upper),
+        )
+        upper_limits = nero_effective_joint_upper_limits(
+            joint4_limit_enabled=bool(self.ik_j4_limit),
+            joint4_upper_rad=max(joint4_lower, joint4_upper),
+        )
+        neutral = tuple(0.5 * (float(lower_limits[i]) + float(upper_limits[i])) for i in range(7))
+        controller = FullPoseDifferentialIkController(
+            FullPoseDifferentialIkControllerConfig(
+                seed_joint_positions_rad=tuple(float(v) for v in self.q_cmd[:7]),
+                joint_lower_limits_rad=lower_limits,
+                joint_upper_limits_rad=upper_limits,
+                neutral_joint_positions_rad=neutral,
+                kinematics_model=model,
+                max_task_step_m=float(self.ik_differential_max_task_step_m),
+                max_rotation_step_rad=float(self.ik_differential_max_rotation_step_rad),
+                position_weight=float(self.ik_differential_position_weight),
+                orientation_weight=float(self.ik_differential_orientation_weight),
+                max_joint_step_rad=float(self.max_joint_step),
+                max_joint_velocity_rad_s=float(self.max_joint_step) * float(self.ik_command_hz),
+                max_joint_acceleration_rad_s2=float(self.ik_differential_max_joint_acceleration_rad_s2),
+                damping_lambda=float(self.ik_differential_damping_lambda),
+                posture_bias_gain=float(self.ik_differential_posture_bias_gain),
+                joint_limit_bias_gain=float(self.ik_differential_joint_limit_bias_gain),
+                bias_weight=float(self.ik_differential_bias_weight),
+                joint_limit_soft_margin_rad=float(self.ik_differential_joint_limit_soft_margin_rad),
+            )
+        )
+        current_q = tuple(float(v) for v in self.q_cmd[:7])
+        controller.reset(
+            RobotStateSnapshot(
+                timestamp_s=time.monotonic(),
+                joint_positions_rad=current_q,
+                ee_pose=model.forward_pose(current_q),
+            )
+        )
+        self.differential_ik_runtime = runtime
+        self.differential_ik_model = model
+        self.differential_ik_controller = controller
 
     def _apply_ik_joint4_search_limit(self, qpos: np.ndarray) -> np.ndarray:
         limited = np.asarray(qpos, dtype=np.float32).copy()
@@ -2788,12 +2990,30 @@ def main() -> int:
     parser.add_argument("--rtc-frozen-steps", type=int, default=2)
     parser.add_argument("--rtc-ramp-rate", type=float, default=3.0)
     parser.add_argument("--rtc-guidance-beta", type=float, default=0.5)
+    parser.add_argument(
+        "--arm-ik-mode",
+        choices=("genesis_pose", "differential_full_pose"),
+        default="differential_full_pose",
+        help="Arm EEF IK backend. differential_full_pose mirrors remote Nero runtime's repo-owned full-pose IK.",
+    )
     parser.add_argument("--max-joint-step", type=float, default=0.045)
     parser.add_argument("--ik-solver-max-joint-step", type=float, default=0.045)
     parser.add_argument("--min-joint-step", type=float, default=0.001)
     parser.add_argument("--ik-pos-tol", type=float, default=1e-3)
     parser.add_argument("--ik-j4-limit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ik-j4-limit-rad", type=_vec2, default=DEFAULT_IK_J4_LIMIT_RAD)
+    parser.add_argument("--ik-command-hz", type=float, default=10.0)
+    parser.add_argument("--ik-differential-finite-difference-rad", type=float, default=1e-4)
+    parser.add_argument("--ik-differential-position-weight", type=float, default=3.0)
+    parser.add_argument("--ik-differential-orientation-weight", type=float, default=1.0)
+    parser.add_argument("--ik-differential-max-task-step-m", type=float, default=0.03)
+    parser.add_argument("--ik-differential-max-rotation-step-rad", type=float, default=math.radians(5.0))
+    parser.add_argument("--ik-differential-damping-lambda", type=float, default=0.02)
+    parser.add_argument("--ik-differential-posture-bias-gain", type=float, default=0.04)
+    parser.add_argument("--ik-differential-joint-limit-bias-gain", type=float, default=0.35)
+    parser.add_argument("--ik-differential-bias-weight", type=float, default=0.08)
+    parser.add_argument("--ik-differential-joint-limit-soft-margin-rad", type=float, default=0.25)
+    parser.add_argument("--ik-differential-max-joint-acceleration-rad-s2", type=float, default=0.0)
     parser.add_argument(
         "--print-hand-every",
         type=int,
@@ -2965,12 +3185,25 @@ def main() -> int:
     )
     executor = RightArmPolicyExecutor(
         scene,
+        arm_ik_mode=str(args.arm_ik_mode),
         max_joint_step=float(args.max_joint_step),
         ik_solver_max_joint_step=float(args.ik_solver_max_joint_step),
         min_joint_step=float(args.min_joint_step),
         pos_tol=float(args.ik_pos_tol),
         ik_j4_limit=bool(args.ik_j4_limit),
         ik_j4_limit_rad=args.ik_j4_limit_rad,
+        ik_command_hz=float(args.ik_command_hz),
+        ik_differential_finite_difference_rad=float(args.ik_differential_finite_difference_rad),
+        ik_differential_position_weight=float(args.ik_differential_position_weight),
+        ik_differential_orientation_weight=float(args.ik_differential_orientation_weight),
+        ik_differential_max_task_step_m=float(args.ik_differential_max_task_step_m),
+        ik_differential_max_rotation_step_rad=float(args.ik_differential_max_rotation_step_rad),
+        ik_differential_damping_lambda=float(args.ik_differential_damping_lambda),
+        ik_differential_posture_bias_gain=float(args.ik_differential_posture_bias_gain),
+        ik_differential_joint_limit_bias_gain=float(args.ik_differential_joint_limit_bias_gain),
+        ik_differential_bias_weight=float(args.ik_differential_bias_weight),
+        ik_differential_joint_limit_soft_margin_rad=float(args.ik_differential_joint_limit_soft_margin_rad),
+        ik_differential_max_joint_acceleration_rad_s2=float(args.ik_differential_max_joint_acceleration_rad_s2),
         workspace_min=args.workspace_min,
         workspace_max=args.workspace_max,
         print_hand_every=int(args.print_hand_every),
