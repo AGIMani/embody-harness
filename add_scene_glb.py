@@ -46,7 +46,7 @@ ROOT_DIR = Path(__file__).resolve().parent
 NERO_LINKER_CONFIG = make_runtime_config(backend="cpu", show_viewer=False)
 DEFAULT_GLB = ROOT_DIR / "scene" / "scene.glb"
 DEFAULT_BOTTLE_GLB = ROOT_DIR / "scene" / "bottle.glb"
-DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.805556)
+DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
 DEFAULT_CONNECTOR_MESH = ROOT_DIR / "assets" / "connector.STL"
 DEFAULT_D455_JSON = ROOT_DIR / "assets" / "d455json.json"
@@ -104,8 +104,8 @@ BOTTLE_Y_RANGE = (0.19251, 0.41711)
 BOTTLE_Z = 0.70
 BOTTLE_YAW_RANGE_DEG = (0.0, 360.0)
 DEFAULT_GRAVITY = (0.0, 0.0, -9.81)
-DEFAULT_TABLE_COLLIDER_POS = (-0.07, 0.305, 0.02)
-DEFAULT_TABLE_COLLIDER_SIZE = (0.36, 0.36, 0.04)
+DEFAULT_TABLE_COLLIDER_POS = (-0.541071, -0.112500, 0.678571)
+DEFAULT_TABLE_COLLIDER_SIZE = (0.700000, 0.700000, 0.040000)
 DEFAULT_OVERLAY_HAND_TRACE_PATH = ROOT_DIR / "logs" / "xr_debug" / "camera_overlay_hand.jsonl"
 RIGHT_SUPPORT_HOLE_Z_MM = -109.0
 SUPPORT_HOLES_MM = np.asarray(
@@ -2853,6 +2853,19 @@ def main() -> None:
     parser.add_argument("--linker-hand-urdf", type=Path, default=DEFAULT_LINKER_HAND_URDF)
     parser.add_argument("--linker-hand-side", choices=("left", "right"), default=NERO_LINKER_CONFIG.linker_hand_side)
     parser.add_argument(
+        "--linker-hand-collision",
+        dest="linker_hand_collision",
+        action="store_true",
+        default=True,
+        help="Enable Linker Hand L10 collision (default).",
+    )
+    parser.add_argument(
+        "--no-linker-hand-collision",
+        dest="linker_hand_collision",
+        action="store_false",
+        help="Disable Linker Hand L10 collision.",
+    )
+    parser.add_argument(
         "--linker-l10-retargeter",
         choices=("heuristic", "dex_vector", "dex_position", "dex_dexpilot", "l10_adaptive", "holo_layered"),
         default=os.environ.get("TELEOP_LINKER_L10_RETARGETER", "holo_layered"),
@@ -2929,7 +2942,7 @@ def main() -> None:
     parser.add_argument("--vr-isaac-teleop-root", default=None)
     parser.add_argument("--vr-startup-timeout-s", type=float, default=300.0)
     parser.add_argument("--vr-teleop-trace-path", default=None)
-    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(0.15, 0.15, 0.15))
+    parser.add_argument("--vr-translation-scale-xyz", type=_vec3, default=(1.0, 1.0, 1.0))
     parser.add_argument("--vr-workspace-origin-xyz", type=_vec3, default=(0.0, 0.0, 0.0))
     parser.add_argument("--vr-input-axis-map", type=_parse_axis_map, default=_parse_axis_map("x,y,z"))
     parser.add_argument("--vr-openxr-coordinate-adapter", choices=("none", "openxr_genesis"), default="openxr_genesis")
@@ -3059,6 +3072,7 @@ def main() -> None:
         d405_camera_gui=args.d405_camera_gui,
         base_collision=args.base_collision,
         arm_collision=args.arm_collision,
+        linker_hand_collision=args.linker_hand_collision,
         add_revo2_flange=not args.no_revo2_flange,
         show_hole_markers=args.show_hole_markers,
     )
