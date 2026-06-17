@@ -48,6 +48,7 @@ DEFAULT_GLB = ROOT_DIR / "scene" / "scene.glb"
 DEFAULT_BOTTLE_GLB = ROOT_DIR / "scene" / "bottle.glb"
 DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
+DEFAULT_COMBINED_NERO_LINKER_URDF = ROOT_DIR / "assets" / "generated" / "dual_nero_linker_l10_combined.urdf"
 DEFAULT_CONNECTOR_MESH = ROOT_DIR / "assets" / "connector.STL"
 DEFAULT_D455_JSON = ROOT_DIR / "assets" / "d455json.json"
 DEFAULT_D405_JSON = ROOT_DIR / "assets" / "d405json.json"
@@ -738,6 +739,9 @@ def _apply_base_world_pose(
 ) -> None:
     if not assembly:
         return
+    if assembly.get("combined_urdf"):
+        _set_entity_pose(assembly["combined"], np.asarray(base_pos, dtype=np.float64), _rotation_from_euler_deg(base_euler))
+        return
     translation, rotation = _assembly_transform_for_base_world_pose(assembly, base_pos, base_euler)
     _apply_assembly_matrix_transform(assembly, translation, rotation)
 
@@ -750,15 +754,15 @@ def _get_joint_dofs(robot: object, joint_name: str) -> list[int]:
     return [int(idx) for idx in getattr(joint, "dofs_idx_local", ())]
 
 
-def _arm_dofs(robot: object) -> list[int]:
-    dofs = [idx for name in ARM_JOINT_NAMES for idx in _get_joint_dofs(robot, name)]
+def _arm_dofs(robot: object, joint_prefix: str = "") -> list[int]:
+    dofs = [idx for name in ARM_JOINT_NAMES for idx in _get_joint_dofs(robot, f"{joint_prefix}{name}")]
     if len(dofs) != 7:
-        raise RuntimeError(f"Expected 7 Nero arm DOFs, got {dofs}")
+        raise RuntimeError(f"Expected 7 Nero arm DOFs with prefix {joint_prefix!r}, got {dofs}")
     return dofs
 
 
-def _set_arm_initial_pose(robot: object, joint_values: tuple[float, ...]) -> None:
-    dofs = _arm_dofs(robot)
+def _set_arm_initial_pose(robot: object, joint_values: tuple[float, ...], joint_prefix: str = "") -> None:
+    dofs = _arm_dofs(robot, joint_prefix=joint_prefix)
     values = np.asarray(joint_values, dtype=np.float32).reshape(7)
     robot.set_dofs_position(values, dofs, zero_velocity=True)
     robot.control_dofs_position(values, dofs)
@@ -780,7 +784,13 @@ def _linker_l10_hand_gains_by_joint() -> dict[str, tuple[float, float]]:
     return gains
 
 
-def _set_named_dof_gains(robot: object, gains: dict[str, tuple[float, float]], force_range: float) -> None:
+def _set_named_dof_gains(
+    robot: object,
+    gains: dict[str, tuple[float, float]],
+    force_range: float,
+    *,
+    joint_prefix: str = "",
+) -> None:
     dofs: list[int] = []
     kp: list[float] = []
     kv: list[float] = []
@@ -788,7 +798,7 @@ def _set_named_dof_gains(robot: object, gains: dict[str, tuple[float, float]], f
     upper: list[float] = []
 
     for joint_name, (joint_kp, joint_kv) in gains.items():
-        joint_dofs = _get_joint_dofs(robot, joint_name)
+        joint_dofs = _get_joint_dofs(robot, f"{joint_prefix}{joint_name}")
         dofs.extend(joint_dofs)
         kp.extend([float(joint_kp)] * len(joint_dofs))
         kv.extend([float(joint_kv)] * len(joint_dofs))
@@ -873,6 +883,7 @@ def _initialize_linker_hand_control_info(assembly: dict[str, object]) -> None:
     urdf_path = Path(urdf_value) if urdf_value is not None else None
     mimic_by_name = _load_linker_hand_mimic_specs(urdf_path)
     limits_by_name = _load_linker_hand_joint_limits(urdf_path)
+    joint_lookup_prefix = str(assembly.get("linker_hand_joint_lookup_prefix", ""))
     joint_names = list(ACTIVE_LINKER_L10_JOINTS)
     for mimic_joint_name in mimic_by_name:
         if mimic_joint_name not in joint_names:
@@ -881,7 +892,7 @@ def _initialize_linker_hand_control_info(assembly: dict[str, object]) -> None:
     names: list[str] = []
     dofs: list[int] = []
     for joint_name in joint_names:
-        joint_dofs = _get_joint_dofs(linker_hand, joint_name)
+        joint_dofs = _get_joint_dofs(linker_hand, f"{joint_lookup_prefix}{joint_name}")
         if not joint_dofs:
             continue
         names.append(str(joint_name))
@@ -897,7 +908,12 @@ def _initialize_linker_hand_control_info(assembly: dict[str, object]) -> None:
         open_pose = np.zeros(len(dofs), dtype=np.float32)
         linker_hand.set_dofs_position(open_pose, dofs, zero_velocity=True)
         linker_hand.control_dofs_position(open_pose, dofs)
-        _set_named_dof_gains(linker_hand, _linker_l10_hand_gains_by_joint(), LINKER_L10_HAND_FORCE_RANGE)
+        _set_named_dof_gains(
+            linker_hand,
+            _linker_l10_hand_gains_by_joint(),
+            LINKER_L10_HAND_FORCE_RANGE,
+            joint_prefix=joint_lookup_prefix,
+        )
     print(
         "[add-scene-linker] hand control ready "
         f"side={assembly.get('linker_hand_side', 'right')} "
@@ -990,6 +1006,8 @@ def _mount_entity_to_arm_eef(
 
 
 def _mount_connectors_to_arms(assembly: dict[str, object], left_arm: object, right_arm: object) -> None:
+    if assembly.get("combined_urdf"):
+        return
     connectors = assembly.get("connectors")
     if not isinstance(connectors, dict):
         return
@@ -1018,18 +1036,23 @@ def _mount_assembly_attached_parts(assembly: dict[str, object], *, print_linker_
     _mount_d405_to_right_connector(assembly)
 
     hand_side = str(assembly.get("linker_hand_side", "right"))
-    mount_arm = left_arm if hand_side == "left" else right_arm
-    _mount_linker_hand_to_arm(
-        assembly.get("linker_hand"),
-        mount_arm,
-        eef_link_name=str(assembly.get("eef_link", DEFAULT_EEF_LINK)),
-        mount_offset_xyz=tuple(float(v) for v in assembly.get("linker_hand_mount_offset_xyz", (0.0, 0.0, 0.0))),
-        mount_quat_wxyz=tuple(float(v) for v in assembly.get("linker_hand_mount_quat_wxyz", (1.0, 0.0, 0.0, 0.0))),
-    )
+    if not assembly.get("combined_urdf"):
+        mount_arm = left_arm if hand_side == "left" else right_arm
+        _mount_linker_hand_to_arm(
+            assembly.get("linker_hand"),
+            mount_arm,
+            eef_link_name=str(assembly.get("eef_link", DEFAULT_EEF_LINK)),
+            mount_offset_xyz=tuple(float(v) for v in assembly.get("linker_hand_mount_offset_xyz", (0.0, 0.0, 0.0))),
+            mount_quat_wxyz=tuple(float(v) for v in assembly.get("linker_hand_mount_quat_wxyz", (1.0, 0.0, 0.0, 0.0))),
+        )
     _apply_linker_hand_target(assembly)
     linker_hand = assembly.get("linker_hand")
     if print_linker_status and linker_hand is not None:
-        hand_pos = _tensor_to_np(linker_hand.get_pos()).reshape(3)
+        if assembly.get("combined_urdf"):
+            hand_link = linker_hand.get_link(str(assembly.get("linker_hand_root_link", f"{hand_side}_l10_hand_base_link")))
+            hand_pos = _tensor_to_np(hand_link.get_pos()).reshape(3)
+        else:
+            hand_pos = _tensor_to_np(linker_hand.get_pos()).reshape(3)
         print(
             "[nero-linker] mounted "
             f"side={hand_side} "
@@ -1077,9 +1100,14 @@ def _mount_d455_to_base(assembly: dict[str, object]) -> None:
 def _mount_d405_to_right_connector(assembly: dict[str, object]) -> None:
     d405 = assembly.get("d405")
     connectors = assembly.get("connectors")
-    if not isinstance(d405, dict) or not isinstance(connectors, dict):
+    if not isinstance(d405, dict):
         return
-    right_connector = connectors.get("right")
+    right_connector = connectors.get("right") if isinstance(connectors, dict) else None
+    if right_connector is None and assembly.get("combined_urdf"):
+        try:
+            right_connector = assembly["combined"].get_link("right_connector")
+        except Exception:
+            right_connector = None
     body = d405.get("body")
     camera = d405.get("camera")
     if right_connector is None or (body is None and camera is None):
@@ -1252,8 +1280,11 @@ def _initialize_nero_linker_assembly(
     _apply_base_world_pose(assembly, initial_base_pos, initial_base_euler)
     left_arm = assembly["left"]
     right_arm = assembly["right"]
-    _set_arm_initial_pose(left_arm, INITIAL_LEFT_ARM_Q)
-    _set_arm_initial_pose(right_arm, INITIAL_RIGHT_ARM_Q)
+    arm_prefixes = assembly.get("arm_joint_prefixes", {})
+    left_prefix = str(arm_prefixes.get("left", "")) if isinstance(arm_prefixes, dict) else ""
+    right_prefix = str(arm_prefixes.get("right", "")) if isinstance(arm_prefixes, dict) else ""
+    _set_arm_initial_pose(left_arm, INITIAL_LEFT_ARM_Q, joint_prefix=left_prefix)
+    _set_arm_initial_pose(right_arm, INITIAL_RIGHT_ARM_Q, joint_prefix=right_prefix)
     _initialize_linker_hand_control_info(assembly)
 
     scene.step()
@@ -1622,6 +1653,7 @@ class _AddSceneNeroTeleopRobot:
         self.command_count = 0
         self.arm = None
         self.eef_link = None
+        self.arm_joint_prefix = ""
         self.arm_dofs: list[int] = []
         self.q_state: np.ndarray | None = None
         self.human_anchor_xyz: tuple[float, float, float] | None = None
@@ -1643,8 +1675,18 @@ class _AddSceneNeroTeleopRobot:
         if not isinstance(assembly, dict):
             raise RuntimeError("add_scene_glb scene does not contain a Nero assembly. Remove --no-arm-assembly.")
         self.arm = assembly[self.arm_side]
-        self.eef_link = self.arm.get_link(str(assembly.get("eef_link", DEFAULT_EEF_LINK)))
-        self.arm_dofs = _arm_dofs(self.arm)
+        eef_links = assembly.get("eef_links", {})
+        eef_link_name = (
+            str(eef_links.get(self.arm_side, assembly.get("eef_link", DEFAULT_EEF_LINK)))
+            if isinstance(eef_links, dict)
+            else str(assembly.get("eef_link", DEFAULT_EEF_LINK))
+        )
+        arm_prefixes = assembly.get("arm_joint_prefixes", {})
+        self.arm_joint_prefix = (
+            str(arm_prefixes.get(self.arm_side, "")) if isinstance(arm_prefixes, dict) else ""
+        )
+        self.eef_link = self.arm.get_link(eef_link_name)
+        self.arm_dofs = _arm_dofs(self.arm, joint_prefix=self.arm_joint_prefix)
         self.q_state = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
         self.connected = True
         print(
@@ -2039,7 +2081,7 @@ class _AddSceneNeroTeleopRobot:
     def recenter_teleop(self) -> None:
         self._ensure_connected()
         initial_q = INITIAL_LEFT_ARM_Q if self.arm_side == "left" else INITIAL_RIGHT_ARM_Q
-        _set_arm_initial_pose(self.arm, initial_q)
+        _set_arm_initial_pose(self.arm, initial_q, joint_prefix=self.arm_joint_prefix)
         self.q_state = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
         self._clear_relative_anchor()
         self.beavr_hand_frame_smoother.reset()
@@ -2536,6 +2578,141 @@ def _add_dual_nero_arm_assembly(
     }
 
 
+def _add_combined_nero_linker_assembly(
+    scene: gs.Scene,
+    *,
+    combined_urdf: Path = DEFAULT_COMBINED_NERO_LINKER_URDF,
+    d455_json: Path | None = None,
+    d455_rgb_gui: bool = DEFAULT_D455_RGB_GUI,
+    d405_json: Path | None = None,
+    d405_camera_gui: bool = DEFAULT_D405_CAMERA_GUI,
+    linker_hand_side: str = NERO_LINKER_CONFIG.linker_hand_side,
+    linker_hand_urdf: Path | None = DEFAULT_LINKER_HAND_URDF,
+    linker_hand_collision: bool = True,
+) -> dict[str, object]:
+    combined_urdf = combined_urdf.expanduser().resolve()
+    linker_hand_urdf = linker_hand_urdf.expanduser().resolve() if linker_hand_urdf is not None else None
+    d455_json = d455_json.expanduser().resolve() if d455_json is not None else None
+    d405_json = d405_json.expanduser().resolve() if d405_json is not None else None
+    if not combined_urdf.exists():
+        raise FileNotFoundError(
+            f"Combined Nero/L10 URDF not found: {combined_urdf}. "
+            "Generate it with: python tools/build_add_scene_combined_urdf.py"
+        )
+    if linker_hand_urdf is not None and not linker_hand_urdf.exists():
+        raise FileNotFoundError(f"Linker Hand URDF not found: {linker_hand_urdf}")
+
+    d455_config = None
+    if d455_json is not None:
+        if not d455_json.exists():
+            raise FileNotFoundError(f"D455 JSON not found: {d455_json}")
+        d455_config = _load_d455_config(d455_json)
+    d405_config = None
+    if d405_json is not None:
+        if not d405_json.exists():
+            raise FileNotFoundError(f"D405 JSON not found: {d405_json}")
+        d405_config = _load_d405_config(d405_json)
+
+    combined = scene.add_entity(
+        gs.morphs.URDF(
+            file=str(combined_urdf),
+            pos=(0.0, 0.0, 0.0),
+            euler=(0.0, 0.0, 0.0),
+            fixed=True,
+            collision=bool(linker_hand_collision),
+            convexify=bool(linker_hand_collision),
+            merge_fixed_links=False,
+            prioritize_urdf_material=True,
+            requires_jac_and_IK=True,
+        ),
+        name="dual_nero_linker_l10_combined",
+    )
+
+    d455: dict[str, object] = {}
+    if d455_config is not None:
+        d455_body_size = tuple(float(v) for v in d455_config["body_size"])
+        d455["body_size"] = d455_body_size
+        d455["body"] = scene.add_entity(
+            gs.morphs.Box(
+                pos=(0.0, 0.0, 0.0),
+                size=d455_body_size,
+                fixed=True,
+                collision=False,
+            ),
+            surface=gs.surfaces.Plastic(color=(0.08, 0.08, 0.08, 1.0), roughness=0.55),
+            name="d455_body",
+        )
+        d455["rgb_camera"] = scene.add_camera(
+            model="pinhole",
+            res=tuple(int(v) for v in d455_config["rgb_res"]),
+            pos=(0.0, 0.0, 0.0),
+            lookat=(1.0, 0.0, 0.0),
+            up=(0.0, 0.0, 1.0),
+            fov=float(d455_config["rgb_fov"]),
+            GUI=bool(d455_rgb_gui),
+            spp=64,
+            near=float(d455_config["rgb_near"]),
+            far=float(d455_config["rgb_far"]),
+        )
+
+    d405: dict[str, object] = {}
+    if d405_config is not None:
+        d405_body_size = tuple(float(v) for v in d405_config["body_size"])
+        d405["body_size"] = d405_body_size
+        d405["body"] = scene.add_entity(
+            gs.morphs.Box(
+                pos=(0.0, 0.0, 0.0),
+                size=d405_body_size,
+                fixed=True,
+                collision=False,
+            ),
+            surface=gs.surfaces.Aluminium(
+                color=SILVER_WHITE_METAL_COLOR,
+                roughness=SILVER_WHITE_METAL_ROUGHNESS,
+            ),
+            name="right_d405_body",
+        )
+        d405["camera"] = scene.add_camera(
+            model="pinhole",
+            res=tuple(int(v) for v in d405_config["res"]),
+            pos=(0.0, 0.0, 0.0),
+            lookat=(0.0, 0.0, 1.0),
+            up=(0.0, 1.0, 0.0),
+            fov=float(d405_config["fov"]),
+            GUI=bool(d405_camera_gui),
+            spp=64,
+            near=float(d405_config["near"]),
+            far=float(d405_config["far"]),
+        )
+
+    hand_side = "left" if str(linker_hand_side) == "left" else "right"
+    return {
+        "combined_urdf": True,
+        "combined": combined,
+        "combined_urdf_path": combined_urdf,
+        "base": combined,
+        "base_initial_pos": np.zeros(3, dtype=np.float64),
+        "base_initial_rotation": np.eye(3, dtype=np.float64),
+        "left": combined,
+        "right": combined,
+        "arm_joint_prefixes": {"left": "left_", "right": "right_"},
+        "eef_links": {"left": "left_revo2_flange", "right": "right_revo2_flange"},
+        "eef_link": f"{hand_side}_revo2_flange",
+        "connectors": {},
+        "d455": d455,
+        "d405": d405,
+        "linker_hand": combined,
+        "linker_hand_side": hand_side,
+        "linker_hand_urdf": linker_hand_urdf,
+        "linker_hand_joint_lookup_prefix": f"{hand_side}_l10_",
+        "linker_hand_root_link": f"{hand_side}_l10_hand_base_link",
+        "linker_hand_mount_offset_xyz": tuple(float(v) for v in NERO_LINKER_CONFIG.linker_hand_mount_offset_xyz),
+        "linker_hand_mount_quat_wxyz": tuple(float(v) for v in NERO_LINKER_CONFIG.linker_hand_mount_quat_wxyz),
+        "origin": np.zeros(3, dtype=np.float64),
+        "pose_items": [],
+    }
+
+
 def create_scene(
     glb_path: str | Path = DEFAULT_GLB,
     *,
@@ -2560,6 +2737,8 @@ def create_scene(
     table_collider_size: tuple[float, float, float] = DEFAULT_TABLE_COLLIDER_SIZE,
     show_table_collider: bool = False,
     add_arm_assembly: bool = True,
+    use_combined_urdf: bool = True,
+    combined_urdf: str | Path = DEFAULT_COMBINED_NERO_LINKER_URDF,
     assembly_origin: tuple[float, float, float] = (0.0, 0.0, 0.0),
     initial_base_pos: tuple[float, float, float] | None = None,
     initial_base_euler: tuple[float, float, float] | None = None,
@@ -2709,26 +2888,39 @@ def create_scene(
 
     assembly_info = None
     if add_arm_assembly:
-        assembly_info = _add_dual_nero_arm_assembly(
-            scene,
-            base_mesh=Path(base_mesh),
-            nero_urdf=Path(nero_urdf),
-            package_root=Path(package_root),
-            linker_hand_urdf=Path(linker_hand_urdf) if add_linker_hand and linker_hand_urdf is not None else None,
-            connector_mesh=Path(connector_mesh) if add_connectors and connector_mesh is not None else None,
-            connector_scale=connector_scale,
-            d455_json=Path(d455_json) if add_d455 and d455_json is not None else None,
-            d455_rgb_gui=d455_rgb_gui,
-            d405_json=Path(d405_json) if add_d405 and d405_json is not None else None,
-            d405_camera_gui=d405_camera_gui,
-            linker_hand_side=linker_hand_side,
-            origin=assembly_origin,
-            base_collision=base_collision,
-            arm_collision=arm_collision,
-            linker_hand_collision=linker_hand_collision,
-            add_revo2_flange=add_revo2_flange,
-            show_hole_markers=show_hole_markers,
-        )
+        if use_combined_urdf:
+            assembly_info = _add_combined_nero_linker_assembly(
+                scene,
+                combined_urdf=Path(combined_urdf),
+                d455_json=Path(d455_json) if add_d455 and d455_json is not None else None,
+                d455_rgb_gui=d455_rgb_gui,
+                d405_json=Path(d405_json) if add_d405 and d405_json is not None else None,
+                d405_camera_gui=d405_camera_gui,
+                linker_hand_side=linker_hand_side,
+                linker_hand_urdf=Path(linker_hand_urdf) if add_linker_hand and linker_hand_urdf is not None else None,
+                linker_hand_collision=linker_hand_collision,
+            )
+        else:
+            assembly_info = _add_dual_nero_arm_assembly(
+                scene,
+                base_mesh=Path(base_mesh),
+                nero_urdf=Path(nero_urdf),
+                package_root=Path(package_root),
+                linker_hand_urdf=Path(linker_hand_urdf) if add_linker_hand and linker_hand_urdf is not None else None,
+                connector_mesh=Path(connector_mesh) if add_connectors and connector_mesh is not None else None,
+                connector_scale=connector_scale,
+                d455_json=Path(d455_json) if add_d455 and d455_json is not None else None,
+                d455_rgb_gui=d455_rgb_gui,
+                d405_json=Path(d405_json) if add_d405 and d405_json is not None else None,
+                d405_camera_gui=d405_camera_gui,
+                linker_hand_side=linker_hand_side,
+                origin=assembly_origin,
+                base_collision=base_collision,
+                arm_collision=arm_collision,
+                linker_hand_collision=linker_hand_collision,
+                add_revo2_flange=add_revo2_flange,
+                show_hole_markers=show_hole_markers,
+            )
 
     scene.build()
     initial_base_pos = tuple(
@@ -2815,6 +3007,12 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=None, help="Random seed for bottle placement.")
     parser.add_argument("--no-arm-assembly", action="store_true", help="Only load the GLB scene.")
+    parser.add_argument("--combined-assembly-urdf", type=Path, default=DEFAULT_COMBINED_NERO_LINKER_URDF)
+    parser.add_argument(
+        "--legacy-split-assembly",
+        action="store_true",
+        help="Use the old multi-entity base/arms/connectors/L10 assembly instead of the combined URDF.",
+    )
     parser.add_argument("--no-table-collider", action="store_true", help="Do not add the table Box collision proxy.")
     parser.add_argument(
         "--table-collider-pos",
@@ -3052,6 +3250,8 @@ def main() -> None:
         table_collider_size=args.table_collider_size,
         show_table_collider=args.show_table_collider,
         add_arm_assembly=not args.no_arm_assembly,
+        use_combined_urdf=not args.legacy_split_assembly,
+        combined_urdf=args.combined_assembly_urdf,
         assembly_origin=args.assembly_origin,
         initial_base_pos=args.initial_base_pos,
         initial_base_euler=args.initial_base_euler,

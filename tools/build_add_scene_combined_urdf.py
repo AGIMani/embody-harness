@@ -99,6 +99,7 @@ def _prefix_tree(
     *,
     prefix: str,
     drop_transmissions: bool = True,
+    strip_collisions: bool = False,
 ) -> tuple[list[ET.Element], set[str], set[str]]:
     tree = ET.parse(source)
     source_root = tree.getroot()
@@ -112,6 +113,12 @@ def _prefix_tree(
         if drop_transmissions and child.tag == "transmission":
             continue
         item = copy.deepcopy(child)
+        if strip_collisions:
+            for collision in list(item.findall(".//collision")):
+                for parent in item.iter():
+                    if collision in list(parent):
+                        parent.remove(collision)
+                        break
         if item.tag == "link" and "name" in item.attrib:
             item.attrib["name"] = prefix + item.attrib["name"]
         elif item.tag == "joint" and "name" in item.attrib:
@@ -129,8 +136,8 @@ def _prefix_tree(
     return elements, prefixed_link_names, prefixed_joint_names
 
 
-def _append_prefixed_urdf(root: ET.Element, source: Path, *, prefix: str) -> set[str]:
-    elements, links, _ = _prefix_tree(source, prefix=prefix)
+def _append_prefixed_urdf(root: ET.Element, source: Path, *, prefix: str, strip_collisions: bool = False) -> set[str]:
+    elements, links, _ = _prefix_tree(source, prefix=prefix, strip_collisions=strip_collisions)
     for item in elements:
         root.append(item)
     return links
@@ -159,11 +166,11 @@ def build_combined_urdf(output: Path, *, hand_side: str) -> Path:
         name="base_stl",
         mesh=base_mesh,
         scale=float(harness.DEFAULT_BASE_SCALE),
-        collision=True,
+        collision=False,
     )
 
-    left_links = _append_prefixed_urdf(root, nero_urdf, prefix="left_")
-    right_links = _append_prefixed_urdf(root, nero_urdf, prefix="right_")
+    left_links = _append_prefixed_urdf(root, nero_urdf, prefix="left_", strip_collisions=True)
+    right_links = _append_prefixed_urdf(root, nero_urdf, prefix="right_", strip_collisions=True)
 
     _add_fixed_joint(
         root,

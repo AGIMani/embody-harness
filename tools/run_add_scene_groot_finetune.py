@@ -1209,12 +1209,21 @@ class RightArmPolicyExecutor:
         self.assembly = assembly
         self.arm = assembly["right"]
         self.left_arm = assembly.get("left")
+        arm_prefixes = assembly.get("arm_joint_prefixes", {})
+        self.right_arm_joint_prefix = str(arm_prefixes.get("right", "")) if isinstance(arm_prefixes, dict) else ""
+        self.left_arm_joint_prefix = str(arm_prefixes.get("left", "")) if isinstance(arm_prefixes, dict) else ""
         self.policy_eef_link_name = str(policy_eef_link)
         if self.policy_eef_link_name not in {"revo2_flange", "link7"}:
             raise ValueError(f"unsupported policy_eef_link: {self.policy_eef_link_name!r}")
-        self.assembly_eef_link_name = str(assembly.get("eef_link", harness.DEFAULT_EEF_LINK))
-        self.eef_link = self.arm.get_link(self.policy_eef_link_name)
-        self.arm_dofs = harness._arm_dofs(self.arm)  # noqa: SLF001
+        eef_links = assembly.get("eef_links", {})
+        if isinstance(eef_links, dict) and self.policy_eef_link_name == "revo2_flange":
+            self.assembly_eef_link_name = str(eef_links.get("right", assembly.get("eef_link", harness.DEFAULT_EEF_LINK)))
+        elif self.right_arm_joint_prefix and self.policy_eef_link_name == "link7":
+            self.assembly_eef_link_name = f"{self.right_arm_joint_prefix}link7"
+        else:
+            self.assembly_eef_link_name = str(self.policy_eef_link_name)
+        self.eef_link = self.arm.get_link(self.assembly_eef_link_name)
+        self.arm_dofs = harness._arm_dofs(self.arm, joint_prefix=self.right_arm_joint_prefix)  # noqa: SLF001
         self.arm_ik_mode = str(arm_ik_mode)
         if self.arm_ik_mode not in {"genesis_pose", "differential_full_pose"}:
             raise ValueError(f"unsupported arm IK mode: {self.arm_ik_mode!r}")
@@ -2041,10 +2050,14 @@ class RightArmPolicyExecutor:
         return True
 
     def _set_initial_arm_poses(self) -> None:
-        harness._set_arm_initial_pose(self.arm, self.initial_right_arm_q)  # noqa: SLF001
+        harness._set_arm_initial_pose(self.arm, self.initial_right_arm_q, joint_prefix=self.right_arm_joint_prefix)  # noqa: SLF001
         if self.left_arm is not None:
             try:
-                harness._set_arm_initial_pose(self.left_arm, self.initial_left_arm_q)  # noqa: SLF001
+                harness._set_arm_initial_pose(
+                    self.left_arm,
+                    self.initial_left_arm_q,
+                    joint_prefix=self.left_arm_joint_prefix,
+                )  # noqa: SLF001
             except Exception as exc:
                 print(f"[policy-ik] left initial pose skipped: {exc}", flush=True)
 
@@ -3460,6 +3473,8 @@ def main() -> int:
         table_collider_pos=args.scene_support_collider_pos,
         table_collider_size=args.scene_support_collider_size,
         show_table_collider=bool(args.show_scene_support_collider),
+        use_combined_urdf=True,
+        combined_urdf=harness.DEFAULT_COMBINED_NERO_LINKER_URDF,
         initial_base_pos=harness.DEFAULT_INITIAL_BASE_WORLD_POS,
         initial_base_euler=harness.DEFAULT_INITIAL_BASE_WORLD_EULER,
         d455_rgb_gui=False,
