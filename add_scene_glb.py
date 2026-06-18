@@ -46,6 +46,12 @@ ROOT_DIR = Path(__file__).resolve().parent
 NERO_LINKER_CONFIG = make_runtime_config(backend="cpu", show_viewer=False)
 DEFAULT_GLB = ROOT_DIR / "scene" / "scene.glb"
 DEFAULT_BOTTLE_GLB = ROOT_DIR / "scene" / "bottle.glb"
+DEFAULT_BOTTLE_PROXY_JSON = ROOT_DIR / "assets" / "generated" / "bottle_cylinder_collision_proxy.json"
+DEFAULT_BOTTLE_PROXY_URDF = ROOT_DIR / "assets" / "generated" / "bottle_cylinder_collision_proxy.urdf"
+DEFAULT_BOTTLE_PROXY_POS = (-0.003652, 0.003652, 0.076696)
+DEFAULT_BOTTLE_PROXY_EULER = (0.0, 0.0, 0.0)
+DEFAULT_BOTTLE_PROXY_DIAMETER = 0.061840
+DEFAULT_BOTTLE_PROXY_HEIGHT = 0.138117
 DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
 DEFAULT_COMBINED_NERO_LINKER_URDF = ROOT_DIR / "assets" / "generated" / "dual_nero_linker_l10_combined.urdf"
@@ -107,6 +113,15 @@ BOTTLE_YAW_RANGE_DEG = (0.0, 360.0)
 DEFAULT_GRAVITY = (0.0, 0.0, -9.81)
 DEFAULT_TABLE_COLLIDER_POS = (-0.541071, -0.112500, 0.678571)
 DEFAULT_TABLE_COLLIDER_SIZE = (0.700000, 0.700000, 0.040000)
+DEFAULT_RIGID_SOLVER_ITERATIONS = 100
+DEFAULT_RIGID_SOLVER_LS_ITERATIONS = 100
+DEFAULT_RIGID_SOLVER_NOSLIP_ITERATIONS = 10
+DEFAULT_RIGID_SOLVER_CONSTRAINT_TIMECONST = 0.005
+DEFAULT_RIGID_MAX_COLLISION_PAIRS = 4096
+DEFAULT_BOTTLE_FRICTION = 1.4
+DEFAULT_BOTTLE_COUP_FRICTION = 1.2
+DEFAULT_L10_COLLISION_FRICTION = 1.6
+DEFAULT_L10_COLLISION_COUP_FRICTION = 1.4
 DEFAULT_OVERLAY_HAND_TRACE_PATH = ROOT_DIR / "logs" / "xr_debug" / "camera_overlay_hand.jsonl"
 RIGHT_SUPPORT_HOLE_Z_MM = -109.0
 SUPPORT_HOLES_MM = np.asarray(
@@ -571,6 +586,42 @@ def _load_d405_config(path: Path) -> dict[str, object]:
         "near": D405_CAMERA_NEAR_M,
         "far": D405_CAMERA_FAR_M,
     }
+
+
+def _load_bottle_proxy_config(
+    path: str | Path | None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], float, float]:
+    if path is None:
+        return (
+            DEFAULT_BOTTLE_PROXY_POS,
+            DEFAULT_BOTTLE_PROXY_EULER,
+            float(DEFAULT_BOTTLE_PROXY_DIAMETER),
+            float(DEFAULT_BOTTLE_PROXY_HEIGHT),
+        )
+    proxy_path = Path(path).expanduser().resolve()
+    if not proxy_path.exists():
+        return (
+            DEFAULT_BOTTLE_PROXY_POS,
+            DEFAULT_BOTTLE_PROXY_EULER,
+            float(DEFAULT_BOTTLE_PROXY_DIAMETER),
+            float(DEFAULT_BOTTLE_PROXY_HEIGHT),
+        )
+    payload = json.loads(proxy_path.read_text(encoding="utf-8"))
+    collision = payload.get("collision", {})
+    pos = tuple(float(v) for v in collision.get("pos_m", DEFAULT_BOTTLE_PROXY_POS))
+    euler = tuple(float(v) for v in collision.get("euler_xyz_deg", DEFAULT_BOTTLE_PROXY_EULER))
+    if len(pos) != 3 or len(euler) != 3:
+        raise ValueError(f"{proxy_path} collision pos_m/euler_xyz_deg must contain three numbers")
+    diameter = float(collision.get("diameter_m", collision.get("radius_m", DEFAULT_BOTTLE_PROXY_DIAMETER * 0.5) * 2.0))
+    height = float(collision.get("height_m", DEFAULT_BOTTLE_PROXY_HEIGHT))
+    if diameter <= 0.0 or height <= 0.0:
+        raise ValueError(f"{proxy_path} collision diameter_m/height_m must be positive")
+    return (
+        (float(pos[0]), float(pos[1]), float(pos[2])),
+        (float(euler[0]), float(euler[1]), float(euler[2])),
+        diameter,
+        height,
+    )
 
 
 def _pose_world_from_base_relative(
@@ -1240,6 +1291,7 @@ def _refresh_scene_attached_parts(scene: gs.Scene) -> None:
     assembly = getattr(scene, "nero_assembly_info", None)
     if isinstance(assembly, dict):
         _mount_assembly_attached_parts(assembly)
+    _sync_bottle_visual_to_proxy(scene)
 
 
 def _install_scene_step_attachment_hook(scene: gs.Scene) -> None:
@@ -2191,12 +2243,70 @@ def _random_bottle_pose(
     return pos, euler_deg
 
 
+def _bottle_proxy_world_pose_from_visual_pose(
+    bottle_pos: tuple[float, float, float],
+    bottle_euler_deg: tuple[float, float, float],
+    proxy_rel_pos: tuple[float, float, float],
+    proxy_rel_euler_deg: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    bottle_rotation = _rotation_from_euler_deg(bottle_euler_deg)
+    proxy_rel_rotation = _rotation_from_euler_deg(proxy_rel_euler_deg)
+    proxy_pos = np.asarray(bottle_pos, dtype=np.float64) + bottle_rotation @ np.asarray(
+        proxy_rel_pos,
+        dtype=np.float64,
+    )
+    return proxy_pos, bottle_rotation @ proxy_rel_rotation
+
+
+def _bottle_visual_pose_from_proxy_world_pose(
+    proxy_entity: object,
+    proxy_rel_pos: tuple[float, float, float],
+    proxy_rel_euler_deg: tuple[float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    proxy_pos = _tensor_to_np(proxy_entity.get_pos()).reshape(3).astype(np.float64)
+    proxy_quat = _tensor_to_np(proxy_entity.get_quat()).reshape(4).astype(np.float64)
+    proxy_rotation = _rotation_from_quat_wxyz(proxy_quat)
+    proxy_rel_rotation = _rotation_from_euler_deg(proxy_rel_euler_deg)
+    bottle_rotation = proxy_rotation @ proxy_rel_rotation.T
+    bottle_pos = proxy_pos - bottle_rotation @ np.asarray(proxy_rel_pos, dtype=np.float64)
+    return bottle_pos, bottle_rotation
+
+
+def _sync_bottle_visual_to_proxy(scene: gs.Scene) -> None:
+    proxy_entity = getattr(scene, "bottle_entity", None)
+    visual_entity = getattr(scene, "bottle_visual_entity", None)
+    if proxy_entity is None or visual_entity is None:
+        return
+    proxy_rel_pos = tuple(float(v) for v in getattr(scene, "bottle_proxy_rel_pos", DEFAULT_BOTTLE_PROXY_POS))
+    proxy_rel_euler = tuple(float(v) for v in getattr(scene, "bottle_proxy_rel_euler", DEFAULT_BOTTLE_PROXY_EULER))
+    bottle_pos, bottle_rotation = _bottle_visual_pose_from_proxy_world_pose(
+        proxy_entity,
+        proxy_rel_pos,
+        proxy_rel_euler,
+    )
+    _set_entity_pose(visual_entity, bottle_pos, bottle_rotation)
+
+
 def _apply_bottle_pose(
     bottle_entity: object | None,
     pos: tuple[float, float, float],
     euler_deg: tuple[float, float, float],
 ) -> None:
     if bottle_entity is None:
+        return
+    proxy_rel_pos = getattr(bottle_entity, "_harness_proxy_rel_pos", None)
+    proxy_rel_euler = getattr(bottle_entity, "_harness_proxy_rel_euler", None)
+    visual_entity = getattr(bottle_entity, "_harness_visual_entity", None)
+    if proxy_rel_pos is not None and proxy_rel_euler is not None:
+        proxy_pos, proxy_rotation = _bottle_proxy_world_pose_from_visual_pose(
+            pos,
+            euler_deg,
+            tuple(float(v) for v in proxy_rel_pos),
+            tuple(float(v) for v in proxy_rel_euler),
+        )
+        _set_entity_pose(bottle_entity, proxy_pos, proxy_rotation)
+        if visual_entity is not None:
+            _set_entity_pose(visual_entity, np.asarray(pos, dtype=np.float64), _rotation_from_euler_deg(euler_deg))
         return
     _set_entity_pose(bottle_entity, np.asarray(pos, dtype=np.float64), _rotation_from_euler_deg(euler_deg))
 
@@ -2532,6 +2642,11 @@ def _add_dual_nero_arm_assembly(
                 merge_fixed_links=False,
                 prioritize_urdf_material=False,
             ),
+            material=gs.materials.Rigid(
+                friction=DEFAULT_L10_COLLISION_FRICTION,
+                coup_friction=DEFAULT_L10_COLLISION_COUP_FRICTION,
+                coup_restitution=0.0,
+            ),
             surface=gs.surfaces.Aluminium(
                 color=SILVER_WHITE_METAL_COLOR,
                 roughness=SILVER_WHITE_METAL_ROUGHNESS,
@@ -2624,6 +2739,11 @@ def _add_combined_nero_linker_assembly(
             merge_fixed_links=False,
             prioritize_urdf_material=True,
             requires_jac_and_IK=True,
+        ),
+        material=gs.materials.Rigid(
+            friction=DEFAULT_L10_COLLISION_FRICTION,
+            coup_friction=DEFAULT_L10_COLLISION_COUP_FRICTION,
+            coup_restitution=0.0,
         ),
         name="dual_nero_linker_l10_combined",
     )
@@ -2731,6 +2851,8 @@ def create_scene(
     bottle_euler: tuple[float, float, float] | None = DEFAULT_BOTTLE_EULER,
     bottle_scale: float | tuple[float, float, float] = 1.0,
     bottle_collision: bool = True,
+    bottle_proxy_json: str | Path | None = DEFAULT_BOTTLE_PROXY_JSON,
+    show_bottle_proxy: bool = False,
     seed: int | None = None,
     add_table_collider: bool = True,
     table_collider_pos: tuple[float, float, float] = DEFAULT_TABLE_COLLIDER_POS,
@@ -2769,7 +2891,7 @@ def create_scene(
         raise FileNotFoundError(f"GLB file not found: {glb_path}")
     bottle_path = Path(bottle_path).expanduser().resolve()
     if add_bottle and not bottle_path.exists():
-        raise FileNotFoundError(f"Bottle GLB file not found: {bottle_path}")
+        raise FileNotFoundError(f"Bottle asset file not found: {bottle_path}")
     if add_bottle and (bottle_pos is None or bottle_euler is None):
         random_pos, random_euler = _random_bottle_pose(np.random.default_rng(seed))
         bottle_pos = random_pos if bottle_pos is None else bottle_pos
@@ -2797,6 +2919,11 @@ def create_scene(
             gravity=gravity,
             enable_self_collision=False,
             enable_adjacent_collision=False,
+            iterations=DEFAULT_RIGID_SOLVER_ITERATIONS,
+            ls_iterations=DEFAULT_RIGID_SOLVER_LS_ITERATIONS,
+            noslip_iterations=DEFAULT_RIGID_SOLVER_NOSLIP_ITERATIONS,
+            constraint_timeconst=DEFAULT_RIGID_SOLVER_CONSTRAINT_TIMECONST,
+            max_collision_pairs=DEFAULT_RIGID_MAX_COLLISION_PAIRS,
         ),
         vis_options=gs.options.VisOptions(
             show_world_frame=True,
@@ -2856,35 +2983,83 @@ def create_scene(
                 collision=True,
                 visualization=show_table_collider,
             ),
-            material=gs.materials.Rigid(friction=0.8, coup_restitution=0.0),
+            material=gs.materials.Rigid(friction=1.0, coup_friction=0.8, coup_restitution=0.0),
             surface=gs.surfaces.Default(color=(0.0, 0.8, 1.0, 0.25), vis_mode="visual"),
             name="table_collider",
         )
 
     bottle_entity = None
+    bottle_visual_entity = None
     if add_bottle:
-        bottle_entity = scene.add_entity(
+        proxy_rel_pos, proxy_rel_euler, proxy_diameter, proxy_height = _load_bottle_proxy_config(bottle_proxy_json)
+        initial_proxy_pos, _ = _bottle_proxy_world_pose_from_visual_pose(
+            bottle_pos,
+            bottle_euler,
+            proxy_rel_pos,
+            proxy_rel_euler,
+        )
+        table_top_z = (
+            float(table_collider_pos[2]) + float(table_collider_size[2]) * 0.5 if add_table_collider else float("nan")
+        )
+        print(
+            "[bottle-proxy] "
+            f"json={Path(bottle_proxy_json).expanduser().resolve() if bottle_proxy_json is not None else '<defaults>'} "
+            f"rel_pos={tuple(round(float(v), 6) for v in proxy_rel_pos)} "
+            f"rel_euler_deg={tuple(round(float(v), 3) for v in proxy_rel_euler)} "
+            f"diameter={float(proxy_diameter):.6f} height={float(proxy_height):.6f} "
+            f"initial_bottom_z={float(initial_proxy_pos[2] - proxy_height * 0.5):.6f} "
+            f"table_top_z={table_top_z:.6f}",
+            flush=True,
+        )
+        bottle_material = gs.materials.Rigid(
+            rho=950.0,
+            friction=DEFAULT_BOTTLE_FRICTION,
+            coup_friction=DEFAULT_BOTTLE_COUP_FRICTION,
+            coup_restitution=0.0,
+        )
+        proxy_pos, proxy_rotation = _bottle_proxy_world_pose_from_visual_pose(
+            bottle_pos,
+            bottle_euler,
+            proxy_rel_pos,
+            proxy_rel_euler,
+        )
+        bottle_visual_entity = scene.add_entity(
             morph=gs.morphs.Mesh(
                 file=str(bottle_path),
                 scale=bottle_scale,
                 pos=bottle_pos,
                 euler=bottle_euler,
-                fixed=False,
-                collision=bottle_collision,
-                convexify=True,
-            ),
-            material=gs.materials.Rigid(
-                rho=950.0,
-                friction=0.45,
-                coup_friction=0.35,
-                coup_restitution=0.0,
+                fixed=True,
+                collision=False,
+                convexify=False,
             ),
             surface=gs.surfaces.Plastic(
                 roughness=0.65,
                 metallic=0.0,
             ),
-            name="bottle_glb",
+            name="bottle_glb_visual_only",
         )
+        bottle_entity = scene.add_entity(
+            morph=gs.morphs.Cylinder(
+                pos=tuple(float(v) for v in proxy_pos),
+                quat=_quat_wxyz_from_rotation(proxy_rotation),
+                radius=float(proxy_diameter) * 0.5,
+                height=float(proxy_height),
+                fixed=False,
+                collision=bottle_collision,
+                visualization=bool(show_bottle_proxy or not bottle_collision),
+            ),
+            material=bottle_material,
+            surface=gs.surfaces.Plastic(
+                color=(0.0, 0.85, 1.0, 0.25),
+                roughness=0.65,
+                metallic=0.0,
+            ),
+            name="bottle_cylinder_collision_proxy",
+        )
+        bottle_entity._harness_visual_entity = bottle_visual_entity
+        bottle_entity._harness_proxy_rel_pos = proxy_rel_pos
+        bottle_entity._harness_proxy_rel_euler = proxy_rel_euler
 
     assembly_info = None
     if add_arm_assembly:
@@ -2944,6 +3119,9 @@ def create_scene(
     _install_scene_step_attachment_hook(scene)
     scene.ceiling_area_light_entity = ceiling_area_light_entity
     scene.bottle_entity = bottle_entity
+    scene.bottle_visual_entity = bottle_visual_entity
+    scene.bottle_proxy_rel_pos = getattr(bottle_entity, "_harness_proxy_rel_pos", DEFAULT_BOTTLE_PROXY_POS)
+    scene.bottle_proxy_rel_euler = getattr(bottle_entity, "_harness_proxy_rel_euler", DEFAULT_BOTTLE_PROXY_EULER)
     scene.table_collider_entity = table_collider_entity
     scene.bottle_initial_pos = bottle_pos
     scene.bottle_initial_euler = bottle_euler
@@ -2971,10 +3149,26 @@ def main() -> None:
         help="Deprecated compatibility flag; scene.glb stays fixed.",
     )
     parser.add_argument("--no-bottle", action="store_true", help="Do not load scene/bottle.glb.")
-    parser.add_argument("--bottle-glb", type=Path, default=DEFAULT_BOTTLE_GLB)
+    parser.add_argument(
+        "--bottle-glb",
+        type=Path,
+        default=DEFAULT_BOTTLE_GLB,
+        help="Bottle visual GLB. Collision is handled by an internal cylinder proxy.",
+    )
     parser.add_argument("--bottle-pos", type=_vec3, default=DEFAULT_BOTTLE_POS, help="Bottle position as x,y,z in meters.")
     parser.add_argument("--bottle-euler", type=_vec3, default=DEFAULT_BOTTLE_EULER, help="Bottle Euler angles in degrees.")
     parser.add_argument("--bottle-scale", type=float, default=1.0, help="Uniform scale for the bottle.")
+    parser.add_argument(
+        "--bottle-proxy-json",
+        type=Path,
+        default=DEFAULT_BOTTLE_PROXY_JSON,
+        help="Cylinder collision proxy JSON saved by debug/debug_glb_cylinder_collision_proxy.py.",
+    )
+    parser.add_argument(
+        "--show-bottle-proxy",
+        action="store_true",
+        help="Render the physical cylinder proxy used for bottle collision.",
+    )
     parser.add_argument(
         "--bottle-collision",
         dest="bottle_collision",
@@ -3244,6 +3438,8 @@ def main() -> None:
         bottle_euler=args.bottle_euler,
         bottle_scale=args.bottle_scale,
         bottle_collision=args.bottle_collision,
+        bottle_proxy_json=args.bottle_proxy_json,
+        show_bottle_proxy=args.show_bottle_proxy,
         seed=args.seed,
         add_table_collider=not args.no_table_collider,
         table_collider_pos=args.table_collider_pos,

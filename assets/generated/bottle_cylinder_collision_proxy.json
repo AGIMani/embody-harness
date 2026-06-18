@@ -1,0 +1,21 @@
+{
+  "description": "GLB visual plus simple cylinder collision proxy. Cylinder frame is relative to the GLB object root.",
+  "glb": "/home/whf/Project/harness/scene/bottle.glb",
+  "output_urdf": "/home/whf/Project/harness/assets/generated/bottle_cylinder_collision_proxy.urdf",
+  "collision": {
+    "type": "cylinder",
+    "pos_m": [
+      -0.003652,
+      0.003652,
+      0.076696
+    ],
+    "euler_xyz_deg": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "diameter_m": 0.06184,
+    "radius_m": 0.03092,
+    "height_m": 0.138117
+  }
+}

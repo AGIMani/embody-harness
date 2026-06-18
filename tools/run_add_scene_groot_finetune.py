@@ -100,6 +100,15 @@ POLICY_HAND_JOINT_NAMES = (
 )
 POLICY_HAND_CLIP_LOWER = -0.6
 POLICY_HAND_CLIP_UPPER = 1.6
+POLICY_HAND_COMMAND_LOWER_BY_NAME = {
+    # Training observation/state for non-thumb MCP pitch is non-negative.
+    # Keep online command/reference/observation in that absolute command space;
+    # raw decoded model actions are still logged before this guard.
+    "index_mcp_pitch": 0.0,
+    "middle_mcp_pitch": 0.0,
+    "ring_mcp_pitch": 0.0,
+    "pinky_mcp_pitch": 0.0,
+}
 DEFAULT_MAX_HAND_JOINT_DELTA = 0.0
 L10_HAND_ACTIVE_LOCAL_INDICES = (0, 2, 3, 4, 5, 9)
 L10_HAND_MASKED_LOCAL_INDICES = (1, 6, 7, 8)
@@ -1265,9 +1274,7 @@ class RightArmPolicyExecutor:
         self.reset_generation = 0
         self.initial_hand_q = self._clip_policy_hand_q(np.asarray(initial_hand_q, dtype=np.float32))
         self.initial_reference_eef_9d = np.asarray(initial_reference_eef_9d, dtype=np.float32).reshape(9)
-        self.initial_reference_hand_q = self._clip_policy_hand_q(
-            np.asarray(initial_reference_hand_q, dtype=np.float32)
-        )
+        self.initial_reference_hand_q = self._clip_policy_hand_q(np.asarray(initial_reference_hand_q, dtype=np.float32))
         self.reference_eef_9d = self.initial_reference_eef_9d.copy()
         self.policy_hand_q_raw = self.initial_reference_hand_q.copy()
         self.reference_hand_q = self.initial_reference_hand_q.copy()
@@ -1546,6 +1553,13 @@ class RightArmPolicyExecutor:
         commands do not carry an arm-joint target when EEF control is active.
         """
         seed = {key: np.asarray(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        if "hand_joint_target" in seed:
+            hand = np.asarray(seed["hand_joint_target"], dtype=np.float32)
+            if hand.ndim >= 2 and hand.shape[-1] >= 10:
+                flat = hand.reshape(-1, hand.shape[-1])
+                for row_idx in range(flat.shape[0]):
+                    flat[row_idx, :10] = self._clip_policy_hand_q(flat[row_idx, :10])
+                seed["hand_joint_target"] = hand.astype(np.float32, copy=False)
         if "arm_joint_target" not in seed:
             return seed
         arm_q = self.current_actual_arm_q() if observation_arm_q is None else np.asarray(observation_arm_q, dtype=np.float32)
@@ -1561,7 +1575,11 @@ class RightArmPolicyExecutor:
         return seed
 
     def current_observation_hand_q(self) -> np.ndarray:
-        return self._current_linker_hand_q(fallback=self.sim_hand_q).astype(np.float32, copy=True)
+        # Match the GR00T training/evaluate chain: hand_joint_pos is the latest
+        # command-space L10 target, not Genesis' URDF-limited qpos feedback.
+        # Feeding a limit-projected state back into policy state/reference
+        # corrupts action-relative hand decoding.
+        return self.reference_hand_q.astype(np.float32, copy=True)
 
     def step_action(self, action: dict[str, np.ndarray], action_index: int) -> None:
         applied_hand = False
@@ -1721,6 +1739,12 @@ class RightArmPolicyExecutor:
                     flat_eef[row_idx, : min(9, flat_eef.shape[1])] = self._clamp_policy_eef_command(
                         flat_eef[row_idx, : min(9, flat_eef.shape[1])]
                     )
+        if "hand_joint_target" in guarded:
+            hand = guarded["hand_joint_target"]
+            if hand.ndim >= 2 and hand.shape[-1] >= 10:
+                flat_hand = hand.reshape(-1, hand.shape[-1])
+                for row_idx in range(flat_hand.shape[0]):
+                    flat_hand[row_idx, :10] = self._clip_policy_hand_q(flat_hand[row_idx, :10])
         return guarded
 
     def sim_project_action_chunk_for_execution(self, action: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -1809,6 +1833,7 @@ class RightArmPolicyExecutor:
             "reference_hand_first": _named_hand_values(reference_hand_flat),
             "rtc_seed_hand_first": None if rtc_seed_hand is None else _named_hand_values(rtc_seed_hand.reshape(-1)[:10]),
             "observation_hand_state": _named_hand_values(observation_hand_q),
+            "actual_hand_state": _named_hand_values(self._current_linker_hand_q(fallback=self.sim_hand_q)),
             "executor_reference_hand": _named_hand_values(self.reference_hand_q),
             "executor_sim_hand": _named_hand_values(self.sim_hand_q),
             "negative_floor_warning": _negative_floor_warning(clipped_hand),
@@ -1821,22 +1846,19 @@ class RightArmPolicyExecutor:
             padded[: values.size] = values
             values = padded
         values = np.clip(values, POLICY_HAND_CLIP_LOWER, POLICY_HAND_CLIP_UPPER)
+        for idx, name in enumerate(POLICY_HAND_JOINT_NAMES):
+            lower = POLICY_HAND_COMMAND_LOWER_BY_NAME.get(name)
+            if lower is not None:
+                values[idx] = max(float(lower), float(values[idx]))
         return values.astype(np.float32, copy=False)
 
     def _project_hand_q_for_sim(self, hand_q: np.ndarray) -> np.ndarray:
-        values = self._clip_policy_hand_q(hand_q)
-        limits_by_name = self.assembly.get("linker_hand_joint_limits_by_name", {})
-        if not isinstance(limits_by_name, dict):
-            limits_by_name = {}
-        projected = values.copy()
-        for idx, name in enumerate(POLICY_HAND_JOINT_NAMES):
-            limit = limits_by_name.get(name)
-            if isinstance(limit, (tuple, list)) and len(limit) == 2:
-                lower, upper = float(limit[0]), float(limit[1])
-            else:
-                lower, upper = 0.0, POLICY_HAND_CLIP_UPPER
-            projected[idx] = float(np.clip(projected[idx], lower, upper))
-        return projected.astype(np.float32, copy=False)
+        # Keep execution in the same command space as the GR00T training/probe
+        # rollout.  The L10 hand targets are policy-space canonical commands
+        # clipped to the probe range; a second absolute/URDF lower-limit projection turns
+        # legitimate open-side commands into zeros and breaks the action-relative
+        # hand chain.
+        return self._clip_policy_hand_q(hand_q)
 
     @staticmethod
     def _action_step(value: np.ndarray, index: int) -> np.ndarray:
@@ -1982,11 +2004,6 @@ class RightArmPolicyExecutor:
         if not joint_names:
             return
 
-        class _HandTarget:
-            def __init__(self, names: tuple[str, ...], values: np.ndarray) -> None:
-                self.joint_names = names
-                self.joint_positions = tuple(float(v) for v in values[: len(names)])
-
         self._hand_target_print_count += 1
         if self._should_print_hand():
             print(
@@ -1994,7 +2011,9 @@ class RightArmPolicyExecutor:
                 f"sim={_named_hand_values(self.sim_hand_q)}",
                 flush=True,
             )
-        harness._set_linker_hand_target(self.assembly, "right", _HandTarget(joint_names, self.sim_hand_q))  # noqa: SLF001
+        # Apply directly here.  The generic add_scene pending-target path clips
+        # against URDF limits, while this policy rollout intentionally mirrors the
+        # Isaac-GR00T probe/evaluate command space.
         self._force_linker_hand_q(self.sim_hand_q)
 
     def _force_linker_hand_q(self, hand_q: np.ndarray) -> bool:
@@ -2027,16 +2046,9 @@ class RightArmPolicyExecutor:
                 if str(mimic_name) not in values_by_name and str(source_name) in values_by_name:
                     values_by_name[str(mimic_name)] = float(multiplier) * float(values_by_name[str(source_name)]) + float(offset)
 
-        limits_by_name = self.assembly.get("linker_hand_joint_limits_by_name", {})
-        default_limits = (-np.inf, np.inf)
         values = np.asarray(
             [
-                float(
-                    np.clip(
-                        values_by_name.get(str(name), 0.0),
-                        *(limits_by_name.get(str(name), default_limits) if isinstance(limits_by_name, dict) else default_limits),
-                    )
-                )
+                float(values_by_name.get(str(name), 0.0))
                 for name in assembly_names
             ],
             dtype=np.float32,
@@ -3136,6 +3148,24 @@ def _rec_to_dtype(value: Any, *, dtype: Any) -> Any:
     return value
 
 
+def _rec_to_device_dtype(value: Any, *, device: str, dtype: Any) -> Any:
+    try:
+        import torch
+    except Exception:
+        return value
+    if isinstance(value, torch.Tensor):
+        if torch.is_floating_point(value):
+            return value.to(device=device, dtype=dtype)
+        return value.to(device=device)
+    if isinstance(value, dict) or hasattr(value, "items"):
+        return {key: _rec_to_device_dtype(item, device=device, dtype=dtype) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rec_to_device_dtype(item, device=device, dtype=dtype) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_rec_to_device_dtype(item, device=device, dtype=dtype) for item in value)
+    return value
+
+
 def _policy_get_action_cpu_processor(
     policy: object,
     observation: dict[str, Any],
@@ -3200,7 +3230,8 @@ def _policy_get_action_cpu_processor(
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(policy.processor(messages))
         collated_inputs = policy.collate_fn(processed_inputs)
-        collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
+        model_device = str(getattr(policy, "device", "cuda" if torch.cuda.is_available() else "cpu"))
+        collated_inputs = _rec_to_device_dtype(collated_inputs, device=model_device, dtype=torch.bfloat16)
 
         merged_options = dict(options or {})
         merged_options["reference_action"] = reference_action
@@ -3268,9 +3299,9 @@ def main() -> int:
     parser.add_argument("--action-fps", type=float, default=10.0, help="Policy action timeline FPS used for probe-style RTC seed windows.")
     parser.add_argument("--rtc-mode", choices=("compat", "seed_window", "off"), default="compat")
     parser.add_argument("--rtc-overlap-steps", type=int, default=None)
-    parser.add_argument("--rtc-max-overlap-steps", type=int, default=5)
-    parser.add_argument("--rtc-frozen-steps", type=int, default=2)
-    parser.add_argument("--rtc-ramp-rate", type=float, default=3.0)
+    parser.add_argument("--rtc-max-overlap-steps", type=int, default=24)
+    parser.add_argument("--rtc-frozen-steps", type=int, default=4)
+    parser.add_argument("--rtc-ramp-rate", type=float, default=20.0)
     parser.add_argument("--rtc-guidance-beta", type=float, default=0.5)
     parser.add_argument(
         "--arm-ik-mode",
@@ -3328,6 +3359,8 @@ def main() -> int:
     )
     parser.add_argument("--bottle-pos", type=_vec3, default=DEFAULT_BOTTLE_POS)
     parser.add_argument("--bottle-euler", type=_vec3, default=DEFAULT_BOTTLE_EULER)
+    parser.add_argument("--bottle-proxy-json", type=Path, default=harness.DEFAULT_BOTTLE_PROXY_JSON)
+    parser.add_argument("--show-bottle-proxy", action="store_true")
     parser.add_argument(
         "--initial-hand-q",
         type=_vec10,
@@ -3466,9 +3499,12 @@ def main() -> int:
         show_viewer=not bool(args.no_viewer),
         backend=args.backend,
         collision=bool(args.scene_mesh_collision),
+        bottle_path=harness.DEFAULT_BOTTLE_GLB,
         bottle_pos=args.bottle_pos,
         bottle_euler=args.bottle_euler,
         bottle_collision=True,
+        bottle_proxy_json=args.bottle_proxy_json,
+        show_bottle_proxy=bool(args.show_bottle_proxy),
         add_table_collider=True,
         table_collider_pos=args.scene_support_collider_pos,
         table_collider_size=args.scene_support_collider_size,
@@ -3551,7 +3587,7 @@ def main() -> int:
         "[physics] enabled "
         f"scene_mesh_collision={bool(args.scene_mesh_collision)} "
         f"scene_support_collider=True pos={args.scene_support_collider_pos} size={args.scene_support_collider_size} "
-        "bottle_collision=True linker_hand_collision=True",
+        "bottle=glb_visual_only_plus_dynamic_cylinder_proxy_collision linker_hand_collision=True",
         flush=True,
     )
 
