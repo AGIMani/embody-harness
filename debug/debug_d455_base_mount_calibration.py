@@ -257,51 +257,27 @@ def _vec3(value: str) -> tuple[float, float, float]:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tune a D455 body pose relative to base.STL.")
+    parser = argparse.ArgumentParser(description="Tune a D455 body pose relative to the combined Nero/L10 URDF root.")
     parser.add_argument("--backend", choices=("cpu", "gpu"), default="cpu")
+    parser.add_argument("--combined-urdf", type=Path, default=harness.DEFAULT_COMBINED_NERO_LINKER_URDF)
     parser.add_argument("--d455-json", type=Path, default=DEFAULT_D455_JSON)
     parser.add_argument("--initial-pos", type=_vec3, default=DEFAULT_D455_REL_POS_M)
     parser.add_argument("--initial-euler", type=_vec3, default=DEFAULT_D455_REL_EULER_DEG)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument("--base-mesh", type=Path, default=harness.DEFAULT_BASE_MESH)
-    parser.add_argument("--nero-urdf", type=Path, default=harness.DEFAULT_NERO_URDF)
-    parser.add_argument("--package-root", type=Path, default=harness.DEFAULT_PACKAGE_ROOT)
-    parser.add_argument("--base-scale", type=float, default=harness.DEFAULT_BASE_SCALE)
-    parser.add_argument("--base-pos", type=harness._vec3, default=(0.0, 0.0, 0.0))
-    parser.add_argument("--base-euler", type=harness._vec3, default=(0.0, 0.0, 0.0))
-    parser.add_argument(
-        "--use-base-foot-anchor",
-        action="store_true",
-        help="Use --base-foot-center-mm as an anchor at world origin instead of --base-pos.",
-    )
-    parser.add_argument("--base-foot-center-mm", type=harness._vec3, default=harness.DEFAULT_BASE_FOOT_CENTER_MM)
-    parser.add_argument("--assembly-origin", type=harness._vec3, default=(0.0, 0.0, 0.0))
-    parser.add_argument("--connector-mesh", type=Path, default=harness.DEFAULT_CONNECTOR_MESH)
-    parser.add_argument("--connector-scale", type=float, default=harness.DEFAULT_CONNECTOR_SCALE)
-    parser.add_argument("--show-connectors", action="store_true", help="Show EEF connectors while tuning D455.")
-    parser.add_argument("--no-revo2-flange", action="store_true")
     parser.add_argument("--no-viewer", action="store_true", help="Build once and print the initial D455 pose.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    combined_urdf = args.combined_urdf.expanduser().resolve()
+    if not combined_urdf.exists():
+        raise FileNotFoundError(f"Combined URDF not found: {combined_urdf}")
     d455_json = args.d455_json.expanduser().resolve()
     if not d455_json.exists():
         raise FileNotFoundError(f"D455 JSON not found: {d455_json}")
     body_size = _load_d455_body_size(d455_json)
     initial_values = tuple(float(v) for v in (*args.initial_pos, *args.initial_euler))
-    base_world_pos = (
-        harness._pose_from_local_anchor(
-            tuple(float(v) for v in args.base_foot_center_mm),
-            tuple(float(v) for v in args.base_euler),
-            float(args.base_scale),
-            tuple(float(v) for v in args.assembly_origin),
-        )
-        if args.use_base_foot_anchor
-        else tuple(float(v) for v in args.base_pos)
-    )
-    base_world_euler = tuple(float(v) for v in args.base_euler)
 
     gs.init(backend=gs.gpu if args.backend == "gpu" else gs.cpu)
     scene = gs.Scene(
@@ -317,19 +293,17 @@ def main() -> None:
         show_viewer=not args.no_viewer,
     )
     scene.add_entity(gs.morphs.Plane())
-    assembly = harness._add_dual_nero_arm_assembly(
-        scene,
-        base_mesh=args.base_mesh,
-        nero_urdf=args.nero_urdf,
-        package_root=args.package_root,
-        linker_hand_urdf=None,
-        connector_mesh=args.connector_mesh if args.show_connectors else None,
-        connector_scale=float(args.connector_scale),
-        origin=args.assembly_origin,
-        base_scale=float(args.base_scale),
-        base_euler=tuple(float(v) for v in args.base_euler),
-        base_foot_center_mm=tuple(float(v) for v in args.base_foot_center_mm),
-        add_revo2_flange=not args.no_revo2_flange,
+    combined = scene.add_entity(
+        gs.morphs.URDF(
+            file=str(combined_urdf),
+            pos=(0.0, 0.0, 0.0),
+            euler=(0.0, 0.0, 0.0),
+            fixed=True,
+            collision=False,
+            merge_fixed_links=False,
+            prioritize_urdf_material=True,
+        ),
+        name="dual_nero_linker_l10_combined_debug",
     )
 
     d455_body = scene.add_entity(
@@ -354,22 +328,14 @@ def main() -> None:
     )
 
     scene.build()
-    harness._apply_base_world_pose(assembly, base_world_pos, base_world_euler)
-    scene.step()
-    if args.show_connectors:
-        left_arm = assembly["left"]
-        right_arm = assembly["right"]
-        harness._mount_connectors_to_arms(assembly, left_arm, right_arm)
-
-    base = assembly["base"]
-    base_pos = harness._tensor_to_np(base.get_pos()).reshape(3).astype(np.float64)
-    base_quat = harness._tensor_to_np(base.get_quat()).reshape(4).astype(np.float64)
-    base_rotation = harness._rotation_from_quat_wxyz(base_quat)
+    harness._set_entity_pose(combined, np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64))
+    combined_pos = np.zeros(3, dtype=np.float64)
+    combined_rotation = np.eye(3, dtype=np.float64)
     _apply_d455_pose(
         body=d455_body,
         front_marker=front_marker,
-        base_pos=base_pos,
-        base_rotation=base_rotation,
+        base_pos=combined_pos,
+        base_rotation=combined_rotation,
         body_size=body_size,
         values=initial_values,
     )
@@ -392,8 +358,8 @@ def main() -> None:
                 _apply_d455_pose(
                     body=d455_body,
                     front_marker=front_marker,
-                    base_pos=base_pos,
-                    base_rotation=base_rotation,
+                    base_pos=combined_pos,
+                    base_rotation=combined_rotation,
                     body_size=body_size,
                     values=values,
                 )

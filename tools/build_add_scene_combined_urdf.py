@@ -94,6 +94,43 @@ def _add_mesh_link(
         )
 
 
+def _add_box_link(
+    root: ET.Element,
+    *,
+    name: str,
+    size: tuple[float, float, float],
+    mass: float,
+    color_rgba: tuple[float, float, float, float],
+    collision: bool = False,
+) -> None:
+    x, y, z = (float(v) for v in size)
+    mass = float(mass)
+    link = ET.SubElement(root, "link", {"name": name})
+    inertial = ET.SubElement(link, "inertial")
+    _origin(inertial, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+    ET.SubElement(inertial, "mass", {"value": f"{mass:.9g}"})
+    ET.SubElement(
+        inertial,
+        "inertia",
+        {
+            "ixx": f"{mass / 12.0 * (y * y + z * z):.9g}",
+            "ixy": "0",
+            "ixz": "0",
+            "iyy": f"{mass / 12.0 * (x * x + z * z):.9g}",
+            "iyz": "0",
+            "izz": f"{mass / 12.0 * (x * x + y * y):.9g}",
+        },
+    )
+    for tag in ("visual", "collision") if collision else ("visual",):
+        item = ET.SubElement(link, tag)
+        _origin(item, (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))
+        geometry = ET.SubElement(item, "geometry")
+        ET.SubElement(geometry, "box", {"size": _fmt(size)})
+        if tag == "visual":
+            material = ET.SubElement(item, "material", {"name": f"{name}_material"})
+            ET.SubElement(material, "color", {"rgba": _fmt(color_rgba)})
+
+
 def _prefix_tree(
     source: Path,
     *,
@@ -232,6 +269,23 @@ def build_combined_urdf(output: Path, *, hand_side: str) -> Path:
         child=hand_root_link,
         xyz=tuple(float(v) for v in harness.NERO_LINKER_CONFIG.linker_hand_mount_offset_xyz),
         rpy=_rpy_rad_from_quat_wxyz(tuple(float(v) for v in harness.NERO_LINKER_CONFIG.linker_hand_mount_quat_wxyz)),
+    )
+
+    _add_box_link(
+        root,
+        name="d455_body",
+        size=tuple(float(v) for v in harness.D455_BODY_SIZE_FALLBACK),
+        mass=0.116,
+        color_rgba=(0.08, 0.08, 0.08, 1.0),
+        collision=False,
+    )
+    _add_fixed_joint(
+        root,
+        name="base_stl_to_d455_body",
+        parent="base_stl",
+        child="d455_body",
+        xyz=tuple(float(v) for v in harness.D455_BASE_REL_POS_M),
+        rpy=_rpy_rad_from_euler_deg(tuple(float(v) for v in harness.D455_BASE_REL_EULER_DEG)),
     )
 
     ET.indent(root, space="  ")

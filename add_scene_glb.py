@@ -84,7 +84,7 @@ LEFT_CONNECTOR_MOUNT_OFFSET_XYZ = (-0.023000, -0.089000, 0.038000)
 LEFT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, -0.3, 0.0)
 RIGHT_CONNECTOR_MOUNT_OFFSET_XYZ = (0.022000, 0.089000, 0.038000)
 RIGHT_CONNECTOR_MOUNT_EULER_DEG = (-90.0, 0.0, 180.0)
-D455_BASE_REL_POS_M = (-0.327778, 0.252000, 1.288889)
+D455_BASE_REL_POS_M = (-0.075778, 0.001444, 1.285333)
 D455_BASE_REL_EULER_DEG = (180.0, 140.0, 0.0)
 D455_BODY_SIZE_FALLBACK = (0.026, 0.124, 0.029)
 D455_RGB_LOCAL_POS_RATIO = (0.5, 0.0, 0.0)
@@ -2754,16 +2754,7 @@ def _add_combined_nero_linker_assembly(
     if d455_config is not None:
         d455_body_size = tuple(float(v) for v in d455_config["body_size"])
         d455["body_size"] = d455_body_size
-        d455["body"] = scene.add_entity(
-            gs.morphs.Box(
-                pos=(0.0, 0.0, 0.0),
-                size=d455_body_size,
-                fixed=True,
-                collision=False,
-            ),
-            surface=gs.surfaces.Plastic(color=(0.08, 0.08, 0.08, 1.0), roughness=0.55),
-            name="d455_body",
-        )
+        d455["body_link_name"] = "d455_body"
         d455["rgb_camera"] = scene.add_camera(
             model="pinhole",
             res=tuple(int(v) for v in d455_config["rgb_res"]),
@@ -3249,13 +3240,19 @@ def main() -> None:
         "--initial-base-pos",
         type=_vec3,
         default=None,
-        help="Initial base world position for the debug panel. Defaults to scene.glb --pos.",
+        help=(
+            "Initial base world position for legacy split assembly. "
+            "Ignored by the default combined URDF mode, where the combined root is fixed at world identity."
+        ),
     )
     parser.add_argument(
         "--initial-base-euler",
         type=_vec3,
         default=None,
-        help="Initial base world XYZ Euler degrees for the debug panel. Defaults to scene.glb --euler.",
+        help=(
+            "Initial base world XYZ Euler degrees for legacy split assembly. "
+            "Ignored by the default combined URDF mode, where the combined root is fixed at world identity."
+        ),
     )
     parser.add_argument("--base-mesh", type=Path, default=DEFAULT_BASE_MESH)
     parser.add_argument("--nero-urdf", type=Path, default=DEFAULT_NERO_URDF)

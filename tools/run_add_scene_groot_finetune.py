@@ -1216,6 +1216,7 @@ class RightArmPolicyExecutor:
         if not isinstance(assembly, dict):
             raise RuntimeError("Scene does not contain Nero assembly")
         self.assembly = assembly
+        self.uses_combined_world_frame = bool(assembly.get("combined_urdf"))
         self.arm = assembly["right"]
         self.left_arm = assembly.get("left")
         arm_prefixes = assembly.get("arm_joint_prefixes", {})
@@ -1442,19 +1443,29 @@ class RightArmPolicyExecutor:
         rotation = harness._rotation_from_quat_wxyz(quat)  # noqa: SLF001
         return pos, np.asarray(rotation, dtype=np.float64).reshape(3, 3)
 
+    def _policy_world_root_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        if self.uses_combined_world_frame:
+            return np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64)
+        return self._arm_root_pose()
+
     def world_pose_to_policy_pose(self, pose: np.ndarray) -> np.ndarray:
-        """Convert Genesis world EEF pose to the remote Teleop robot-base policy frame."""
+        """Convert Genesis world EEF pose to the policy frame.
+
+        In the current combined-URDF scene, Genesis world is defined to be the
+        dual_nero_linker_l10_combined.urdf root/base frame.  Legacy split mode
+        still uses the right arm entity root for compatibility.
+        """
         pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
-        arm_pos, arm_rotation = self._arm_root_pose()
+        arm_pos, arm_rotation = self._policy_world_root_pose()
         out = np.eye(4, dtype=np.float64)
         out[:3, 3] = arm_rotation.T @ (pose[:3, 3] - arm_pos)
         out[:3, :3] = arm_rotation.T @ pose[:3, :3]
         return out
 
     def policy_pose_to_world_pose(self, pose: np.ndarray) -> np.ndarray:
-        """Convert remote Teleop robot-base policy frame pose to Genesis world."""
+        """Convert policy frame pose to Genesis world."""
         pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
-        arm_pos, arm_rotation = self._arm_root_pose()
+        arm_pos, arm_rotation = self._policy_world_root_pose()
         out = np.eye(4, dtype=np.float64)
         out[:3, 3] = arm_pos + arm_rotation @ pose[:3, 3]
         out[:3, :3] = arm_rotation @ pose[:3, :3]
@@ -1664,8 +1675,21 @@ class RightArmPolicyExecutor:
         target_world[:3, :3] = self.target_rotation
         target_policy = self.world_pose_to_policy_pose(target_world)
         arm_pos, arm_rotation = self._arm_root_pose()
+        policy_root_pos, policy_root_rotation = self._policy_world_root_pose()
+        frame_name = (
+            "dual_nero_linker_l10_combined_root_world"
+            if self.uses_combined_world_frame
+            else "right_arm_entity_local_rokae_base"
+        )
         return {
-            "frame": "right_arm_entity_local_rokae_base",
+            "frame": frame_name,
+            "world_frame": (
+                "dual_nero_linker_l10_combined.urdf root/base frame"
+                if self.uses_combined_world_frame
+                else "Genesis world with legacy split assembly base pose"
+            ),
+            "policy_root_world_pos": policy_root_pos.tolist(),
+            "policy_root_world_rot6d": _rotmat_to_rot6d(policy_root_rotation).tolist(),
             "eef_link": self.policy_eef_link_name,
             "assembly_eef_link": self.assembly_eef_link_name,
             "policy_action_eef_semantics": (
@@ -1675,6 +1699,7 @@ class RightArmPolicyExecutor:
             ),
             "rot6d_convention": "[R00,R10,R20,R01,R11,R21]",
             "teleop_bridge": None if self.teleop_bridge is None else dict(self.teleop_bridge.last_debug),
+            "combined_urdf_world_frame": self.uses_combined_world_frame,
             "arm_root_world_pos": arm_pos.tolist(),
             "arm_root_world_rot6d": _rotmat_to_rot6d(arm_rotation).tolist(),
             "current_world_xyz": current_world[:3, 3].tolist(),
