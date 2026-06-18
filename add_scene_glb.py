@@ -55,6 +55,8 @@ DEFAULT_BOTTLE_PROXY_HEIGHT = 0.138117
 DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
 DEFAULT_COMBINED_NERO_LINKER_URDF = ROOT_DIR / "assets" / "generated" / "dual_nero_linker_l10_combined.urdf"
+DEFAULT_SCENE_WORLD_POS = (-0.140625, 0.0, -0.058594)
+DEFAULT_SCENE_WORLD_EULER = (0.0, 0.0, 0.0)
 DEFAULT_CONNECTOR_MESH = ROOT_DIR / "assets" / "connector.STL"
 DEFAULT_D455_JSON = ROOT_DIR / "assets" / "d455json.json"
 DEFAULT_D405_JSON = ROOT_DIR / "assets" / "d405json.json"
@@ -67,8 +69,8 @@ TMP_ROOT = Path(os.environ.get("HARNESS_GENESIS_TMPDIR", f"/tmp/harness_genesis_
 DEFAULT_BASE_SCALE = 0.001
 DEFAULT_BASE_EULER = (90.0, 0.0, 0.0)
 DEFAULT_BASE_FOOT_CENTER_MM = (-51.439, -842.036, -50.0)
-DEFAULT_INITIAL_BASE_WORLD_POS = (0.386667, -0.306667, 0.038889)
-DEFAULT_INITIAL_BASE_WORLD_EULER = (0.0, 0.0, 1.8)
+DEFAULT_INITIAL_BASE_WORLD_POS = (0.0, 0.0, 0.0)
+DEFAULT_INITIAL_BASE_WORLD_EULER = (0.0, 0.0, 0.0)
 DEFAULT_MOUNT_HOLE_YAW_DEG = 90.0
 DEFAULT_ARM_LIFT_M = 0.005
 FIXED_ASSEMBLY_TRANSLATION = (-0.235556, -0.486667, -0.805556)
@@ -111,7 +113,7 @@ BOTTLE_Y_RANGE = (0.19251, 0.41711)
 BOTTLE_Z = 0.70
 BOTTLE_YAW_RANGE_DEG = (0.0, 360.0)
 DEFAULT_GRAVITY = (0.0, 0.0, -9.81)
-DEFAULT_TABLE_COLLIDER_POS = (-0.541071, -0.112500, 0.678571)
+DEFAULT_TABLE_COLLIDER_POS = (-0.616071, -0.064286, 0.620536)
 DEFAULT_TABLE_COLLIDER_SIZE = (0.700000, 0.700000, 0.040000)
 DEFAULT_RIGID_SOLVER_ITERATIONS = 100
 DEFAULT_RIGID_SOLVER_LS_ITERATIONS = 100
@@ -791,7 +793,7 @@ def _apply_base_world_pose(
     if not assembly:
         return
     if assembly.get("combined_urdf"):
-        _set_entity_pose(assembly["combined"], np.asarray(base_pos, dtype=np.float64), _rotation_from_euler_deg(base_euler))
+        _set_entity_pose(assembly["combined"], np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64))
         return
     translation, rotation = _assembly_transform_for_base_world_pose(assembly, base_pos, base_euler)
     _apply_assembly_matrix_transform(assembly, translation, rotation)
@@ -2841,8 +2843,8 @@ def create_scene(
     dt: float = 0.01,
     gravity: tuple[float, float, float] = DEFAULT_GRAVITY,
     scale: float | tuple[float, float, float] = 1.0,
-    pos: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    euler: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    pos: tuple[float, float, float] = DEFAULT_SCENE_WORLD_POS,
+    euler: tuple[float, float, float] = DEFAULT_SCENE_WORLD_EULER,
     collision: bool = False,
     fixed: bool = True,
     add_bottle: bool = True,
@@ -2972,6 +2974,20 @@ def create_scene(
         surface=gs.surfaces.Default(vis_mode="visual"),
         name="scene_glb",
     )
+    if use_combined_urdf:
+        print(
+            "[scene] fixed_world=dual_nero_linker_l10_combined.urdf root identity "
+            f"scene_glb_pos={tuple(round(float(v), 6) for v in pos)} "
+            f"scene_glb_euler_deg={tuple(round(float(v), 3) for v in euler)}",
+            flush=True,
+        )
+    else:
+        print(
+            "[scene] scene_glb_pose "
+            f"pos={tuple(round(float(v), 6) for v in pos)} "
+            f"euler_deg={tuple(round(float(v), 3) for v in euler)}",
+            flush=True,
+        )
 
     table_collider_entity = None
     if add_table_collider:
@@ -3104,6 +3120,9 @@ def create_scene(
     initial_base_euler = tuple(
         float(v) for v in (DEFAULT_INITIAL_BASE_WORLD_EULER if initial_base_euler is None else initial_base_euler)
     )
+    if isinstance(assembly_info, dict) and assembly_info.get("combined_urdf"):
+        initial_base_pos = (0.0, 0.0, 0.0)
+        initial_base_euler = (0.0, 0.0, 0.0)
     _initialize_nero_linker_assembly(
         scene,
         assembly_info,
@@ -3136,8 +3155,8 @@ def main() -> None:
     parser.add_argument("--glb", default=str(DEFAULT_GLB), help="Path to the GLB file.")
     parser.add_argument("--gravity", type=_vec3, default=DEFAULT_GRAVITY, help="Gravity vector as x,y,z in m/s^2.")
     parser.add_argument("--scale", type=float, default=1.0, help="Uniform scale for the GLB.")
-    parser.add_argument("--pos", type=_vec3, default=(0.0, 0.0, 0.0), help="Position as x,y,z.")
-    parser.add_argument("--euler", type=_vec3, default=(0.0, 0.0, 0.0), help="Euler angles in degrees as x,y,z.")
+    parser.add_argument("--pos", type=_vec3, default=DEFAULT_SCENE_WORLD_POS, help="Position as x,y,z.")
+    parser.add_argument("--euler", type=_vec3, default=DEFAULT_SCENE_WORLD_EULER, help="Euler angles in degrees as x,y,z.")
     parser.add_argument(
         "--no-collision",
         action="store_true",

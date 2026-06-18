@@ -21,6 +21,7 @@ import add_scene_glb as harness  # noqa: E402
 
 
 DEFAULT_OUTPUT = ROOT_DIR / "assets" / "scene_base_frame_debug.json"
+DEFAULT_COMBINED_URDF = ROOT_DIR / "assets" / "generated" / "dual_nero_linker_l10_combined.urdf"
 DEFAULT_SCENE_POS = (0.0, 0.0, 0.0)
 DEFAULT_SCENE_EULER = (0.0, 0.0, 0.0)
 DEFAULT_BASE_POS = (0.0, 0.0, 0.0)
@@ -82,6 +83,7 @@ def _payload_from_values(
     target: str,
     values: tuple[float, ...],
     scene_glb: Path,
+    combined_urdf: Path,
     base_mesh: Path,
     fixed_scene_pos: tuple[float, float, float],
     fixed_scene_euler: tuple[float, float, float],
@@ -90,17 +92,18 @@ def _payload_from_values(
 ) -> dict[str, object]:
     target_pos = tuple(float(v) for v in values[:3])
     target_euler = tuple(float(v) for v in values[3:6])
-    scene_pos = target_pos if target == "scene" else fixed_scene_pos
-    scene_euler = target_euler if target == "scene" else fixed_scene_euler
-    base_pos = target_pos if target == "base" else fixed_base_pos
-    base_euler = target_euler if target == "base" else fixed_base_euler
+    scene_pos = target_pos
+    scene_euler = target_euler
+    base_pos = fixed_base_pos
+    base_euler = fixed_base_euler
     return {
         "description": (
-            "Single-target visual frame calibration. Sliders are fixed world XYZ/RPY; "
-            "Bake To File writes the current target transform into the selected asset."
+            "Scene GLB calibration relative to the fixed combined dual Nero + Linker L10 URDF root. "
+            "The combined URDF root is the world frame/origin. Sliders adjust scene.glb XYZ/RPY."
         ),
-        "target": target,
+        "target": "scene",
         "scene_glb": str(scene_glb),
+        "combined_urdf": str(combined_urdf),
         "base_mesh": str(base_mesh),
         "scene": {
             "pos_m": list(scene_pos),
@@ -116,24 +119,27 @@ def _payload_from_values(
 
 
 def _print_payload(payload: dict[str, object]) -> None:
-    target = str(payload["target"])
     scene = payload["scene"]
     base = payload["base"]
     scene_pos = tuple(float(v) for v in scene["pos_m"])
     scene_euler = tuple(float(v) for v in scene["euler_xyz_deg"])
     base_pos = tuple(float(v) for v in base["pos_m"])
     base_euler = tuple(float(v) for v in base["euler_xyz_deg"])
-    target_data = scene if target == "scene" else base
-    target_pos = tuple(float(v) for v in target_data["pos_m"])
-    target_euler = tuple(float(v) for v in target_data["euler_xyz_deg"])
     print("[scene-base-frame-debug]", flush=True)
-    print(f"  target={target} pos={_format_tuple(target_pos)} euler_deg={_format_tuple(target_euler, 3)}", flush=True)
+    print("  fixed_world=dual_nero_linker_l10_combined.urdf root pose at identity", flush=True)
     print(f"  scene.glb pos={_format_tuple(scene_pos)} euler_deg={_format_tuple(scene_euler, 3)}", flush=True)
-    print(f"  base.STL  pos={_format_tuple(base_pos)} euler_deg={_format_tuple(base_euler, 3)}", flush=True)
+    print(f"  legacy_base.STL pos={_format_tuple(base_pos)} euler_deg={_format_tuple(base_euler, 3)}", flush=True)
+    print(
+        "  add_scene_args:\n"
+        f"    --pos {scene_pos[0]:.6f},{scene_pos[1]:.6f},{scene_pos[2]:.6f} "
+        f"--euler {scene_euler[0]:.3f},{scene_euler[1]:.3f},{scene_euler[2]:.3f}",
+        flush=True,
+    )
     print(
         "  workflow:\n"
-        "    1. Run with --target scene, adjust scene, click Bake To File.\n"
-        "    2. Restart with --target base, adjust base against the baked scene, click Bake To File.",
+        "    1. The combined URDF root is fixed at world origin.\n"
+        "    2. Adjust scene.glb until it matches the fixed robot/base frame.\n"
+        "    3. Save JSON for runtime args, or Bake To File to write this transform into scene.glb.",
         flush=True,
     )
 
@@ -534,16 +540,27 @@ def _refresh_axes(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Single-target visual calibration for scene.glb or base.STL frame alignment.")
-    parser.add_argument("--target", choices=("scene", "base"), required=True, help="Asset to adjust and bake.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Calibrate scene.glb relative to the fixed dual Nero + Linker L10 combined URDF. "
+            "The combined URDF root is the Genesis world frame/origin."
+        )
+    )
+    parser.add_argument(
+        "--target",
+        choices=("scene",),
+        default="scene",
+        help="Compatibility option. This script now only adjusts scene.glb.",
+    )
     parser.add_argument("--backend", choices=("cpu", "gpu"), default="gpu")
     parser.add_argument("--scene-glb", type=Path, default=harness.DEFAULT_GLB)
+    parser.add_argument("--combined-urdf", type=Path, default=DEFAULT_COMBINED_URDF)
     parser.add_argument("--base-mesh", type=Path, default=harness.DEFAULT_BASE_MESH)
     parser.add_argument("--base-scale", type=float, default=harness.DEFAULT_BASE_SCALE)
-    parser.add_argument("--scene-pos", type=_vec3, default=DEFAULT_SCENE_POS, help="Fixed/initial scene pose in world meters.")
-    parser.add_argument("--scene-euler", type=_vec3, default=DEFAULT_SCENE_EULER, help="Fixed/initial scene XYZ Euler degrees.")
-    parser.add_argument("--base-pos", type=_vec3, default=DEFAULT_BASE_POS, help="Fixed/initial base pose in world meters.")
-    parser.add_argument("--base-euler", type=_vec3, default=DEFAULT_BASE_EULER, help="Fixed/initial base XYZ Euler degrees.")
+    parser.add_argument("--scene-pos", type=_vec3, default=DEFAULT_SCENE_POS, help="Initial scene pose in combined-URDF/world meters.")
+    parser.add_argument("--scene-euler", type=_vec3, default=DEFAULT_SCENE_EULER, help="Initial scene XYZ Euler degrees.")
+    parser.add_argument("--base-pos", type=_vec3, default=DEFAULT_BASE_POS, help=argparse.SUPPRESS)
+    parser.add_argument("--base-euler", type=_vec3, default=DEFAULT_BASE_EULER, help=argparse.SUPPRESS)
     parser.add_argument("--axis-length", type=float, default=DEFAULT_AXIS_LENGTH)
     parser.add_argument("--axis-radius", type=float, default=DEFAULT_AXIS_RADIUS)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -555,17 +572,21 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
     scene_glb = args.scene_glb.expanduser().resolve()
+    combined_urdf = args.combined_urdf.expanduser().resolve()
     base_mesh = args.base_mesh.expanduser().resolve()
     if not scene_glb.exists():
         raise FileNotFoundError(f"scene GLB not found: {scene_glb}")
+    if not combined_urdf.exists():
+        raise FileNotFoundError(f"combined URDF not found: {combined_urdf}")
     if not base_mesh.exists():
         raise FileNotFoundError(f"base mesh not found: {base_mesh}")
 
-    target_values = tuple(float(v) for v in ((*args.scene_pos, *args.scene_euler) if args.target == "scene" else (*args.base_pos, *args.base_euler)))
+    target_values = tuple(float(v) for v in (*args.scene_pos, *args.scene_euler))
     payload = _payload_from_values(
-        target=args.target,
+        target="scene",
         values=target_values,
         scene_glb=scene_glb,
+        combined_urdf=combined_urdf,
         base_mesh=base_mesh,
         fixed_scene_pos=args.scene_pos,
         fixed_scene_euler=args.scene_euler,
@@ -601,21 +622,24 @@ def main() -> None:
         ),
         name="scene_glb_frame_debug",
     )
-    base_entity = scene.add_entity(
-        gs.morphs.Mesh(
-            file=str(base_mesh),
-            pos=args.base_pos,
-            euler=args.base_euler,
-            scale=float(args.base_scale),
+    combined_entity = scene.add_entity(
+        gs.morphs.URDF(
+            file=str(combined_urdf),
+            pos=(0.0, 0.0, 0.0),
+            euler=(0.0, 0.0, 0.0),
             fixed=True,
             collision=False,
             convexify=False,
+            merge_fixed_links=False,
+            prioritize_urdf_material=True,
+            requires_jac_and_IK=True,
         ),
-        name="base_stl_frame_debug",
+        material=gs.materials.Rigid(rho=1000.0, friction=1.0),
+        name="dual_nero_linker_l10_combined_fixed_reference",
     )
     scene.build()
 
-    panel = _create_panel(str(args.target), target_values)
+    panel = _create_panel("scene", target_values)
     panel["running"].value = bool(args.start_step)
     last_values: tuple[float, ...] | None = None
     last_print_counter = 0
@@ -630,16 +654,13 @@ def main() -> None:
             values = _read_values(panel)
             target_pos = tuple(values[0:3])
             target_euler = tuple(values[3:6])
-            scene_pos = target_pos if args.target == "scene" else args.scene_pos
-            scene_euler = target_euler if args.target == "scene" else args.scene_euler
-            base_pos = target_pos if args.target == "base" else args.base_pos
-            base_euler = target_euler if args.target == "base" else args.base_euler
+            scene_pos = target_pos
+            scene_euler = target_euler
 
             if values != last_values:
                 _set_mesh_pose(scene_entity, scene_pos, scene_euler)
-                _set_mesh_pose(base_entity, base_pos, base_euler)
                 target_pose = _pose_matrix(target_pos, target_euler)
-                fixed_pose = _pose_matrix(args.base_pos, args.base_euler) if args.target == "scene" else _pose_matrix(args.scene_pos, args.scene_euler)
+                fixed_pose = np.eye(4, dtype=np.float64)
                 debug_objects = _refresh_axes(
                     scene,
                     debug_objects,
@@ -652,9 +673,10 @@ def main() -> None:
                 last_values = values
 
             payload = _payload_from_values(
-                target=args.target,
+                target="scene",
                 values=values,
                 scene_glb=scene_glb,
+                combined_urdf=combined_urdf,
                 base_mesh=base_mesh,
                 fixed_scene_pos=args.scene_pos,
                 fixed_scene_euler=args.scene_euler,
@@ -671,7 +693,7 @@ def main() -> None:
                 last_bake_counter = int(panel["bake_counter"].value)
                 _print_payload(payload)
                 backup = _bake_target(
-                    target=args.target,
+                    target="scene",
                     scene_glb=scene_glb,
                     base_mesh=base_mesh,
                     base_scale=float(args.base_scale),
@@ -680,7 +702,7 @@ def main() -> None:
                 )
                 print(
                     "[scene-base-frame-debug] bake complete. "
-                    f"Restart this script with zero {args.target} pose to view baked asset. backup={backup}",
+                    f"Restart this script with zero scene pose to view baked asset. backup={backup}",
                     flush=True,
                 )
                 print(

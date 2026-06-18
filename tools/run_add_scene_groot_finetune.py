@@ -31,7 +31,7 @@ DEFAULT_EGO_ROI_CENTER_X = 0.50
 DEFAULT_EGO_ROI_CENTER_Y = 0.65
 DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
-DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.541071, -0.112500, 0.678571)
+DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.616071, -0.064286, 0.620536)
 DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE = (0.700000, 0.700000, 0.040000)
 DEFAULT_INITIAL_RIGHT_ARM_Q = (
     0.2724284429,
@@ -3498,6 +3498,8 @@ def main() -> int:
     scene, _ = harness.create_scene(
         show_viewer=not bool(args.no_viewer),
         backend=args.backend,
+        pos=harness.DEFAULT_SCENE_WORLD_POS,
+        euler=harness.DEFAULT_SCENE_WORLD_EULER,
         collision=bool(args.scene_mesh_collision),
         bottle_path=harness.DEFAULT_BOTTLE_GLB,
         bottle_pos=args.bottle_pos,
@@ -3511,17 +3513,11 @@ def main() -> int:
         show_table_collider=bool(args.show_scene_support_collider),
         use_combined_urdf=True,
         combined_urdf=harness.DEFAULT_COMBINED_NERO_LINKER_URDF,
-        initial_base_pos=harness.DEFAULT_INITIAL_BASE_WORLD_POS,
-        initial_base_euler=harness.DEFAULT_INITIAL_BASE_WORLD_EULER,
+        initial_base_pos=(0.0, 0.0, 0.0),
+        initial_base_euler=(0.0, 0.0, 0.0),
         d455_rgb_gui=False,
         d405_camera_gui=False,
         linker_hand_collision=True,
-    )
-    print(
-        "[scene] base_world_pose "
-        f"pos={tuple(round(float(v), 6) for v in harness.DEFAULT_INITIAL_BASE_WORLD_POS)} "
-        f"euler_deg={tuple(round(float(v), 3) for v in harness.DEFAULT_INITIAL_BASE_WORLD_EULER)}",
-        flush=True,
     )
     ego_camera, wrist_camera = _create_policy_cameras(scene, image_size=image_size)
     print(

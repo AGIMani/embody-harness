@@ -18,10 +18,10 @@ import add_scene_glb as harness
 
 
 DEFAULT_D455_JSON = ROOT_DIR / "assets" / "d455json.json"
-DEFAULT_OUTPUT = ROOT_DIR / "assets" / "d455_base_mount_debug.json"
+DEFAULT_OUTPUT = ROOT_DIR / "assets" / "d455_combined_mount_debug.json"
 
-DEFAULT_D455_REL_POS_M = (-0.327778, 0.252000, 1.288889)
-DEFAULT_D455_REL_EULER_DEG = (180.0, 140.0, 0.0)
+DEFAULT_D455_REL_POS_M = harness.D455_BASE_REL_POS_M
+DEFAULT_D455_REL_EULER_DEG = harness.D455_BASE_REL_EULER_DEG
 
 COARSE_TRANSLATION_RANGE_M = 1.5
 FINE_TRANSLATION_STEP_M = 0.001
@@ -91,20 +91,20 @@ def _payload_from_values(
     rel_euler = values[3:]
     rel_quat = harness._quat_wxyz_from_rotation(harness._rotation_from_euler_deg(rel_euler))
     return {
-        "description": "D455 body pose relative to the loaded base.STL entity frame.",
+        "description": "D455 body pose relative to dual_nero_linker_l10_combined.urdf root frame.",
         "d455_json": str(d455_json),
         "body_size_m_xyz": [float(v) for v in body_size],
-        "pos_in_base_frame_m": [float(v) for v in rel_pos],
-        "euler_xyz_in_base_frame_deg": [float(v) for v in rel_euler],
-        "quat_wxyz_in_base_frame": [float(v) for v in rel_quat],
+        "pos_in_combined_root_frame_m": [float(v) for v in rel_pos],
+        "euler_xyz_in_combined_root_frame_deg": [float(v) for v in rel_euler],
+        "quat_wxyz_in_combined_root_frame": [float(v) for v in rel_quat],
     }
 
 
 def _print_payload(payload: dict[str, object]) -> None:
-    pos = tuple(float(v) for v in payload["pos_in_base_frame_m"])
-    euler = tuple(float(v) for v in payload["euler_xyz_in_base_frame_deg"])
-    quat = tuple(float(v) for v in payload["quat_wxyz_in_base_frame"])
-    print("[d455-base-debug] relative_to_base_stl", flush=True)
+    pos = tuple(float(v) for v in payload["pos_in_combined_root_frame_m"])
+    euler = tuple(float(v) for v in payload["euler_xyz_in_combined_root_frame_deg"])
+    quat = tuple(float(v) for v in payload["quat_wxyz_in_combined_root_frame"])
+    print("[d455-combined-debug] relative_to_dual_nero_linker_l10_combined_root", flush=True)
     print(
         f"  pos={_format_tuple(pos)} "
         f"euler_deg={_format_tuple(euler, 3)} "
@@ -123,7 +123,7 @@ def _print_payload(payload: dict[str, object]) -> None:
 def _write_payload(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    print(f"[d455-base-debug] saved {path}", flush=True)
+    print(f"[d455-combined-debug] saved {path}", flush=True)
 
 
 def _panel_main(initial_values, values, print_counter, save_counter, reset_counter, stop_flag) -> None:
@@ -167,11 +167,11 @@ def _panel_main(initial_values, values, print_counter, save_counter, reset_count
         root.quit()
 
     root = tk.Tk()
-    root.title("D455 Base Mount Calibration")
+    root.title("D455 Combined URDF Mount Calibration")
     root.geometry("860x430")
     root.minsize(760, 360)
 
-    title = ttk.Label(root, text="D455 pose relative to base.STL", font=("Arial", 12, "bold"))
+    title = ttk.Label(root, text="D455 pose relative to combined URDF root", font=("Arial", 12, "bold"))
     title.pack(fill=tk.X, padx=12, pady=(12, 4))
 
     frame = ttk.Frame(root)
