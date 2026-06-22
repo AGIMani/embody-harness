@@ -3077,6 +3077,41 @@ def _prepare_local_checkpoint(checkpoint: Path, cosmos_model: Path) -> tuple[Pat
     return tmp_path, tmp
 
 
+def _load_checkpoint_action_reference_configs(checkpoint: Path, embodiment_tag: str) -> dict[str, dict[str, Any]]:
+    processor_path = checkpoint / "processor_config.json"
+    try:
+        processor_cfg = json.loads(processor_path.read_text(encoding="utf-8"))
+        modality_cfg = processor_cfg["processor_kwargs"]["modality_configs"][embodiment_tag]
+        action_cfg = modality_cfg["action"]
+        keys = list(action_cfg["modality_keys"])
+        configs = list(action_cfg.get("action_configs") or [])
+    except Exception as exc:
+        print(
+            "[policy-reference] warning failed_to_load_action_reference_configs "
+            f"path={processor_path} error={exc}",
+            flush=True,
+        )
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for key, cfg in zip(keys, configs, strict=False):
+        if isinstance(cfg, dict):
+            out[str(key)] = {
+                "rep": str(cfg.get("rep", "")),
+                "state_key": cfg.get("state_key"),
+                "reference_source": str(cfg.get("reference_source", "state")),
+                "reference_key": cfg.get("reference_key"),
+                "reference_delta_index": cfg.get("reference_delta_index"),
+            }
+    action_refs = {
+        key: cfg
+        for key, cfg in out.items()
+        if cfg.get("rep") == "RELATIVE" and cfg.get("reference_source") == "action"
+    }
+    if action_refs:
+        print(f"[policy-reference] action_relative_reference_configs={action_refs}", flush=True)
+    return out
+
+
 def _load_groot_policy(args: argparse.Namespace):
     if str(ISAAC_GROOT_ROOT) not in sys.path:
         sys.path.insert(0, str(ISAAC_GROOT_ROOT))
@@ -3094,6 +3129,10 @@ def _load_groot_policy(args: argparse.Namespace):
         model_path=str(checkpoint),
         device=str(args.policy_device),
         strict=not bool(args.no_policy_strict),
+    )
+    policy._harness_action_reference_configs = _load_checkpoint_action_reference_configs(
+        checkpoint,
+        EmbodimentTag.NEW_EMBODIMENT.value,
     )
     _patch_pytorch_action_head_rtc(getattr(policy, "model", None))
     policy._harness_tempdir = tmp  # keep symlink tree alive
@@ -3670,6 +3709,103 @@ def _rec_to_device_dtype(value: Any, *, device: str, dtype: Any) -> Any:
     return value
 
 
+def _decode_action_with_harness_references(
+    policy: object,
+    normalized_action: np.ndarray,
+    batched_states: dict[str, np.ndarray],
+    reference_action: dict[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Decode GR00T actions using checkpoint action-reference metadata."""
+    from gr00t.configs.data.embodiment_configs import ActionRepresentation
+
+    processor = policy.processor
+    embodiment_tag = policy.embodiment_tag
+    embodiment_key = embodiment_tag.value
+    action_modality = processor.modality_configs[embodiment_key]["action"]
+    action_keys = list(action_modality.modality_keys)
+    action_configs = list(action_modality.action_configs or [])
+    action_horizon = len(action_modality.delta_indices)
+    reference_configs = getattr(policy, "_harness_action_reference_configs", {}) or {}
+
+    out_dict: dict[str, np.ndarray] = {}
+    start_idx = 0
+    for key in action_keys:
+        joint_dim = processor.state_action_processor.norm_params[embodiment_key]["action"][key]["dim"].item()
+        out_dict[key] = normalized_action[..., :action_horizon, start_idx : start_idx + joint_dim]
+        start_idx += joint_dim
+
+    relative_keys: set[str] = set()
+    for key, action_config in zip(action_keys, action_configs, strict=False):
+        if action_config.rep == ActionRepresentation.RELATIVE and processor.state_action_processor.use_relative_action:
+            relative_keys.add(str(key))
+
+    saved_use_relative = bool(processor.state_action_processor.use_relative_action)
+    processor.state_action_processor.use_relative_action = False
+    try:
+        unnormalized = processor.state_action_processor.unapply_action(
+            out_dict,
+            embodiment_key,
+            state=batched_states,
+        )
+    finally:
+        processor.state_action_processor.use_relative_action = saved_use_relative
+
+    decoded: dict[str, np.ndarray] = {}
+    metadata: dict[str, Any] = {"decode_reference_sources": {}}
+    batch_size = int(normalized_action.shape[0])
+    for key, action_config in zip(action_keys, action_configs, strict=False):
+        key = str(key)
+        value = np.asarray(unnormalized[key], dtype=np.float64)
+        if key not in relative_keys:
+            decoded[key] = value.astype(np.float32)
+            metadata["decode_reference_sources"][key] = "absolute"
+            continue
+
+        key_reference_cfg = reference_configs.get(key, {})
+        use_action_reference = str(key_reference_cfg.get("reference_source", "state")) == "action"
+        state_key = action_config.state_key if action_config.state_key else key
+        if use_action_reference:
+            reference_key = str(key_reference_cfg.get("reference_key") or key)
+            if reference_key not in reference_action:
+                raise KeyError(f"Action-relative decode for {key!r} requires reference_action[{reference_key!r}]")
+            reference_values = np.asarray(reference_action[reference_key], dtype=np.float64)
+            metadata["decode_reference_sources"][key] = {
+                "source": "action",
+                "reference_key": reference_key,
+                "reference_delta_index": key_reference_cfg.get("reference_delta_index"),
+            }
+        else:
+            if state_key not in batched_states:
+                raise KeyError(f"State-relative decode for {key!r} requires state[{state_key!r}]")
+            reference_values = np.asarray(batched_states[state_key], dtype=np.float64)
+            metadata["decode_reference_sources"][key] = {"source": "state", "state_key": state_key}
+
+        if reference_values.ndim == 1:
+            reference_values = reference_values.reshape(1, 1, -1)
+        elif reference_values.ndim == 2:
+            if reference_values.shape[0] == batch_size:
+                reference_values = reference_values[:, None, :]
+            else:
+                reference_values = reference_values[None, ...]
+        if reference_values.shape[0] != batch_size:
+            if reference_values.shape[0] == 1:
+                reference_values = np.repeat(reference_values, batch_size, axis=0)
+            else:
+                raise ValueError(f"Reference for {key!r} has shape {reference_values.shape}, expected batch={batch_size}")
+
+        absolute_batches = []
+        for ref, rel in zip(reference_values, value, strict=True):
+            absolute = processor.state_action_processor._convert_to_absolute_action(
+                action=rel,
+                reference_state=ref[-1],
+                action_type=action_config.type,
+                action_format=action_config.format,
+            )
+            absolute_batches.append(absolute)
+        decoded[key] = np.stack(absolute_batches, axis=0).astype(np.float32)
+    return decoded, metadata
+
+
 def _policy_get_action_cpu_processor(
     policy: object,
     observation: dict[str, Any],
@@ -3750,16 +3886,16 @@ def _policy_get_action_cpu_processor(
             key: np.stack([state[key] for state in states], axis=0)
             for key in policy.modality_configs["state"].modality_keys
         }
-        unnormalized_action = policy.processor.decode_action(
+        unnormalized_action, decode_metadata = _decode_action_with_harness_references(
+            policy,
             normalized_action.cpu().numpy(),
-            policy.embodiment_tag,
             batched_states,
             reference_action=reference_action,
         )
         casted_action = {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
         if getattr(policy, "strict", False):
             policy.check_action(casted_action)
-        return casted_action, {}
+        return casted_action, decode_metadata
     finally:
         torch.set_default_device(previous_device)
 

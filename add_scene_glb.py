@@ -99,7 +99,7 @@ RIGHT_D405_CONNECTOR_REL_EULER_DEG = (79.969, 0.0, 0.0)
 D405_CAMERA_LOCAL_POS_RATIO = (0.0, 0.0, 0.5)
 D405_CAMERA_NEAR_M = 1.0e-4
 D405_CAMERA_FAR_M = 1.0e6
-DEFAULT_D405_CAMERA_GUI = True
+DEFAULT_D405_CAMERA_GUI = False
 SILVER_WHITE_METAL_COLOR = (0.86, 0.88, 0.88, 1.0)
 SILVER_WHITE_METAL_ROUGHNESS = 0.28
 CEILING_AREA_LIGHT_POS = (0.0, 0.0, 2.6)
@@ -1334,7 +1334,12 @@ def _render_d405_view(scene: gs.Scene, enabled: bool = True) -> None:
     camera = getattr(scene, "right_d405_camera", None)
     if camera is None:
         return
-    camera.render(rgb=True, depth=False, segmentation=False, normal=False, force_render=True)
+    try:
+        camera.render(rgb=True, depth=False, segmentation=False, normal=False, force_render=True)
+    except Exception as exc:
+        if not getattr(scene, "_d405_preview_render_warned", False):
+            print(f"[d405-preview] disabled: failed to render/show Genesis camera GUI: {exc}", flush=True)
+            scene._d405_preview_render_warned = True
 
 
 def _refresh_scene_attached_parts(scene: gs.Scene) -> None:
@@ -3430,7 +3435,7 @@ def main() -> None:
         dest="d405_camera_gui",
         action="store_true",
         default=DEFAULT_D405_CAMERA_GUI,
-        help="Open the built-in Genesis GUI window for the right wrist D405 camera (default).",
+        help="Open the built-in Genesis GUI window for the right wrist D405 camera.",
     )
     parser.add_argument(
         "--no-d405-camera-gui",
