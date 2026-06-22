@@ -90,7 +90,7 @@ D455_BODY_SIZE_FALLBACK = (0.026, 0.124, 0.029)
 D455_RGB_LOCAL_POS_RATIO = (0.5, 0.0, 0.0)
 DEFAULT_D455_RGB_GUI = True
 D455_MODEL_IMAGE_SIZE = (224, 224)
-D455_EGO_ROI_ZOOM = 2.0
+D455_EGO_ROI_ZOOM = 1.0
 D455_EGO_ROI_CENTER_X = 0.50
 D455_EGO_ROI_CENTER_Y = 0.65
 D405_BODY_SIZE_FALLBACK = (0.042, 0.042, 0.023)
@@ -588,6 +588,50 @@ def _load_d405_config(path: Path) -> dict[str, object]:
         "near": D405_CAMERA_NEAR_M,
         "far": D405_CAMERA_FAR_M,
     }
+
+
+def load_d405_mount_json(path: str | Path) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Load a D405 right-connector mount JSON produced by the smooth wrist calibration tool."""
+    json_path = Path(path).expanduser().resolve()
+    if not json_path.exists():
+        raise FileNotFoundError(f"D405 mount JSON not found: {json_path}")
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    constants = payload.get("python_constants") if isinstance(payload.get("python_constants"), dict) else {}
+
+    pos_values = payload.get("offset_xyz_in_connector_frame_m")
+    if pos_values is None and isinstance(constants, dict):
+        pos_values = constants.get("RIGHT_D405_CONNECTOR_REL_POS_M")
+    euler_values = payload.get("euler_xyz_in_connector_frame_deg")
+    if euler_values is None and isinstance(constants, dict):
+        euler_values = constants.get("RIGHT_D405_CONNECTOR_REL_EULER_DEG")
+    if not isinstance(pos_values, (list, tuple)) or len(pos_values) != 3:
+        raise ValueError(f"{json_path} missing offset_xyz_in_connector_frame_m / RIGHT_D405_CONNECTOR_REL_POS_M")
+    if not isinstance(euler_values, (list, tuple)) or len(euler_values) != 3:
+        raise ValueError(f"{json_path} missing euler_xyz_in_connector_frame_deg / RIGHT_D405_CONNECTOR_REL_EULER_DEG")
+    pos = tuple(float(v) for v in pos_values)
+    euler = tuple(float(v) for v in euler_values)
+    return pos, euler  # type: ignore[return-value]
+
+
+def resolve_d405_mount_args(
+    *,
+    mount_json: str | Path | None,
+    rel_pos: tuple[float, float, float] | None,
+    rel_euler: tuple[float, float, float] | None,
+) -> tuple[tuple[float, float, float], tuple[float, float, float], str]:
+    source = "defaults"
+    json_pos: tuple[float, float, float] | None = None
+    json_euler: tuple[float, float, float] | None = None
+    if mount_json is not None:
+        json_pos, json_euler = load_d405_mount_json(mount_json)
+        source = f"json:{Path(mount_json).expanduser().resolve()}"
+    final_pos = tuple(float(v) for v in (rel_pos if rel_pos is not None else (json_pos or RIGHT_D405_CONNECTOR_REL_POS_M)))
+    final_euler = tuple(
+        float(v) for v in (rel_euler if rel_euler is not None else (json_euler or RIGHT_D405_CONNECTOR_REL_EULER_DEG))
+    )
+    if rel_pos is not None or rel_euler is not None:
+        source = f"{source}+cli_override" if mount_json is not None else "cli"
+    return final_pos, final_euler, source
 
 
 def _load_bottle_proxy_config(
@@ -1127,11 +1171,13 @@ def _mount_d455_to_base(assembly: dict[str, object]) -> None:
     base_pos = _tensor_to_np(base.get_pos()).reshape(3).astype(np.float64)
     base_quat = _tensor_to_np(base.get_quat()).reshape(4).astype(np.float64)
     base_rotation = _rotation_from_quat_wxyz(base_quat)
+    d455_rel_pos = tuple(float(v) for v in assembly.get("d455_base_rel_pos", D455_BASE_REL_POS_M))
+    d455_rel_euler = tuple(float(v) for v in assembly.get("d455_base_rel_euler", D455_BASE_REL_EULER_DEG))
     d455_pos, d455_rotation = _pose_world_from_base_relative(
         base_pos=base_pos,
         base_rotation=base_rotation,
-        rel_pos=D455_BASE_REL_POS_M,
-        rel_euler=D455_BASE_REL_EULER_DEG,
+        rel_pos=d455_rel_pos,
+        rel_euler=d455_rel_euler,
     )
 
     if body is not None:
@@ -1169,8 +1215,10 @@ def _mount_d405_to_right_connector(assembly: dict[str, object]) -> None:
     connector_pos = _tensor_to_np(right_connector.get_pos()).reshape(3).astype(np.float64)
     connector_quat = _tensor_to_np(right_connector.get_quat()).reshape(4).astype(np.float64)
     connector_rotation = _rotation_from_quat_wxyz(connector_quat)
-    d405_rotation = connector_rotation @ _rotation_from_euler_deg(RIGHT_D405_CONNECTOR_REL_EULER_DEG)
-    d405_pos = connector_pos + connector_rotation @ np.asarray(RIGHT_D405_CONNECTOR_REL_POS_M, dtype=np.float64)
+    d405_rel_pos = tuple(float(v) for v in assembly.get("d405_connector_rel_pos", RIGHT_D405_CONNECTOR_REL_POS_M))
+    d405_rel_euler = tuple(float(v) for v in assembly.get("d405_connector_rel_euler", RIGHT_D405_CONNECTOR_REL_EULER_DEG))
+    d405_rotation = connector_rotation @ _rotation_from_euler_deg(d405_rel_euler)
+    d405_pos = connector_pos + connector_rotation @ np.asarray(d405_rel_pos, dtype=np.float64)
 
     if body is not None:
         _set_entity_pose(body, d405_pos, d405_rotation)
@@ -2477,8 +2525,14 @@ def _add_dual_nero_arm_assembly(
     connector_scale: float = DEFAULT_CONNECTOR_SCALE,
     d455_json: Path | None = None,
     d455_rgb_gui: bool = DEFAULT_D455_RGB_GUI,
+    d455_rgb_fov: float | None = None,
+    d455_base_rel_pos: tuple[float, float, float] = D455_BASE_REL_POS_M,
+    d455_base_rel_euler: tuple[float, float, float] = D455_BASE_REL_EULER_DEG,
     d405_json: Path | None = None,
     d405_camera_gui: bool = DEFAULT_D405_CAMERA_GUI,
+    d405_fov: float | None = None,
+    d405_connector_rel_pos: tuple[float, float, float] = RIGHT_D405_CONNECTOR_REL_POS_M,
+    d405_connector_rel_euler: tuple[float, float, float] = RIGHT_D405_CONNECTOR_REL_EULER_DEG,
     linker_hand_side: str = NERO_LINKER_CONFIG.linker_hand_side,
     linker_hand_mount_offset_xyz: tuple[float, float, float] = NERO_LINKER_CONFIG.linker_hand_mount_offset_xyz,
     linker_hand_mount_quat_wxyz: tuple[float, float, float, float] = NERO_LINKER_CONFIG.linker_hand_mount_quat_wxyz,
@@ -2513,11 +2567,15 @@ def _add_dual_nero_arm_assembly(
         if not d455_json.exists():
             raise FileNotFoundError(f"D455 JSON not found: {d455_json}")
         d455_config = _load_d455_config(d455_json)
+        if d455_rgb_fov is not None:
+            d455_config["rgb_fov"] = float(d455_rgb_fov)
     d405_config = None
     if d405_json is not None and connector_mesh is not None:
         if not d405_json.exists():
             raise FileNotFoundError(f"D405 JSON not found: {d405_json}")
         d405_config = _load_d405_config(d405_json)
+        if d405_fov is not None:
+            d405_config["fov"] = float(d405_fov)
 
     base_pos = _pose_from_local_anchor(base_foot_center_mm, base_euler, base_scale, origin)
     urdf_for_genesis = _make_revo2_flange_urdf(nero_urdf) if add_revo2_flange else nero_urdf
@@ -2683,7 +2741,11 @@ def _add_dual_nero_arm_assembly(
         "right": right_arm,
         "connectors": connectors,
         "d455": d455,
+        "d455_base_rel_pos": tuple(float(v) for v in d455_base_rel_pos),
+        "d455_base_rel_euler": tuple(float(v) for v in d455_base_rel_euler),
         "d405": d405,
+        "d405_connector_rel_pos": tuple(float(v) for v in d405_connector_rel_pos),
+        "d405_connector_rel_euler": tuple(float(v) for v in d405_connector_rel_euler),
         "linker_hand": linker_hand,
         "linker_hand_side": "left" if str(linker_hand_side) == "left" else "right",
         "linker_hand_urdf": linker_hand_urdf,
@@ -2701,8 +2763,14 @@ def _add_combined_nero_linker_assembly(
     combined_urdf: Path = DEFAULT_COMBINED_NERO_LINKER_URDF,
     d455_json: Path | None = None,
     d455_rgb_gui: bool = DEFAULT_D455_RGB_GUI,
+    d455_rgb_fov: float | None = None,
+    d455_base_rel_pos: tuple[float, float, float] = D455_BASE_REL_POS_M,
+    d455_base_rel_euler: tuple[float, float, float] = D455_BASE_REL_EULER_DEG,
     d405_json: Path | None = None,
     d405_camera_gui: bool = DEFAULT_D405_CAMERA_GUI,
+    d405_fov: float | None = None,
+    d405_connector_rel_pos: tuple[float, float, float] = RIGHT_D405_CONNECTOR_REL_POS_M,
+    d405_connector_rel_euler: tuple[float, float, float] = RIGHT_D405_CONNECTOR_REL_EULER_DEG,
     linker_hand_side: str = NERO_LINKER_CONFIG.linker_hand_side,
     linker_hand_urdf: Path | None = DEFAULT_LINKER_HAND_URDF,
     linker_hand_collision: bool = True,
@@ -2724,11 +2792,15 @@ def _add_combined_nero_linker_assembly(
         if not d455_json.exists():
             raise FileNotFoundError(f"D455 JSON not found: {d455_json}")
         d455_config = _load_d455_config(d455_json)
+        if d455_rgb_fov is not None:
+            d455_config["rgb_fov"] = float(d455_rgb_fov)
     d405_config = None
     if d405_json is not None:
         if not d405_json.exists():
             raise FileNotFoundError(f"D405 JSON not found: {d405_json}")
         d405_config = _load_d405_config(d405_json)
+        if d405_fov is not None:
+            d405_config["fov"] = float(d405_fov)
 
     combined = scene.add_entity(
         gs.morphs.URDF(
@@ -2813,7 +2885,11 @@ def _add_combined_nero_linker_assembly(
         "eef_link": f"{hand_side}_revo2_flange",
         "connectors": {},
         "d455": d455,
+        "d455_base_rel_pos": tuple(float(v) for v in d455_base_rel_pos),
+        "d455_base_rel_euler": tuple(float(v) for v in d455_base_rel_euler),
         "d405": d405,
+        "d405_connector_rel_pos": tuple(float(v) for v in d405_connector_rel_pos),
+        "d405_connector_rel_euler": tuple(float(v) for v in d405_connector_rel_euler),
         "linker_hand": combined,
         "linker_hand_side": hand_side,
         "linker_hand_urdf": linker_hand_urdf,
@@ -2869,9 +2945,15 @@ def create_scene(
     add_d455: bool = True,
     d455_json: str | Path | None = DEFAULT_D455_JSON,
     d455_rgb_gui: bool = DEFAULT_D455_RGB_GUI,
+    d455_rgb_fov: float | None = None,
+    d455_base_rel_pos: tuple[float, float, float] = D455_BASE_REL_POS_M,
+    d455_base_rel_euler: tuple[float, float, float] = D455_BASE_REL_EULER_DEG,
     add_d405: bool = True,
     d405_json: str | Path | None = DEFAULT_D405_JSON,
     d405_camera_gui: bool = DEFAULT_D405_CAMERA_GUI,
+    d405_fov: float | None = None,
+    d405_connector_rel_pos: tuple[float, float, float] = RIGHT_D405_CONNECTOR_REL_POS_M,
+    d405_connector_rel_euler: tuple[float, float, float] = RIGHT_D405_CONNECTOR_REL_EULER_DEG,
     base_collision: bool = False,
     arm_collision: bool = False,
     linker_hand_collision: bool = False,
@@ -3076,8 +3158,14 @@ def create_scene(
                 combined_urdf=Path(combined_urdf),
                 d455_json=Path(d455_json) if add_d455 and d455_json is not None else None,
                 d455_rgb_gui=d455_rgb_gui,
+                d455_rgb_fov=d455_rgb_fov,
+                d455_base_rel_pos=d455_base_rel_pos,
+                d455_base_rel_euler=d455_base_rel_euler,
                 d405_json=Path(d405_json) if add_d405 and d405_json is not None else None,
                 d405_camera_gui=d405_camera_gui,
+                d405_fov=d405_fov,
+                d405_connector_rel_pos=d405_connector_rel_pos,
+                d405_connector_rel_euler=d405_connector_rel_euler,
                 linker_hand_side=linker_hand_side,
                 linker_hand_urdf=Path(linker_hand_urdf) if add_linker_hand and linker_hand_urdf is not None else None,
                 linker_hand_collision=linker_hand_collision,
@@ -3093,8 +3181,14 @@ def create_scene(
                 connector_scale=connector_scale,
                 d455_json=Path(d455_json) if add_d455 and d455_json is not None else None,
                 d455_rgb_gui=d455_rgb_gui,
+                d455_rgb_fov=d455_rgb_fov,
+                d455_base_rel_pos=d455_base_rel_pos,
+                d455_base_rel_euler=d455_base_rel_euler,
                 d405_json=Path(d405_json) if add_d405 and d405_json is not None else None,
                 d405_camera_gui=d405_camera_gui,
+                d405_fov=d405_fov,
+                d405_connector_rel_pos=d405_connector_rel_pos,
+                d405_connector_rel_euler=d405_connector_rel_euler,
                 linker_hand_side=linker_hand_side,
                 origin=assembly_origin,
                 base_collision=base_collision,
@@ -3284,6 +3378,9 @@ def main() -> None:
     parser.add_argument("--connector-scale", type=float, default=DEFAULT_CONNECTOR_SCALE)
     parser.add_argument("--no-d455", action="store_true", help="Do not mount the fixed D455 body and RGB camera.")
     parser.add_argument("--d455-json", type=Path, default=DEFAULT_D455_JSON)
+    parser.add_argument("--d455-rgb-fov", type=float, default=None, help="Override D455 RGB Genesis vertical FOV in degrees.")
+    parser.add_argument("--d455-base-rel-pos", type=_vec3, default=D455_BASE_REL_POS_M, help="D455 body pose relative to combined/base frame, xyz meters.")
+    parser.add_argument("--d455-base-rel-euler", type=_vec3, default=D455_BASE_REL_EULER_DEG, help="D455 body pose relative to combined/base frame, euler degrees.")
     parser.add_argument(
         "--d455-rgb-gui",
         dest="d455_rgb_gui",
@@ -3307,7 +3404,7 @@ def main() -> None:
         "--d455-ego-roi-zoom",
         type=float,
         default=D455_EGO_ROI_ZOOM,
-        help="D455 ego_view center-crop digital zoom, matching finetune inference.",
+        help="D455 ego_view center-crop digital zoom. Default 1.0 matches finetune smooth full-frame inference.",
     )
     parser.add_argument(
         "--d455-ego-roi-center-x",
@@ -3324,6 +3421,10 @@ def main() -> None:
     parser.add_argument("--d455-preview-scale", type=int, default=2, help="Integer scale for the cropped D455 preview window.")
     parser.add_argument("--no-d405", action="store_true", help="Do not mount the D405 camera on the right connector.")
     parser.add_argument("--d405-json", type=Path, default=DEFAULT_D405_JSON)
+    parser.add_argument("--d405-fov", type=float, default=None, help="Override right D405 Genesis vertical FOV in degrees.")
+    parser.add_argument("--d405-mount-json", type=Path, default=None, help="Load right D405 connector-relative pose from calibration JSON.")
+    parser.add_argument("--d405-connector-rel-pos", type=_vec3, default=None, help="Right D405 body pose relative to right connector, xyz meters. Overrides --d405-mount-json position.")
+    parser.add_argument("--d405-connector-rel-euler", type=_vec3, default=None, help="Right D405 body pose relative to right connector, euler degrees. Overrides --d405-mount-json orientation.")
     parser.add_argument(
         "--d405-camera-gui",
         dest="d405_camera_gui",
@@ -3415,6 +3516,18 @@ def main() -> None:
         print("[scene] --no-collision ignored: scene.glb is visual-only; table collision uses --no-table-collider.", flush=True)
     if args.dynamic:
         print("[scene] --dynamic ignored: scene.glb stays fixed as the support surface.", flush=True)
+    d405_connector_rel_pos, d405_connector_rel_euler, d405_mount_source = resolve_d405_mount_args(
+        mount_json=args.d405_mount_json,
+        rel_pos=args.d405_connector_rel_pos,
+        rel_euler=args.d405_connector_rel_euler,
+    )
+    print(
+        "[d405-mount] "
+        f"source={d405_mount_source} "
+        f"pos={tuple(round(float(v), 6) for v in d405_connector_rel_pos)} "
+        f"euler_deg={tuple(round(float(v), 3) for v in d405_connector_rel_euler)}",
+        flush=True,
+    )
     os.environ["TELEOP_LINKER_L10_RETARGETER"] = str(args.linker_l10_retargeter)
     if args.enable_vr_teleop:
         if args.no_arm_assembly:
@@ -3479,9 +3592,15 @@ def main() -> None:
         add_d455=not args.no_d455,
         d455_json=args.d455_json,
         d455_rgb_gui=False,
+        d455_rgb_fov=args.d455_rgb_fov,
+        d455_base_rel_pos=args.d455_base_rel_pos,
+        d455_base_rel_euler=args.d455_base_rel_euler,
         add_d405=not args.no_d405,
         d405_json=args.d405_json,
         d405_camera_gui=args.d405_camera_gui,
+        d405_fov=args.d405_fov,
+        d405_connector_rel_pos=d405_connector_rel_pos,
+        d405_connector_rel_euler=d405_connector_rel_euler,
         base_collision=args.base_collision,
         arm_collision=args.arm_collision,
         linker_hand_collision=args.linker_hand_collision,

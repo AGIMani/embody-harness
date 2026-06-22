@@ -13,8 +13,8 @@
     }
   },
   "resolution": {
-    "width": 1280,
-    "height": 720
+    "width": 640,
+    "height": 480
   },
   "frequency_fps": 30,
   "projection_mode": "perspective",

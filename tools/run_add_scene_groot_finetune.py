@@ -25,10 +25,13 @@ ISAAC_GROOT_ROOT = Path(os.environ.get("ISAAC_GROOT_ROOT", ROOT_DIR.parent / "Is
 DEFAULT_POLICY_CHECKPOINT = ROOT_DIR / "checkpoints" / "finetune" / "checkpoint-59000"
 DEFAULT_COSMOS_MODEL = ROOT_DIR / "checkpoints" / "nvidia" / "Cosmos-Reason2-2B"
 DEFAULT_TASK = "pick up the bottle with green cap and place it in the white rectangle area"
-DEFAULT_IMAGE_SIZE = (224, 224)
-DEFAULT_EGO_ROI_ZOOM = 2.0
+DEFAULT_IMAGE_SIZE = (180, 320)
+DEFAULT_EGO_ROI_ZOOM = 1.0
 DEFAULT_EGO_ROI_CENTER_X = 0.50
 DEFAULT_EGO_ROI_CENTER_Y = 0.65
+DEFAULT_WRIST_ROI_ZOOM = 1.0
+DEFAULT_WRIST_ROI_CENTER_X = 0.50
+DEFAULT_WRIST_ROI_CENTER_Y = 0.50
 DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
 DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.616071, -0.064286, 0.620536)
@@ -52,39 +55,39 @@ DEFAULT_INITIAL_LEFT_ARM_Q = (
     0.1212131166,
 )
 DEFAULT_INITIAL_HAND_Q = (
-    0.072044,
-    0.422158,
-    0.136070,
-    0.136070,
-    0.136070,
-    0.204105,
-    0.034896,
-    0.026172,
-    0.062802,
-    0.113390,
+    0.1848468184,
+    0.3151794076,
+    0.000000,
+    0.000000,
+    0.000000,
+    0.000000,
+    0.0581703521,
+    0.0262242742,
+    0.1140341759,
+    0.000000,
 )
 DEFAULT_INITIAL_REFERENCE_EEF_9D = (
-    -0.382481151,
-    0.157008573,
-    0.614672903,
-    -0.117517303,
-    -0.277327377,
-    -0.948701119,
-    0.055898530,
-    -0.955272723,
-    0.272063020,
+    -0.3831384480,
+    0.1545769125,
+    0.6139852405,
+    -0.1099411249,
+    -0.2940049767,
+    -0.9494598508,
+    0.0566430911,
+    -0.9555513263,
+    0.2893323302,
 )
 DEFAULT_INITIAL_REFERENCE_HAND_Q = (
-    0.072044,
-    0.422158,
-    0.136070,
-    0.136070,
-    0.136070,
-    0.204105,
-    0.034896,
-    0.026172,
-    0.062802,
-    0.113390,
+    0.1848468184,
+    0.3151794076,
+    0.000000,
+    0.000000,
+    0.000000,
+    0.000000,
+    0.0581703521,
+    0.0262242742,
+    0.1140341759,
+    0.000000,
 )
 POLICY_HAND_JOINT_NAMES = (
     "thumb_cmc_pitch",
@@ -109,6 +112,15 @@ POLICY_HAND_COMMAND_LOWER_BY_NAME = {
     "ring_mcp_pitch": 0.0,
     "pinky_mcp_pitch": 0.0,
 }
+POLICY_HAND_OBSERVATION_LOWER_BY_NAME = {
+    # Remote training observation.state.hand_joint_pos comes from Linker L10 SDK
+    # get_state().  A fully open non-thumb pitch typically reads back as raw=254,
+    # i.e. ~0.005336 rad in URDF command space, not exact mathematical zero.
+    "index_mcp_pitch": 0.005336078431372549,
+    "middle_mcp_pitch": 0.005336078431372549,
+    "ring_mcp_pitch": 0.005336078431372549,
+    "pinky_mcp_pitch": 0.005336078431372549,
+}
 DEFAULT_MAX_HAND_JOINT_DELTA = 0.0
 L10_HAND_ACTIVE_LOCAL_INDICES = (0, 2, 3, 4, 5, 9)
 L10_HAND_MASKED_LOCAL_INDICES = (1, 6, 7, 8)
@@ -116,8 +128,53 @@ DEFAULT_IK_J4_LIMIT_RAD = (0.0, 2.14)
 DEFAULT_POLICY_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_policy_debug.jsonl"
 DEFAULT_POLICY_TELEOP_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_teleop_bridge.jsonl"
 DEFAULT_POLICY_TRACE_DIR = ROOT_DIR / "logs" / "groot_finetune_policy_trace"
+DEFAULT_SMOOTH_REFERENCE_DIR = (
+    ROOT_DIR.parent / "Isaac-GR00T" / "outputs" / "IsaacLab" / "nero" / "mission2" / "smooth"
+)
 DEFAULT_POLICY_TRANSLATION_SCALE = (0.6, 0.6, 0.6)
 DEFAULT_POLICY_ORIENTATION_MAX_SPEED_RAD_S = 4.0
+
+L10_SDK_JOINT_CALIBRATION = (
+    ("thumb_cmc_pitch", 0.0, 0.75, True),
+    ("thumb_cmc_yaw", 0.0, 1.43, True),
+    ("index_mcp_pitch", 0.0, 1.62, True),
+    ("middle_mcp_pitch", 0.0, 1.62, True),
+    ("ring_mcp_pitch", 0.0, 1.62, True),
+    ("pinky_mcp_pitch", 0.0, 1.62, True),
+    ("index_mcp_roll", -0.26, 0.21, False),
+    ("ring_mcp_roll", 0.0, 0.21, False),
+    ("pinky_mcp_roll", 0.0, 0.34, False),
+    ("thumb_cmc_roll", -0.52, 1.01, True),
+)
+L10_CALIBRATED_ANCHOR_JOINT_NAMES = (
+    "thumb_cmc_roll",
+    "thumb_cmc_yaw",
+    "thumb_cmc_pitch",
+    "index_mcp_roll",
+    "index_mcp_pitch",
+    "middle_mcp_pitch",
+    "ring_mcp_roll",
+    "ring_mcp_pitch",
+    "pinky_mcp_roll",
+    "pinky_mcp_pitch",
+)
+L10_CALIBRATED_ANCHOR_RATIOS = {
+    "full_open": (0.100000, 0.220000, 0.140000, 0.160000, 0.100000, 0.062468, 0.120000, 0.091864, 0.180000, 0.143309),
+    "pinch_index": (0.105829, 0.620147, 0.524679, 0.000000, 0.558536, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000),
+    "pinch_middle": (0.255754, 0.620147, 0.563545, 0.000000, 0.000000, 0.569560, 0.000000, 0.000000, 0.000000, 0.000000),
+    "pinch_ring": (0.418908, 0.620147, 0.553828, 0.000000, 0.000000, 0.000000, 0.000000, 0.558536, 0.000000, 0.000000),
+    "pinch_pinky": (0.621748, 0.588879, 0.544112, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.558536),
+}
+L10_CALIBRATED_RAW_ANCHORS = {
+    "full_open": (254, 254, 254, 254, 254, 254, 254, 191, 254, 254),
+    "pinch_index": (123, 102, 122, 254, 254, 254, 0, 0, 13, 201),
+    "pinch_middle": (121, 94, 254, 115, 254, 254, 0, 0, 13, 174),
+    "pinch_ring": (117, 36, 254, 254, 115, 254, 0, 0, 13, 157),
+    "pinch_pinky": (117, 32, 254, 254, 254, 115, 0, 0, 13, 98),
+}
+L10_CALIBRATED_ANCHOR_LOCAL_RADIUS = 0.35
+L10_CALIBRATED_ANCHOR_KERNEL_SIGMA = 0.12
+L10_CALIBRATED_ANCHOR_SNAP_DISTANCE = 0.05
 
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -128,6 +185,7 @@ from teleop_stack.ik.full_pose_controller import (  # noqa: E402
     FullPoseDifferentialIkControllerConfig,
 )
 from teleop_stack.ik.nero_genesis_kinematics import GenesisLinkKinematicsModel  # noqa: E402
+from teleop_stack.ik.nero_can_fk import nero_can_flange_pose_from_joints  # noqa: E402
 from teleop_stack.ik.nero_limits import (  # noqa: E402
     nero_effective_joint_lower_limits,
     nero_effective_joint_upper_limits,
@@ -193,6 +251,140 @@ def _vec10(text: str) -> tuple[float, ...]:
         return tuple(float(part) for part in parts)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("expected numeric comma-separated values") from exc
+
+
+def _scale_linear(value: float, src_min: float, src_max: float, dst_min: float, dst_max: float) -> float:
+    if abs(float(src_max) - float(src_min)) < 1.0e-9:
+        return float(dst_min)
+    return (float(value) - float(src_min)) * (float(dst_max) - float(dst_min)) / (
+        float(src_max) - float(src_min)
+    ) + float(dst_min)
+
+
+def _l10_command_limits_by_name() -> dict[str, tuple[float, float]]:
+    return {
+        "thumb_cmc_roll": (0.0, 1.1339),
+        "thumb_cmc_yaw": (0.0, 1.9189),
+        "thumb_cmc_pitch": (0.0, 0.5146),
+        "index_mcp_roll": (0.0, 0.2181),
+        "index_mcp_pitch": (0.0, 1.3607),
+        "middle_mcp_pitch": (0.0, 1.3607),
+        "ring_mcp_roll": (0.0, 0.2181),
+        "ring_mcp_pitch": (0.0, 1.3607),
+        "pinky_mcp_roll": (0.0, 0.3489),
+        "pinky_mcp_pitch": (0.0, 1.3607),
+    }
+
+
+def _l10_calibrated_anchor_positions() -> tuple[tuple[dict[str, float], tuple[int, ...]], ...]:
+    limits = _l10_command_limits_by_name()
+    anchors: list[tuple[dict[str, float], tuple[int, ...]]] = []
+    for anchor_name, ratios in L10_CALIBRATED_ANCHOR_RATIOS.items():
+        by_name: dict[str, float] = {}
+        for joint_name, ratio in zip(L10_CALIBRATED_ANCHOR_JOINT_NAMES, ratios, strict=True):
+            lower, upper = limits[joint_name]
+            by_name[joint_name] = _scale_linear(np.clip(float(ratio), 0.0, 1.0), 0.0, 1.0, lower, upper)
+        anchors.append(
+            (
+                by_name,
+                tuple(int(np.clip(int(value), 0, 255)) for value in L10_CALIBRATED_RAW_ANCHORS[anchor_name]),
+            )
+        )
+    return tuple(anchors)
+
+
+def _l10_base_raw_from_command(value_by_name: dict[str, float]) -> tuple[int, ...]:
+    limits = _l10_command_limits_by_name()
+    raw_values: list[int] = []
+    for joint_name, sdk_lower, sdk_upper, raw_reversed in L10_SDK_JOINT_CALIBRATION:
+        source_lower, source_upper = limits[joint_name]
+        value = float(np.clip(value_by_name[joint_name], source_lower, source_upper))
+        ratio = _scale_linear(value, source_lower, source_upper, 0.0, 1.0)
+        sdk_value = float(np.clip(_scale_linear(ratio, 0.0, 1.0, sdk_lower, sdk_upper), sdk_lower, sdk_upper))
+        if raw_reversed:
+            raw = _scale_linear(sdk_value, sdk_lower, sdk_upper, 255.0, 0.0)
+        else:
+            raw = _scale_linear(sdk_value, sdk_lower, sdk_upper, 0.0, 255.0)
+        raw_values.append(int(round(float(np.clip(raw, 0.0, 255.0)))))
+    return tuple(raw_values)
+
+
+def _l10_calibrated_raw_from_command(value_by_name: dict[str, float]) -> tuple[int, ...]:
+    limits = _l10_command_limits_by_name()
+    anchors = _l10_calibrated_anchor_positions()
+    distances: list[float] = []
+    for anchor_by_name, anchor_raw in anchors:
+        squared = 0.0
+        for joint_name, anchor_value in anchor_by_name.items():
+            lower, upper = limits[joint_name]
+            value = float(np.clip(value_by_name[joint_name], lower, upper))
+            delta = (value - float(anchor_value)) / max(abs(upper - lower), 1.0e-9)
+            squared += delta * delta
+        distance = squared ** 0.5
+        if distance < 1.0e-9:
+            return anchor_raw
+        distances.append(distance)
+
+    if distances:
+        nearest_index, nearest_distance = min(enumerate(distances), key=lambda item: item[1])
+        if nearest_distance <= L10_CALIBRATED_ANCHOR_SNAP_DISTANCE:
+            return anchors[nearest_index][1]
+
+    base_raw = _l10_base_raw_from_command(value_by_name)
+    weighted_corrections: list[tuple[int, float, tuple[int, ...]]] = []
+    for index, distance in enumerate(distances):
+        if distance <= L10_CALIBRATED_ANCHOR_LOCAL_RADIUS:
+            weight = math.exp(-0.5 * (distance / L10_CALIBRATED_ANCHOR_KERNEL_SIGMA) ** 2)
+            weighted_corrections.append((index, weight, _l10_base_raw_from_command(anchors[index][0])))
+    weight_sum = sum(weight for _index, weight, _anchor_base_raw in weighted_corrections)
+    if weight_sum <= 0.0:
+        return base_raw
+
+    raw_values: list[int] = []
+    for channel_index in range(len(L10_SDK_JOINT_CALIBRATION)):
+        correction = 0.0
+        for anchor_index, weight, anchor_base_raw in weighted_corrections:
+            anchor_raw = anchors[anchor_index][1]
+            correction += weight * (anchor_raw[channel_index] - anchor_base_raw[channel_index])
+        raw_values.append(int(round(float(np.clip(base_raw[channel_index] + correction / weight_sum, 0.0, 255.0)))))
+    return tuple(raw_values)
+
+
+def _l10_reported_hand_q_from_command(hand_q: np.ndarray) -> np.ndarray:
+    command = np.asarray(hand_q, dtype=np.float32).reshape(-1)[:10]
+    padded = np.zeros(10, dtype=np.float32)
+    padded[: command.size] = command
+    value_by_name = {name: float(value) for name, value in zip(POLICY_HAND_JOINT_NAMES, padded, strict=True)}
+    # Training observation.state.hand_joint_pos is exported from LinkerHand SDK
+    # get_state(): raw 0..255 positions decoded into the same canonical units as
+    # the command.  Do not use the hand-pose retarget anchor snaps here.  Those
+    # anchors are useful for skeleton->command retargeting, but as a command->
+    # reported-state estimator they collapse near-open commands to the full-open
+    # raw anchor and make non-thumb pitch observations stay at ~0.005 even after
+    # the online command has started closing.
+    raw_values = _l10_base_raw_from_command(value_by_name)
+    limits = _l10_command_limits_by_name()
+    reported_by_name: dict[str, float] = {}
+    for raw, (joint_name, sdk_lower, sdk_upper, raw_reversed) in zip(
+        raw_values,
+        L10_SDK_JOINT_CALIBRATION,
+        strict=True,
+    ):
+        if raw_reversed:
+            sdk_value = _scale_linear(float(raw), 255.0, 0.0, sdk_lower, sdk_upper)
+        else:
+            sdk_value = _scale_linear(float(raw), 0.0, 255.0, sdk_lower, sdk_upper)
+        source_lower, source_upper = limits[joint_name]
+        ratio = _scale_linear(float(np.clip(sdk_value, sdk_lower, sdk_upper)), sdk_lower, sdk_upper, 0.0, 1.0)
+        reported_by_name[joint_name] = float(
+            np.clip(_scale_linear(ratio, 0.0, 1.0, source_lower, source_upper), source_lower, source_upper)
+        )
+    out = np.asarray([reported_by_name[name] for name in POLICY_HAND_JOINT_NAMES], dtype=np.float32)
+    for idx, name in enumerate(POLICY_HAND_JOINT_NAMES):
+        lower = POLICY_HAND_OBSERVATION_LOWER_BY_NAME.get(name)
+        if lower is not None:
+            out[idx] = max(float(lower), float(out[idx]))
+    return out
 
 
 def _axis_map(text: str) -> tuple[str, str, str]:
@@ -394,6 +586,31 @@ def _render_camera_rgb(
         roi_center_x=roi_center_x,
         roi_center_y=roi_center_y,
     )
+
+
+def _postprocess_policy_image(
+    image: np.ndarray,
+    *,
+    rotate_deg: int = 0,
+    flip_horizontal: bool = False,
+    flip_vertical: bool = False,
+) -> np.ndarray:
+    """Apply explicit model-input diagnostics without changing camera geometry."""
+    arr = np.asarray(image)
+    rotate = int(rotate_deg) % 360
+    if rotate not in (0, 90, 180, 270):
+        raise ValueError(f"policy image rotation must be one of 0,90,180,270 degrees, got {rotate_deg!r}")
+    if rotate == 90:
+        arr = np.rot90(arr, k=1)
+    elif rotate == 180:
+        arr = np.rot90(arr, k=2)
+    elif rotate == 270:
+        arr = np.rot90(arr, k=3)
+    if flip_horizontal:
+        arr = np.flip(arr, axis=1)
+    if flip_vertical:
+        arr = np.flip(arr, axis=0)
+    return np.ascontiguousarray(arr).astype(np.uint8, copy=False)
 
 
 def _bottle_panel_main(initial_values, values, policy_running, sim_running, reset_counter, stop_flag) -> None:
@@ -935,6 +1152,179 @@ class Gr00tObservationBuilder:
         return {"video": video, "state": state, "language": language}
 
 
+class SmoothReferenceProvider:
+    """Teacher-forced smooth dataset reference_action(t) for diagnosis."""
+
+    def __init__(
+        self,
+        *,
+        smooth_dir: Path,
+        episode_index: int,
+        frame_offset: int = 0,
+        loop: bool = False,
+    ) -> None:
+        self.smooth_dir = smooth_dir.expanduser().resolve()
+        self.episode_index = int(episode_index)
+        self.frame_offset = int(frame_offset)
+        self.loop = bool(loop)
+        path = self.smooth_dir / "data" / f"chunk-{self.episode_index // 1000:03d}" / f"episode_{self.episode_index:06d}.parquet"
+        if not path.exists():
+            raise FileNotFoundError(f"Smooth reference episode not found: {path}")
+        try:
+            import pyarrow.parquet as pq
+        except Exception as exc:
+            raise RuntimeError(
+                "Reading --policy-hand-reference-source smooth_action_frame requires pyarrow in this environment."
+            ) from exc
+        table = pq.read_table(path, columns=["observation.state", "action"])
+        state = np.asarray(table.column("observation.state").to_pylist(), dtype=np.float32)
+        action = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
+        if state.ndim != 2 or state.shape[1] < 7:
+            raise ValueError(f"Unexpected smooth observation.state shape for {path}: {state.shape}")
+        if action.ndim != 2 or action.shape[1] < 19:
+            raise ValueError(f"Unexpected smooth action shape for {path}: {action.shape}")
+        self.path = path
+        self.arm_state = state[:, 0:7].astype(np.float32, copy=True)
+        self.eef_action = action[:, 0:9].astype(np.float32, copy=True)
+        self.hand_action = action[:, 9:19].astype(np.float32, copy=True)
+
+    @property
+    def length(self) -> int:
+        return int(self.hand_action.shape[0])
+
+    def _index_for_step(self, step_count: int) -> tuple[int, int]:
+        raw_index = int(step_count) + self.frame_offset
+        if self.loop and self.length > 0:
+            index = raw_index % self.length
+        else:
+            index = max(0, min(raw_index, self.length - 1))
+        return raw_index, index
+
+    def hand_reference_at_step(self, step_count: int) -> tuple[np.ndarray, dict[str, Any]]:
+        raw_index, index = self._index_for_step(step_count)
+        hand = self.hand_action[index : index + 1].astype(np.float32, copy=True)
+        return hand, {
+            "source": "smooth_action_frame",
+            "smooth_dir": str(self.smooth_dir),
+            "episode_index": int(self.episode_index),
+            "frame_index": int(index),
+            "raw_frame_index": int(raw_index),
+            "loop": bool(self.loop),
+            "path": str(self.path),
+        }
+
+    def full_reference_at_step(self, step_count: int) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        raw_index, index = self._index_for_step(step_count)
+        reference = {
+            "eef_9d": self.eef_action[index : index + 1].astype(np.float32, copy=True),
+            "hand_joint_target": self.hand_action[index : index + 1].astype(np.float32, copy=True),
+            "arm_joint_target": self.arm_state[index : index + 1].astype(np.float32, copy=True),
+        }
+        return reference, {
+            "source": "smooth_full_action_frame",
+            "smooth_dir": str(self.smooth_dir),
+            "episode_index": int(self.episode_index),
+            "frame_index": int(index),
+            "raw_frame_index": int(raw_index),
+            "loop": bool(self.loop),
+            "path": str(self.path),
+        }
+
+
+class SmoothVideoProvider:
+    """Teacher-force policy ego/wrist videos from a smooth dataset episode."""
+
+    def __init__(
+        self,
+        *,
+        smooth_dir: Path,
+        episode_index: int,
+        image_size: tuple[int, int],
+        frame_offset: int = 0,
+        loop: bool = False,
+    ) -> None:
+        self.smooth_dir = smooth_dir.expanduser().resolve()
+        self.episode_index = int(episode_index)
+        self.image_size = tuple(int(v) for v in image_size)
+        self.frame_offset = int(frame_offset)
+        self.loop = bool(loop)
+        chunk = f"chunk-{self.episode_index // 1000:03d}"
+        self.ego_path = (
+            self.smooth_dir
+            / "videos"
+            / chunk
+            / "observation.images.ego_view"
+            / f"episode_{self.episode_index:06d}.mp4"
+        )
+        self.wrist_path = (
+            self.smooth_dir
+            / "videos"
+            / chunk
+            / "observation.images.wrist_view"
+            / f"episode_{self.episode_index:06d}.mp4"
+        )
+        if not self.ego_path.exists():
+            raise FileNotFoundError(f"Smooth ego video not found: {self.ego_path}")
+        if not self.wrist_path.exists():
+            raise FileNotFoundError(f"Smooth wrist video not found: {self.wrist_path}")
+        try:
+            import cv2  # type: ignore[import-not-found]
+        except Exception as exc:
+            raise RuntimeError("--policy-video-source smooth_dataset requires cv2 in this environment.") from exc
+        self._cv2 = cv2
+        self._ego_cap = cv2.VideoCapture(str(self.ego_path))
+        self._wrist_cap = cv2.VideoCapture(str(self.wrist_path))
+        if not self._ego_cap.isOpened():
+            raise RuntimeError(f"Failed to open smooth ego video: {self.ego_path}")
+        if not self._wrist_cap.isOpened():
+            raise RuntimeError(f"Failed to open smooth wrist video: {self.wrist_path}")
+        self.length = int(
+            min(
+                max(0, int(self._ego_cap.get(cv2.CAP_PROP_FRAME_COUNT))),
+                max(0, int(self._wrist_cap.get(cv2.CAP_PROP_FRAME_COUNT))),
+            )
+        )
+        if self.length <= 0:
+            raise RuntimeError(f"Smooth videos contain no readable frames: {self.ego_path}, {self.wrist_path}")
+
+    def close(self) -> None:
+        self._ego_cap.release()
+        self._wrist_cap.release()
+
+    def _index_for_step(self, step_count: int) -> tuple[int, int]:
+        raw_index = int(step_count) + self.frame_offset
+        if self.loop:
+            index = raw_index % self.length
+        else:
+            index = max(0, min(raw_index, self.length - 1))
+        return raw_index, index
+
+    def _read_frame(self, cap: object, path: Path, frame_index: int) -> np.ndarray:
+        cv2 = self._cv2
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Failed to read frame={frame_index} from {path}")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = self.image_size
+        return cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA).astype(np.uint8)
+
+    def frame_at_step(self, step_count: int) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        raw_index, index = self._index_for_step(step_count)
+        ego = self._read_frame(self._ego_cap, self.ego_path, index)
+        wrist = self._read_frame(self._wrist_cap, self.wrist_path, index)
+        return ego, wrist, {
+            "source": "smooth_dataset",
+            "smooth_dir": str(self.smooth_dir),
+            "episode_index": int(self.episode_index),
+            "frame_index": int(index),
+            "raw_frame_index": int(raw_index),
+            "loop": bool(self.loop),
+            "ego_path": str(self.ego_path),
+            "wrist_path": str(self.wrist_path),
+        }
+
+
 class PolicyTeleopBridge:
     """Interpret policy eef_9d as OpenXR-like source wrist motion."""
 
@@ -1279,12 +1669,16 @@ class RightArmPolicyExecutor:
         self.reference_eef_9d = self.initial_reference_eef_9d.copy()
         self.policy_hand_q_raw = self.initial_reference_hand_q.copy()
         self.reference_hand_q = self.initial_reference_hand_q.copy()
+        self.observation_hand_q = _l10_reported_hand_q_from_command(self.reference_hand_q)
         self.sim_hand_q = self._project_hand_q_for_sim(self.initial_hand_q)
         self.hand_q = self.sim_hand_q.copy()
+        self.policy_action_frame_rotation = np.eye(3, dtype=np.float64)
+        self.policy_action_frame_translation = np.zeros(3, dtype=np.float64)
         self._set_initial_arm_poses()
         self.q_cmd = _tensor_to_np(self.arm.get_qpos()).reshape(-1)[self.arm_dofs].astype(np.float32)
         self.target_rotation = self.current_eef_pose()[:3, :3].copy()
         self.target_xyz = self.current_eef_pose()[:3, 3].copy()
+        self._calibrate_policy_action_frame_to_initial_reference(reason="init_before_first_reference")
         self.reference_eef_9d = self.target_policy_eef_9d()
         self.teleop_bridge = (
             PolicyTeleopBridge(
@@ -1323,8 +1717,8 @@ class RightArmPolicyExecutor:
         )
         print(
             "[policy-eef] remote_semantics="
-            "teleop_source mode treats policy eef_9d as OpenXR wrist/source pose; "
-            "it is anchored like remote engage_teleop and mapped to the selected robot TCP/control-link. "
+            "model observation eef_9d uses Nero CAN feedback-base FK; "
+            "default policy action/reference eef_9d uses Genesis/runtime world safe-target pose. "
             "rot6d=[R00,R10,R20,R01,R11,R21]",
             flush=True,
         )
@@ -1387,6 +1781,7 @@ class RightArmPolicyExecutor:
         self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         self._freeze_target_at_current_eef()
+        self._calibrate_policy_action_frame_to_initial_reference(reason="init_after_scene_step")
         self.reference_eef_9d = self.target_policy_eef_9d()
         if self.teleop_bridge is not None:
             self.teleop_bridge.reset_from_eef(self.current_eef_pose())
@@ -1399,11 +1794,13 @@ class RightArmPolicyExecutor:
         self.reference_eef_9d = self.initial_reference_eef_9d.copy()
         self.policy_hand_q_raw = self.initial_reference_hand_q.copy()
         self.reference_hand_q = self.initial_reference_hand_q.copy()
+        self.observation_hand_q = _l10_reported_hand_q_from_command(self.reference_hand_q)
         self.sim_hand_q = self._project_hand_q_for_sim(self.initial_hand_q)
         self.hand_q = self.sim_hand_q.copy()
         self._apply_linker_hand_target()
         harness._step_scene_with_attached_parts(self.scene)  # noqa: SLF001
         self._freeze_target_at_current_eef()
+        self._calibrate_policy_action_frame_to_initial_reference(reason="reset")
         self.reference_eef_9d = self.target_policy_eef_9d()
         if self.teleop_bridge is not None:
             self.teleop_bridge.reset_from_eef(self.current_eef_pose())
@@ -1448,13 +1845,7 @@ class RightArmPolicyExecutor:
             return np.zeros(3, dtype=np.float64), np.eye(3, dtype=np.float64)
         return self._arm_root_pose()
 
-    def world_pose_to_policy_pose(self, pose: np.ndarray) -> np.ndarray:
-        """Convert Genesis world EEF pose to the policy frame.
-
-        In the current combined-URDF scene, Genesis world is defined to be the
-        dual_nero_linker_l10_combined.urdf root/base frame.  Legacy split mode
-        still uses the right arm entity root for compatibility.
-        """
+    def _world_pose_to_policy_pose_uncalibrated(self, pose: np.ndarray) -> np.ndarray:
         pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
         arm_pos, arm_rotation = self._policy_world_root_pose()
         out = np.eye(4, dtype=np.float64)
@@ -1462,8 +1853,7 @@ class RightArmPolicyExecutor:
         out[:3, :3] = arm_rotation.T @ pose[:3, :3]
         return out
 
-    def policy_pose_to_world_pose(self, pose: np.ndarray) -> np.ndarray:
-        """Convert policy frame pose to Genesis world."""
+    def _policy_pose_to_world_pose_uncalibrated(self, pose: np.ndarray) -> np.ndarray:
         pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
         arm_pos, arm_rotation = self._policy_world_root_pose()
         out = np.eye(4, dtype=np.float64)
@@ -1471,11 +1861,68 @@ class RightArmPolicyExecutor:
         out[:3, :3] = arm_rotation @ pose[:3, :3]
         return out
 
+    def world_pose_to_policy_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Convert Genesis world EEF pose to the training policy action frame.
+
+        The combined URDF root is the Genesis world origin, but the finetune
+        data was exported in the older Nero runtime safe-target frame.  The
+        reset calibration below preserves that action/reference coordinate
+        contract while still executing IK in current Genesis world coordinates.
+        """
+        out = self._world_pose_to_policy_pose_uncalibrated(pose)
+        action_rotation = np.asarray(self.policy_action_frame_rotation, dtype=np.float64).reshape(3, 3)
+        action_translation = np.asarray(self.policy_action_frame_translation, dtype=np.float64).reshape(3)
+        out[:3, 3] = action_rotation @ out[:3, 3] + action_translation
+        out[:3, :3] = action_rotation @ out[:3, :3]
+        return out
+
+    def policy_pose_to_world_pose(self, pose: np.ndarray) -> np.ndarray:
+        """Convert training policy action-frame pose to Genesis world."""
+        pose = np.asarray(pose, dtype=np.float64).reshape(4, 4)
+        action_rotation = np.asarray(self.policy_action_frame_rotation, dtype=np.float64).reshape(3, 3)
+        action_translation = np.asarray(self.policy_action_frame_translation, dtype=np.float64).reshape(3)
+        uncalibrated = np.eye(4, dtype=np.float64)
+        uncalibrated[:3, 3] = action_rotation.T @ (pose[:3, 3] - action_translation)
+        uncalibrated[:3, :3] = action_rotation.T @ pose[:3, :3]
+        return self._policy_pose_to_world_pose_uncalibrated(uncalibrated)
+
+    def _calibrate_policy_action_frame_to_initial_reference(self, *, reason: str) -> None:
+        if self.policy_execution_mode != "robot_target":
+            return
+        current_pose = np.eye(4, dtype=np.float64)
+        current_pose[:3, 3] = np.asarray(self.target_xyz, dtype=np.float64).reshape(3)
+        current_pose[:3, :3] = np.asarray(self.target_rotation, dtype=np.float64).reshape(3, 3)
+        current_uncalibrated = self._world_pose_to_policy_pose_uncalibrated(current_pose)
+        desired = np.eye(4, dtype=np.float64)
+        desired[:3, 3] = self.initial_reference_eef_9d[:3].astype(np.float64)
+        desired[:3, :3] = _rot6d_to_rotmat(self.initial_reference_eef_9d[3:9])
+        action_rotation = desired[:3, :3] @ current_uncalibrated[:3, :3].T
+        action_translation = desired[:3, 3] - action_rotation @ current_uncalibrated[:3, 3]
+        self.policy_action_frame_rotation = action_rotation.astype(np.float64, copy=True)
+        self.policy_action_frame_translation = action_translation.astype(np.float64, copy=True)
+        check = self.world_pose_to_policy_pose(current_pose)
+        print(
+            "[policy-eef] action_frame_calibrated "
+            f"reason={reason} "
+            f"translation={tuple(round(float(v), 6) for v in self.policy_action_frame_translation)} "
+            f"reset_policy_xyz={tuple(round(float(v), 6) for v in check[:3, 3])} "
+            f"desired_xyz={tuple(round(float(v), 6) for v in desired[:3, 3])}",
+            flush=True,
+        )
+
     def current_policy_eef_pose(self) -> np.ndarray:
         return self.world_pose_to_policy_pose(self.current_eef_pose())
 
     def current_policy_eef_9d(self) -> np.ndarray:
         pose = self.current_policy_eef_pose()
+        return np.concatenate([pose[:3, 3].astype(np.float32), _rotmat_to_rot6d(pose[:3, :3])]).astype(np.float32)
+
+    def current_observation_eef_pose(self) -> np.ndarray:
+        """EEF pose for model observation, matching remote Nero CAN feedback."""
+        return nero_can_flange_pose_from_joints(self.current_actual_arm_q())
+
+    def current_observation_eef_9d(self) -> np.ndarray:
+        pose = self.current_observation_eef_pose()
         return np.concatenate([pose[:3, 3].astype(np.float32), _rotmat_to_rot6d(pose[:3, :3])]).astype(np.float32)
 
     def target_policy_eef_9d(self) -> np.ndarray:
@@ -1586,11 +2033,10 @@ class RightArmPolicyExecutor:
         return seed
 
     def current_observation_hand_q(self) -> np.ndarray:
-        # Match the GR00T training/evaluate chain: hand_joint_pos is the latest
-        # command-space L10 target, not Genesis' URDF-limited qpos feedback.
-        # Feeding a limit-projected state back into policy state/reference
-        # corrupts action-relative hand decoding.
-        return self.reference_hand_q.astype(np.float32, copy=True)
+        # Match the GR00T training capture chain: hand_joint_pos is Linker L10
+        # SDK get_state() reported proprioception in command-space joint units.
+        # It is related to, but not identical to, the hand_joint_target command.
+        return self.observation_hand_q.astype(np.float32, copy=True)
 
     def step_action(self, action: dict[str, np.ndarray], action_index: int) -> None:
         applied_hand = False
@@ -1624,6 +2070,7 @@ class RightArmPolicyExecutor:
                 self.policy_hand_q_raw,
                 previous_hand_q=self.reference_hand_q,
             )
+            self.observation_hand_q = _l10_reported_hand_q_from_command(self.reference_hand_q)
             self.sim_hand_q = self._project_hand_q_for_sim(self.reference_hand_q)
             self.hand_q = self.sim_hand_q.copy()
             self._apply_linker_hand_target()
@@ -1670,6 +2117,7 @@ class RightArmPolicyExecutor:
     def eef_frame_debug_snapshot(self) -> dict[str, Any]:
         current_world = self.current_eef_pose()
         current_policy = self.world_pose_to_policy_pose(current_world)
+        current_observation = self.current_observation_eef_pose()
         target_world = np.eye(4, dtype=np.float64)
         target_world[:3, 3] = self.target_xyz
         target_world[:3, :3] = self.target_rotation
@@ -1698,6 +2146,21 @@ class RightArmPolicyExecutor:
                 else "direct_robot_tcp_control_link_pose"
             ),
             "rot6d_convention": "[R00,R10,R20,R01,R11,R21]",
+            "observation_eef_frame": "nero_can_feedback_base",
+            "observation_eef_source": "offline_mdh_fk_from_current_7_joint_q",
+            "action_eef_frame": "genesis_runtime_world",
+            "reference_action_eef_frame": "genesis_runtime_world",
+            "action_eef_frame_calibration": {
+                "source": "reset_pose_to_training_initial_reference",
+                "translation": self.policy_action_frame_translation.tolist(),
+                "rotation_rot6d": _rotmat_to_rot6d(self.policy_action_frame_rotation).tolist(),
+            },
+            "hand_observation_source": "l10_sdk_reported_state_estimate_from_command_raw_mapping",
+            "right_mount_can_axis_semantics": {
+                "can_base_x": "physical_up",
+                "can_base_y": "physical_back",
+                "can_base_z": "physical_right",
+            },
             "teleop_bridge": None if self.teleop_bridge is None else dict(self.teleop_bridge.last_debug),
             "combined_urdf_world_frame": self.uses_combined_world_frame,
             "arm_root_world_pos": arm_pos.tolist(),
@@ -1706,6 +2169,8 @@ class RightArmPolicyExecutor:
             "current_world_rot6d": _rotmat_to_rot6d(current_world[:3, :3]).tolist(),
             "current_policy_xyz": current_policy[:3, 3].tolist(),
             "current_policy_rot6d": _rotmat_to_rot6d(current_policy[:3, :3]).tolist(),
+            "current_observation_xyz": current_observation[:3, 3].tolist(),
+            "current_observation_rot6d": _rotmat_to_rot6d(current_observation[:3, :3]).tolist(),
             "target_world_xyz": target_world[:3, 3].tolist(),
             "target_world_rot6d": _rotmat_to_rot6d(target_world[:3, :3]).tolist(),
             "target_policy_xyz": target_policy[:3, 3].tolist(),
@@ -2160,7 +2625,7 @@ class RightArmPolicyExecutor:
             joint4_limit_enabled=bool(self.ik_j4_limit),
             joint4_upper_rad=max(joint4_lower, joint4_upper),
         )
-        neutral = tuple(0.5 * (float(lower_limits[i]) + float(upper_limits[i])) for i in range(7))
+        neutral = tuple(float(v) for v in DEFAULT_INITIAL_RIGHT_ARM_Q)
         controller = FullPoseDifferentialIkController(
             FullPoseDifferentialIkControllerConfig(
                 seed_joint_positions_rad=tuple(float(v) for v in self.q_cmd[:7]),
@@ -2193,6 +2658,14 @@ class RightArmPolicyExecutor:
         self.differential_ik_runtime = runtime
         self.differential_ik_model = model
         self.differential_ik_controller = controller
+        print(
+            "[policy-ik] differential_controller "
+            f"neutral={tuple(round(float(v), 6) for v in neutral)} "
+            f"posture_bias_gain={float(self.ik_differential_posture_bias_gain):.6f} "
+            f"joint_limit_bias_gain={float(self.ik_differential_joint_limit_bias_gain):.6f} "
+            f"bias_weight={float(self.ik_differential_bias_weight):.6f}",
+            flush=True,
+        )
 
     def _apply_ik_joint4_search_limit(self, qpos: np.ndarray) -> np.ndarray:
         limited = np.asarray(qpos, dtype=np.float32).copy()
@@ -2500,6 +2973,12 @@ def _write_policy_replan_trace(
             "npz_path": str(npz_path),
             "arrays": _summarize_npz_arrays(arrays),
             "language": _jsonable(observation.get("language", {})),
+            "eef_frames": {
+                "observation_eef_frame": "nero_can_feedback_base",
+                "observation_eef_source": "offline_mdh_fk_from_current_7_joint_q",
+                "action_eef_frame": "genesis_runtime_world",
+                "reference_action_eef_frame": "genesis_runtime_world",
+            },
             "reference_action_source": str(reference_action_source),
             "rtc": {
                 "options": rtc_options,
@@ -3299,7 +3778,7 @@ def main() -> int:
         "--ego-roi-zoom",
         type=float,
         default=DEFAULT_EGO_ROI_ZOOM,
-        help="D455 ego_view center-crop digital zoom. Use 1.0 to disable; default matches remote RealSense collection.",
+        help="D455 ego_view center-crop digital zoom. Default 1.0 matches the smooth training videos' full-frame policy input.",
     )
     parser.add_argument(
         "--ego-roi-center-x",
@@ -3313,6 +3792,79 @@ def main() -> int:
         default=DEFAULT_EGO_ROI_CENTER_Y,
         help="D455 ego_view ROI center Y in normalized image coordinates.",
     )
+    parser.add_argument(
+        "--wrist-roi-zoom",
+        type=float,
+        default=DEFAULT_WRIST_ROI_ZOOM,
+        help="D405 wrist_view center-crop digital zoom. Default 1.0 keeps the full camera frame.",
+    )
+    parser.add_argument(
+        "--wrist-roi-center-x",
+        type=float,
+        default=DEFAULT_WRIST_ROI_CENTER_X,
+        help="D405 wrist_view ROI center X in normalized image coordinates.",
+    )
+    parser.add_argument(
+        "--wrist-roi-center-y",
+        type=float,
+        default=DEFAULT_WRIST_ROI_CENTER_Y,
+        help="D405 wrist_view ROI center Y in normalized image coordinates.",
+    )
+    parser.add_argument(
+        "--ego-image-rotate-deg",
+        type=int,
+        choices=(0, 90, 180, 270),
+        default=0,
+        help="Rotate ego_view model input after rendering/loading. Diagnostic only; default keeps source orientation.",
+    )
+    parser.add_argument(
+        "--wrist-image-rotate-deg",
+        type=int,
+        choices=(0, 90, 180, 270),
+        default=0,
+        help="Rotate wrist_view model input after rendering/loading. Diagnostic only; default keeps source orientation.",
+    )
+    parser.add_argument("--ego-image-flip-horizontal", action="store_true", help="Horizontally flip ego_view model input after rendering/loading.")
+    parser.add_argument("--ego-image-flip-vertical", action="store_true", help="Vertically flip ego_view model input after rendering/loading.")
+    parser.add_argument("--wrist-image-flip-horizontal", action="store_true", help="Horizontally flip wrist_view model input after rendering/loading.")
+    parser.add_argument("--wrist-image-flip-vertical", action="store_true", help="Vertically flip wrist_view model input after rendering/loading.")
+    parser.add_argument(
+        "--policy-video-source",
+        choices=("sim", "smooth_dataset"),
+        default="sim",
+        help="Use rendered simulator cameras or teacher-forced smooth dataset ego/wrist videos for policy input.",
+    )
+    parser.add_argument(
+        "--policy-video-smooth-dir",
+        type=Path,
+        default=DEFAULT_SMOOTH_REFERENCE_DIR,
+        help="Smooth dataset root used by --policy-video-source smooth_dataset.",
+    )
+    parser.add_argument(
+        "--policy-video-episode",
+        type=int,
+        default=0,
+        help="Smooth episode index used by --policy-video-source smooth_dataset.",
+    )
+    parser.add_argument(
+        "--policy-video-frame-offset",
+        type=int,
+        default=0,
+        help="Frame offset added to session-relative policy step for smooth video input.",
+    )
+    parser.add_argument(
+        "--policy-video-loop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Loop smooth video frames when --policy-video-source smooth_dataset runs past the episode length.",
+    )
+    parser.add_argument("--d455-rgb-fov", type=float, default=None, help="Override D455 RGB Genesis vertical FOV in degrees.")
+    parser.add_argument("--d455-base-rel-pos", type=_vec3, default=harness.D455_BASE_REL_POS_M, help="D455 body pose relative to combined/root frame, xyz meters.")
+    parser.add_argument("--d455-base-rel-euler", type=_vec3, default=harness.D455_BASE_REL_EULER_DEG, help="D455 body pose relative to combined/root frame, euler degrees.")
+    parser.add_argument("--d405-fov", type=float, default=None, help="Override right D405 Genesis vertical FOV in degrees.")
+    parser.add_argument("--d405-mount-json", type=Path, default=None, help="Load right D405 connector-relative pose from calibration JSON.")
+    parser.add_argument("--d405-connector-rel-pos", type=_vec3, default=None, help="Right D405 body pose relative to right connector, xyz meters. Overrides --d405-mount-json position.")
+    parser.add_argument("--d405-connector-rel-euler", type=_vec3, default=None, help="Right D405 body pose relative to right connector, euler degrees. Overrides --d405-mount-json orientation.")
     parser.add_argument("--policy-hz", type=float, default=2.0)
     parser.add_argument(
         "--wall-clock-replan",
@@ -3347,9 +3899,24 @@ def main() -> int:
     parser.add_argument("--ik-differential-max-task-step-m", type=float, default=0.03)
     parser.add_argument("--ik-differential-max-rotation-step-rad", type=float, default=math.radians(5.0))
     parser.add_argument("--ik-differential-damping-lambda", type=float, default=0.02)
-    parser.add_argument("--ik-differential-posture-bias-gain", type=float, default=0.04)
-    parser.add_argument("--ik-differential-joint-limit-bias-gain", type=float, default=0.35)
-    parser.add_argument("--ik-differential-bias-weight", type=float, default=0.08)
+    parser.add_argument(
+        "--ik-differential-posture-bias-gain",
+        type=float,
+        default=0.04,
+        help="Posture-bias gain for differential IK. Default matches remote NeroDualRobotConfig.",
+    )
+    parser.add_argument(
+        "--ik-differential-joint-limit-bias-gain",
+        type=float,
+        default=0.35,
+        help="Joint-limit bias gain for differential IK. Default matches remote NeroDualRobotConfig.",
+    )
+    parser.add_argument(
+        "--ik-differential-bias-weight",
+        type=float,
+        default=0.08,
+        help="DLS nullspace/bias regularization weight. Default matches remote NeroDualRobotConfig.",
+    )
     parser.add_argument("--ik-differential-joint-limit-soft-margin-rad", type=float, default=0.25)
     parser.add_argument("--ik-differential-max-joint-acceleration-rad-s2", type=float, default=0.0)
     parser.add_argument(
@@ -3390,7 +3957,7 @@ def main() -> int:
         "--initial-hand-q",
         type=_vec10,
         default=DEFAULT_INITIAL_HAND_Q,
-        help="Initial 10D L10 hand target in GR00T canonical order; defaults to the remote Teleop open pose.",
+        help="Initial 10D L10 hand target in GR00T canonical order; defaults to the smooth training reset command.",
     )
     parser.add_argument(
         "--initial-reference-eef-9d",
@@ -3403,6 +3970,40 @@ def main() -> int:
         type=_vec10,
         default=DEFAULT_INITIAL_REFERENCE_HAND_Q,
         help="Initial action-relative 10D hand command reference in GR00T canonical order.",
+    )
+    parser.add_argument(
+        "--policy-hand-reference-source",
+        choices=("executor_current", "smooth_action_frame", "smooth_full_action_frame"),
+        default="executor_current",
+        help=(
+            "Hand-only action-relative reference source. executor_current is the normal online mode; "
+            "smooth_action_frame teacher-forces hand_joint_target from the smooth dataset for diagnosis; "
+            "smooth_full_action_frame also teacher-forces eef_9d and arm_joint_target reference fields."
+        ),
+    )
+    parser.add_argument(
+        "--policy-hand-reference-smooth-dir",
+        type=Path,
+        default=DEFAULT_SMOOTH_REFERENCE_DIR,
+        help="Smooth dataset root used by --policy-hand-reference-source smooth_action_frame.",
+    )
+    parser.add_argument(
+        "--policy-hand-reference-episode",
+        type=int,
+        default=0,
+        help="Smooth episode index used by --policy-hand-reference-source smooth_action_frame.",
+    )
+    parser.add_argument(
+        "--policy-hand-reference-frame-offset",
+        type=int,
+        default=0,
+        help="Frame offset added to the session-relative policy step for smooth hand references.",
+    )
+    parser.add_argument(
+        "--policy-hand-reference-loop",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Loop smooth hand reference frames instead of clamping at the last frame.",
     )
     parser.add_argument("--initial-right-arm-q", type=_vec7, default=DEFAULT_INITIAL_RIGHT_ARM_Q)
     parser.add_argument("--initial-left-arm-q", type=_vec7, default=DEFAULT_INITIAL_LEFT_ARM_Q)
@@ -3432,11 +4033,10 @@ def main() -> int:
     parser.add_argument(
         "--policy-execution-mode",
         choices=("teleop_source", "robot_target"),
-        default="teleop_source",
+        default="robot_target",
         help=(
-            "teleop_source matches the remote live OpenXR teleop path: decoded eef_9d is an OpenXR wrist/source pose "
-            "that is anchored and mapped into the robot EEF target. robot_target treats eef_9d as a direct robot-frame "
-            "EEF command target for A/B debugging."
+            "robot_target treats decoded eef_9d as the Genesis/runtime safe-target pose used by training actions. "
+            "teleop_source is kept only as a legacy/debug mode that interprets decoded eef_9d as an OpenXR wrist/source pose."
         ),
     )
     parser.add_argument(
@@ -3504,6 +4104,12 @@ def main() -> int:
         raise SystemExit(f"--ego-roi-center-x must be in [0, 1], got {args.ego_roi_center_x}")
     if not 0.0 <= float(args.ego_roi_center_y) <= 1.0:
         raise SystemExit(f"--ego-roi-center-y must be in [0, 1], got {args.ego_roi_center_y}")
+    if float(args.wrist_roi_zoom) < 1.0:
+        raise SystemExit(f"--wrist-roi-zoom must be >= 1.0, got {args.wrist_roi_zoom}")
+    if not 0.0 <= float(args.wrist_roi_center_x) <= 1.0:
+        raise SystemExit(f"--wrist-roi-center-x must be in [0, 1], got {args.wrist_roi_center_x}")
+    if not 0.0 <= float(args.wrist_roi_center_y) <= 1.0:
+        raise SystemExit(f"--wrist-roi-center-y must be in [0, 1], got {args.wrist_roi_center_y}")
     policy = _make_policy(args)
     modality_config = policy.get_modality_config()
     _validate_policy_video_schema(modality_config)
@@ -3520,6 +4126,18 @@ def main() -> int:
     action_dt_s = 1.0 / max(float(args.action_fps), 1.0e-6)
 
     print(f"[scene] creating add_scene_glb scene image_size={image_size}", flush=True)
+    d405_connector_rel_pos, d405_connector_rel_euler, d405_mount_source = harness.resolve_d405_mount_args(
+        mount_json=args.d405_mount_json,
+        rel_pos=args.d405_connector_rel_pos,
+        rel_euler=args.d405_connector_rel_euler,
+    )
+    print(
+        "[camera] d405_mount "
+        f"source={d405_mount_source} "
+        f"pos={tuple(round(float(v), 6) for v in d405_connector_rel_pos)} "
+        f"euler_deg={tuple(round(float(v), 3) for v in d405_connector_rel_euler)}",
+        flush=True,
+    )
     scene, _ = harness.create_scene(
         show_viewer=not bool(args.no_viewer),
         backend=args.backend,
@@ -3541,7 +4159,13 @@ def main() -> int:
         initial_base_pos=(0.0, 0.0, 0.0),
         initial_base_euler=(0.0, 0.0, 0.0),
         d455_rgb_gui=False,
+        d455_rgb_fov=args.d455_rgb_fov,
+        d455_base_rel_pos=args.d455_base_rel_pos,
+        d455_base_rel_euler=args.d455_base_rel_euler,
         d405_camera_gui=False,
+        d405_fov=args.d405_fov,
+        d405_connector_rel_pos=d405_connector_rel_pos,
+        d405_connector_rel_euler=d405_connector_rel_euler,
         linker_hand_collision=True,
     )
     ego_camera, wrist_camera = _create_policy_cameras(scene, image_size=image_size)
@@ -3549,7 +4173,23 @@ def main() -> int:
         "[camera] ego_view_roi "
         f"zoom={float(args.ego_roi_zoom):.2f} "
         f"center=({float(args.ego_roi_center_x):.2f}, {float(args.ego_roi_center_y):.2f}) "
-        "source=remote_realsense_collection",
+        "source=smooth_training_full_frame_default",
+        flush=True,
+    )
+    print(
+        "[camera] wrist_view_roi "
+        f"zoom={float(args.wrist_roi_zoom):.2f} "
+        f"center=({float(args.wrist_roi_center_x):.2f}, {float(args.wrist_roi_center_y):.2f})",
+        flush=True,
+    )
+    print(
+        "[camera] policy_image_postprocess "
+        f"ego_rotate_deg={int(args.ego_image_rotate_deg)} "
+        f"ego_flip_h={bool(args.ego_image_flip_horizontal)} "
+        f"ego_flip_v={bool(args.ego_image_flip_vertical)} "
+        f"wrist_rotate_deg={int(args.wrist_image_rotate_deg)} "
+        f"wrist_flip_h={bool(args.wrist_image_flip_horizontal)} "
+        f"wrist_flip_v={bool(args.wrist_image_flip_vertical)}",
         flush=True,
     )
     executor = RightArmPolicyExecutor(
@@ -3594,11 +4234,47 @@ def main() -> int:
         policy_orientation_max_speed_rad_s=float(args.policy_orientation_max_speed_rad_s),
         action_dt_s=action_dt_s,
     )
+    smooth_reference_provider: SmoothReferenceProvider | None = None
+    if str(args.policy_hand_reference_source) in {"smooth_action_frame", "smooth_full_action_frame"}:
+        smooth_reference_provider = SmoothReferenceProvider(
+            smooth_dir=args.policy_hand_reference_smooth_dir,
+            episode_index=int(args.policy_hand_reference_episode),
+            frame_offset=int(args.policy_hand_reference_frame_offset),
+            loop=bool(args.policy_hand_reference_loop),
+        )
+        print(
+            f"[policy-hand-reference] {args.policy_hand_reference_source} "
+            f"episode={smooth_reference_provider.episode_index} "
+            f"frames={smooth_reference_provider.length} "
+            f"offset={smooth_reference_provider.frame_offset} "
+            f"loop={smooth_reference_provider.loop} "
+            f"path={smooth_reference_provider.path}",
+            flush=True,
+        )
     obs_builder = Gr00tObservationBuilder(
         modality_config=modality_config,
         instruction=str(args.instruction),
         image_size=image_size,
     )
+    smooth_video_provider: SmoothVideoProvider | None = None
+    if str(args.policy_video_source) == "smooth_dataset":
+        smooth_video_provider = SmoothVideoProvider(
+            smooth_dir=args.policy_video_smooth_dir,
+            episode_index=int(args.policy_video_episode),
+            image_size=image_size,
+            frame_offset=int(args.policy_video_frame_offset),
+            loop=bool(args.policy_video_loop),
+        )
+        print(
+            "[policy-video] smooth_dataset "
+            f"episode={smooth_video_provider.episode_index} "
+            f"frames={smooth_video_provider.length} "
+            f"offset={smooth_video_provider.frame_offset} "
+            f"loop={smooth_video_provider.loop} "
+            f"ego={smooth_video_provider.ego_path} "
+            f"wrist={smooth_video_provider.wrist_path}",
+            flush=True,
+        )
     print(
         "[policy] ready "
         f"instruction={args.instruction!r} image_size={image_size}",
@@ -3648,6 +4324,7 @@ def main() -> int:
     trace_session_id = ""
     trace_replan_index = 0
     last_policy_running = False
+    policy_session_start_step = 0
     if policy_trace_dir is not None:
         policy_trace_dir = policy_trace_dir.expanduser()
         policy_trace_dir.mkdir(parents=True, exist_ok=True)
@@ -3668,6 +4345,7 @@ def main() -> int:
                 trace_session_index += 1
                 trace_session_id = _new_policy_trace_session_id(trace_session_index)
                 trace_replan_index = 0
+                policy_session_start_step = int(step_count)
                 _append_policy_trace_event(
                     policy_trace_dir,
                     session_id=trace_session_id,
@@ -3732,16 +4410,55 @@ def main() -> int:
                         roi_center_x=float(args.ego_roi_center_x),
                         roi_center_y=float(args.ego_roi_center_y),
                     )
-                    wrist = _render_camera_rgb(wrist_camera, image_size=image_size)
+                    wrist = _render_camera_rgb(
+                        wrist_camera,
+                        image_size=image_size,
+                        roi_zoom=float(args.wrist_roi_zoom),
+                        roi_center_x=float(args.wrist_roi_center_x),
+                        roi_center_y=float(args.wrist_roi_center_y),
+                    )
+                    video_source_metadata: dict[str, Any] = {"source": "sim"}
+                    if smooth_video_provider is not None:
+                        relative_video_step = int(step_count) - int(policy_session_start_step)
+                        ego, wrist, video_source_metadata = smooth_video_provider.frame_at_step(relative_video_step)
+                    ego = _postprocess_policy_image(
+                        ego,
+                        rotate_deg=int(args.ego_image_rotate_deg),
+                        flip_horizontal=bool(args.ego_image_flip_horizontal),
+                        flip_vertical=bool(args.ego_image_flip_vertical),
+                    )
+                    wrist = _postprocess_policy_image(
+                        wrist,
+                        rotate_deg=int(args.wrist_image_rotate_deg),
+                        flip_horizontal=bool(args.wrist_image_flip_horizontal),
+                        flip_vertical=bool(args.wrist_image_flip_vertical),
+                    )
+                    video_source_metadata["ego_image_postprocess"] = {
+                        "rotate_deg": int(args.ego_image_rotate_deg),
+                        "flip_horizontal": bool(args.ego_image_flip_horizontal),
+                        "flip_vertical": bool(args.ego_image_flip_vertical),
+                    }
+                    video_source_metadata["wrist_image_postprocess"] = {
+                        "rotate_deg": int(args.wrist_image_rotate_deg),
+                        "flip_horizontal": bool(args.wrist_image_flip_horizontal),
+                        "flip_vertical": bool(args.wrist_image_flip_vertical),
+                    }
                     camera_preview.show(ego=ego, wrist=wrist)
                     obs_builder.append_frame(ego=ego, wrist=wrist)
                     reference_action = executor.current_reference_action()
                     observation_arm_q = executor.current_arm_q()
                     observation_hand_q = executor.current_observation_hand_q()
+                    observation_eef_pose = executor.current_observation_eef_pose()
+                    observation_eef_9d = np.concatenate(
+                        [
+                            observation_eef_pose[:3, 3].astype(np.float32),
+                            _rotmat_to_rot6d(observation_eef_pose[:3, :3]),
+                        ]
+                    ).astype(np.float32)
                     observation = obs_builder.build(
                         arm_q=observation_arm_q,
-                        eef_pose=executor.current_eef_pose(),
-                        policy_eef_9d=executor.current_policy_eef_9d(),
+                        eef_pose=observation_eef_pose,
+                        policy_eef_9d=observation_eef_9d,
                         hand_q=observation_hand_q,
                         reference_action=reference_action,
                     )
@@ -3777,6 +4494,25 @@ def main() -> int:
                     reference_action_source = "rtc_seed" if rtc_reference_action is not None else "executor_current"
                     if rtc_reference_action is not None:
                         reference_action = rtc_reference_action
+                    reference_override_metadata: dict[str, Any] | None = None
+                    if smooth_reference_provider is not None:
+                        relative_step = int(step_count) - int(policy_session_start_step)
+                        reference_action = {
+                            key: np.asarray(value, dtype=np.float32, copy=True)
+                            for key, value in reference_action.items()
+                        }
+                        if str(args.policy_hand_reference_source) == "smooth_full_action_frame":
+                            smooth_reference, reference_override_metadata = (
+                                smooth_reference_provider.full_reference_at_step(relative_step)
+                            )
+                            reference_action.update(smooth_reference)
+                            reference_action_source = f"{reference_action_source}+smooth_full_reference"
+                        else:
+                            hand_reference, reference_override_metadata = (
+                                smooth_reference_provider.hand_reference_at_step(relative_step)
+                            )
+                            reference_action["hand_joint_target"] = hand_reference
+                            reference_action_source = f"{reference_action_source}+smooth_hand_reference"
                     tic = time.perf_counter()
                     policy_action_chunk, policy_info = _policy_get_action_cpu_processor(
                         policy,
@@ -3806,6 +4542,9 @@ def main() -> int:
                         reference_action_source=reference_action_source,
                         observation_hand_q=observation_hand_q,
                     )
+                    if reference_override_metadata is not None:
+                        hand_debug["reference_override_metadata"] = _jsonable(reference_override_metadata)
+                    hand_debug["video_source"] = _jsonable(video_source_metadata)
                     rtc_store_action_chunk = executor.rtc_seed_action_from_command_chunk(
                         action_chunk,
                         observation_arm_q=observation_arm_q,
@@ -3821,7 +4560,7 @@ def main() -> int:
                         observation=observation,
                         observation_arm_q=observation_arm_q,
                         observation_hand_q=observation_hand_q,
-                        observation_eef_pose=executor.current_eef_pose(),
+                        observation_eef_pose=observation_eef_pose,
                         reference_action=reference_action,
                         reference_action_source=reference_action_source,
                         rtc_seed_action=rtc_seed_action,
@@ -3868,6 +4607,7 @@ def main() -> int:
                             if rtc_seed_action is None
                             else _jsonable_action(rtc_seed_action),
                             "reference_action": _jsonable_action(reference_action),
+                            "video_source": _jsonable(video_source_metadata),
                             "action_summary": _summarize_action_chunk(action_chunk),
                             "rtc_stored_seed_action_summary": _summarize_action_chunk(rtc_store_action_chunk),
                             "policy_raw_action_summary": _summarize_action_chunk(policy_action_chunk),
@@ -3933,6 +4673,8 @@ def main() -> int:
             )
         eef_trajectory_overlay.clear()
         camera_preview.close()
+        if smooth_video_provider is not None:
+            smooth_video_provider.close()
         _shutdown_panel(panel)
     print(f"[done] steps={step_count}", flush=True)
     return 0
