@@ -22,7 +22,7 @@ from PIL import Image
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 ISAAC_GROOT_ROOT = Path(os.environ.get("ISAAC_GROOT_ROOT", ROOT_DIR.parent / "Isaac-GR00T"))
-DEFAULT_POLICY_CHECKPOINT = ROOT_DIR / "checkpoints" / "finetune" / "checkpoint-59000"
+DEFAULT_POLICY_CHECKPOINT = ROOT_DIR / "checkpoints" / "finetune" / "checkpoint-20000"
 DEFAULT_COSMOS_MODEL = ROOT_DIR / "checkpoints" / "nvidia" / "Cosmos-Reason2-2B"
 DEFAULT_TASK = "pick up the bottle with green cap and place it in the white rectangle area"
 DEFAULT_IMAGE_SIZE = (180, 320)
@@ -128,7 +128,7 @@ DEFAULT_IK_J4_LIMIT_RAD = (0.0, 2.14)
 DEFAULT_POLICY_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_policy_debug.jsonl"
 DEFAULT_POLICY_TELEOP_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_finetune_teleop_bridge.jsonl"
 DEFAULT_POLICY_TRACE_DIR = ROOT_DIR / "logs" / "groot_finetune_policy_trace"
-DEFAULT_SMOOTH_REFERENCE_DIR = (
+DEFAULT_SMOOTH_DATASET_DIR = (
     ROOT_DIR.parent / "Isaac-GR00T" / "outputs" / "IsaacLab" / "nero" / "mission2" / "smooth"
 )
 DEFAULT_POLICY_TRANSLATION_SCALE = (0.6, 0.6, 0.6)
@@ -613,6 +613,69 @@ def _postprocess_policy_image(
     return np.ascontiguousarray(arr).astype(np.uint8, copy=False)
 
 
+def _capture_policy_model_inputs(
+    *,
+    ego_camera: object | None,
+    wrist_camera: object | None,
+    image_size: tuple[int, int],
+    ego_roi_zoom: float,
+    ego_roi_center_x: float,
+    ego_roi_center_y: float,
+    wrist_roi_zoom: float,
+    wrist_roi_center_x: float,
+    wrist_roi_center_y: float,
+    ego_rotate_deg: int,
+    ego_flip_horizontal: bool,
+    ego_flip_vertical: bool,
+    wrist_rotate_deg: int,
+    wrist_flip_horizontal: bool,
+    wrist_flip_vertical: bool,
+    smooth_video_provider: Any | None = None,
+    smooth_video_step: int = 0,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    if smooth_video_provider is not None:
+        ego, wrist, video_source_metadata = smooth_video_provider.frame_at_step(int(smooth_video_step))
+    else:
+        ego = _render_camera_rgb(
+            ego_camera,
+            image_size=image_size,
+            roi_zoom=float(ego_roi_zoom),
+            roi_center_x=float(ego_roi_center_x),
+            roi_center_y=float(ego_roi_center_y),
+        )
+        wrist = _render_camera_rgb(
+            wrist_camera,
+            image_size=image_size,
+            roi_zoom=float(wrist_roi_zoom),
+            roi_center_x=float(wrist_roi_center_x),
+            roi_center_y=float(wrist_roi_center_y),
+        )
+        video_source_metadata = {"source": "sim"}
+    ego = _postprocess_policy_image(
+        ego,
+        rotate_deg=int(ego_rotate_deg),
+        flip_horizontal=bool(ego_flip_horizontal),
+        flip_vertical=bool(ego_flip_vertical),
+    )
+    wrist = _postprocess_policy_image(
+        wrist,
+        rotate_deg=int(wrist_rotate_deg),
+        flip_horizontal=bool(wrist_flip_horizontal),
+        flip_vertical=bool(wrist_flip_vertical),
+    )
+    video_source_metadata["ego_image_postprocess"] = {
+        "rotate_deg": int(ego_rotate_deg),
+        "flip_horizontal": bool(ego_flip_horizontal),
+        "flip_vertical": bool(ego_flip_vertical),
+    }
+    video_source_metadata["wrist_image_postprocess"] = {
+        "rotate_deg": int(wrist_rotate_deg),
+        "flip_horizontal": bool(wrist_flip_horizontal),
+        "flip_vertical": bool(wrist_flip_vertical),
+    }
+    return ego, wrist, video_source_metadata
+
+
 def _bottle_panel_main(initial_values, values, policy_running, sim_running, reset_counter, stop_flag) -> None:
     import tkinter as tk
     from tkinter import ttk
@@ -844,9 +907,18 @@ class CameraPreview:
         self.enabled = bool(enabled)
         self.scale = max(1, int(scale))
         self._cv2 = None
+        self._tk = None
+        self._image_tk = None
+        self._root = None
+        self._labels: dict[str, object] = {}
+        self._photo_images: dict[str, object] = {}
+        self._backend: str | None = None
         self._available = False
         self._warned = False
-        self._windows = ("GR00T ego_view model input", "GR00T wrist_view model input")
+        self._windows = (
+            "GR00T wrist_view model input (cropped)",
+            "GR00T ego_view model input (cropped)",
+        )
 
     def _ensure(self) -> bool:
         if not self.enabled:
@@ -863,52 +935,129 @@ class CameraPreview:
             import cv2  # type: ignore[import-not-found]
         except Exception as exc:
             if not self._warned:
-                print(f"[camera-preview] disabled: failed to import cv2: {exc}", flush=True)
+                print(f"[camera-preview] OpenCV unavailable, trying Tk preview: {exc}", flush=True)
                 self._warned = True
-            self.enabled = False
-            return False
+            return self._ensure_tk()
         self._cv2 = cv2
         try:
             for name in self._windows:
                 cv2.namedWindow(name, cv2.WINDOW_NORMAL)
         except Exception as exc:
             if not self._warned:
-                print(f"[camera-preview] disabled: failed to create OpenCV windows: {exc}", flush=True)
+                print(f"[camera-preview] OpenCV window unavailable, trying Tk preview: {exc}", flush=True)
+                self._warned = True
+            self._cv2 = None
+            return self._ensure_tk()
+        self._available = True
+        self._backend = "opencv"
+        print(
+            "[camera-preview] showing cropped wrist_view and ego_view model inputs with OpenCV; "
+            "press q in a preview window to close previews",
+            flush=True,
+        )
+        return True
+
+    def _ensure_tk(self) -> bool:
+        if self._available and self._backend == "tk":
+            return True
+        try:
+            import tkinter as tk
+            from PIL import ImageTk
+        except Exception as exc:
+            if not self._warned:
+                print(f"[camera-preview] disabled: failed to import Tk preview backend: {exc}", flush=True)
                 self._warned = True
             self.enabled = False
             return False
+        try:
+            root = tk.Toplevel() if tk._default_root is not None else tk.Tk()
+            root.title("GR00T model input preview")
+            root.protocol("WM_DELETE_WINDOW", self._close_from_user)
+            for col, name in enumerate(self._windows):
+                title = tk.Label(root, text=name)
+                title.grid(row=0, column=col, padx=4, pady=(4, 0))
+                label = tk.Label(root)
+                label.grid(row=1, column=col, padx=4, pady=4)
+                self._labels[name] = label
+        except Exception as exc:
+            if not self._warned:
+                print(f"[camera-preview] disabled: failed to create Tk preview window: {exc}", flush=True)
+                self._warned = True
+            self.enabled = False
+            return False
+        self._tk = tk
+        self._image_tk = ImageTk
+        self._root = root
         self._available = True
-        print("[camera-preview] showing ego_view and wrist_view model inputs; press q in a preview window to close previews", flush=True)
+        self._backend = "tk"
+        print("[camera-preview] showing cropped wrist_view and ego_view model inputs with Tk", flush=True)
         return True
 
     def show(self, *, ego: np.ndarray, wrist: np.ndarray) -> None:
         if not self._ensure():
             return
-        assert self._cv2 is not None
-        cv2 = self._cv2
-        for name, image in ((self._windows[0], ego), (self._windows[1], wrist)):
+        for name, image in ((self._windows[0], wrist), (self._windows[1], ego)):
             frame = np.asarray(image)
             if frame.ndim != 3 or frame.shape[-1] != 3:
                 continue
-            if self.scale > 1:
-                height, width = frame.shape[:2]
-                frame = cv2.resize(frame, (width * self.scale, height * self.scale), interpolation=cv2.INTER_NEAREST)
-            cv2.imshow(name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        key = cv2.waitKey(1) & 0xFF
-        if key in (ord("q"), 27):
-            self.close()
-            self.enabled = False
-            print("[camera-preview] closed", flush=True)
+            if self._backend == "opencv":
+                assert self._cv2 is not None
+                cv2 = self._cv2
+                if self.scale > 1:
+                    height, width = frame.shape[:2]
+                    frame = cv2.resize(frame, (width * self.scale, height * self.scale), interpolation=cv2.INTER_NEAREST)
+                cv2.imshow(name, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+            elif self._backend == "tk":
+                assert self._image_tk is not None
+                if self.scale > 1:
+                    height, width = frame.shape[:2]
+                    pil_image = Image.fromarray(frame).resize((width * self.scale, height * self.scale), Image.Resampling.NEAREST)
+                else:
+                    pil_image = Image.fromarray(frame)
+                photo = self._image_tk.PhotoImage(pil_image)
+                label = self._labels.get(name)
+                if label is not None:
+                    label.configure(image=photo)
+                self._photo_images[name] = photo
+        if self._backend == "opencv":
+            assert self._cv2 is not None
+            key = self._cv2.waitKey(1) & 0xFF
+            if key in (ord("q"), 27):
+                self.close()
+                self.enabled = False
+                print("[camera-preview] closed", flush=True)
+        elif self._backend == "tk" and self._root is not None:
+            try:
+                self._root.update_idletasks()
+                self._root.update()
+            except Exception:
+                self.close()
+                self.enabled = False
 
     def close(self) -> None:
-        if not self._available or self._cv2 is None:
+        if not self._available:
             return
-        for name in self._windows:
+        if self._backend == "opencv" and self._cv2 is not None:
+            for name in self._windows:
+                try:
+                    self._cv2.destroyWindow(name)
+                except Exception:
+                    pass
+        elif self._backend == "tk" and self._root is not None:
             try:
-                self._cv2.destroyWindow(name)
+                self._root.destroy()
             except Exception:
                 pass
+            self._root = None
+            self._labels.clear()
+            self._photo_images.clear()
         self._available = False
+        self._backend = None
+
+    def _close_from_user(self) -> None:
+        self.close()
+        self.enabled = False
+        print("[camera-preview] closed", flush=True)
 
 
 class EefChunkTrajectoryOverlay:
@@ -1109,7 +1258,6 @@ class Gr00tObservationBuilder:
         eef_pose: np.ndarray,
         policy_eef_9d: np.ndarray | None = None,
         hand_q: np.ndarray,
-        reference_action: dict[str, np.ndarray],
     ) -> dict[str, Any]:
         frames = self._select_history_frames()
         video: dict[str, np.ndarray] = {}
@@ -1139,8 +1287,8 @@ class Gr00tObservationBuilder:
             "arm_eef_rot6d": eef_rot6d,
             "hand_joint_pos": hand_10,
             "arm_joint_pos": arm_7,
-            "hand_joint_target": reference_action["hand_joint_target"].reshape(-1).astype(np.float32),
-            "arm_joint_target": reference_action["arm_joint_target"].reshape(-1).astype(np.float32),
+            "hand_joint_target": hand_10,
+            "arm_joint_target": arm_7,
         }
         state = {}
         for key in self.modality_config["state"].modality_keys:
@@ -1150,85 +1298,6 @@ class Gr00tObservationBuilder:
 
         language = {key: [[self.instruction]] for key in self.modality_config["language"].modality_keys}
         return {"video": video, "state": state, "language": language}
-
-
-class SmoothReferenceProvider:
-    """Teacher-forced smooth dataset reference_action(t) for diagnosis."""
-
-    def __init__(
-        self,
-        *,
-        smooth_dir: Path,
-        episode_index: int,
-        frame_offset: int = 0,
-        loop: bool = False,
-    ) -> None:
-        self.smooth_dir = smooth_dir.expanduser().resolve()
-        self.episode_index = int(episode_index)
-        self.frame_offset = int(frame_offset)
-        self.loop = bool(loop)
-        path = self.smooth_dir / "data" / f"chunk-{self.episode_index // 1000:03d}" / f"episode_{self.episode_index:06d}.parquet"
-        if not path.exists():
-            raise FileNotFoundError(f"Smooth reference episode not found: {path}")
-        try:
-            import pyarrow.parquet as pq
-        except Exception as exc:
-            raise RuntimeError(
-                "Reading --policy-hand-reference-source smooth_action_frame requires pyarrow in this environment."
-            ) from exc
-        table = pq.read_table(path, columns=["observation.state", "action"])
-        state = np.asarray(table.column("observation.state").to_pylist(), dtype=np.float32)
-        action = np.asarray(table.column("action").to_pylist(), dtype=np.float32)
-        if state.ndim != 2 or state.shape[1] < 7:
-            raise ValueError(f"Unexpected smooth observation.state shape for {path}: {state.shape}")
-        if action.ndim != 2 or action.shape[1] < 19:
-            raise ValueError(f"Unexpected smooth action shape for {path}: {action.shape}")
-        self.path = path
-        self.arm_state = state[:, 0:7].astype(np.float32, copy=True)
-        self.eef_action = action[:, 0:9].astype(np.float32, copy=True)
-        self.hand_action = action[:, 9:19].astype(np.float32, copy=True)
-
-    @property
-    def length(self) -> int:
-        return int(self.hand_action.shape[0])
-
-    def _index_for_step(self, step_count: int) -> tuple[int, int]:
-        raw_index = int(step_count) + self.frame_offset
-        if self.loop and self.length > 0:
-            index = raw_index % self.length
-        else:
-            index = max(0, min(raw_index, self.length - 1))
-        return raw_index, index
-
-    def hand_reference_at_step(self, step_count: int) -> tuple[np.ndarray, dict[str, Any]]:
-        raw_index, index = self._index_for_step(step_count)
-        hand = self.hand_action[index : index + 1].astype(np.float32, copy=True)
-        return hand, {
-            "source": "smooth_action_frame",
-            "smooth_dir": str(self.smooth_dir),
-            "episode_index": int(self.episode_index),
-            "frame_index": int(index),
-            "raw_frame_index": int(raw_index),
-            "loop": bool(self.loop),
-            "path": str(self.path),
-        }
-
-    def full_reference_at_step(self, step_count: int) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-        raw_index, index = self._index_for_step(step_count)
-        reference = {
-            "eef_9d": self.eef_action[index : index + 1].astype(np.float32, copy=True),
-            "hand_joint_target": self.hand_action[index : index + 1].astype(np.float32, copy=True),
-            "arm_joint_target": self.arm_state[index : index + 1].astype(np.float32, copy=True),
-        }
-        return reference, {
-            "source": "smooth_full_action_frame",
-            "smooth_dir": str(self.smooth_dir),
-            "episode_index": int(self.episode_index),
-            "frame_index": int(index),
-            "raw_frame_index": int(raw_index),
-            "loop": bool(self.loop),
-            "path": str(self.path),
-        }
 
 
 class SmoothVideoProvider:
@@ -1984,20 +2053,6 @@ class RightArmPolicyExecutor:
             flush=True,
         )
 
-    def current_reference_action(self) -> dict[str, np.ndarray]:
-        if self.teleop_bridge is not None:
-            eef_9d = self.teleop_bridge.current_reference_eef_9d()
-        else:
-            eef_9d = self.reference_eef_9d.astype(np.float32, copy=True)
-        arm_joint_target = np.zeros(7, dtype=np.float32)
-        actual_arm_q = self.current_actual_arm_q()
-        arm_joint_target[: min(7, actual_arm_q.size)] = actual_arm_q[: min(7, actual_arm_q.size)]
-        return {
-            "eef_9d": eef_9d[None, :],
-            "hand_joint_target": self.reference_hand_q[:10][None, :].astype(np.float32),
-            "arm_joint_target": arm_joint_target[None, :],
-        }
-
     def rtc_seed_action_from_command_chunk(
         self,
         action: dict[str, np.ndarray],
@@ -2149,7 +2204,6 @@ class RightArmPolicyExecutor:
             "observation_eef_frame": "nero_can_feedback_base",
             "observation_eef_source": "offline_mdh_fk_from_current_7_joint_q",
             "action_eef_frame": "genesis_runtime_world",
-            "reference_action_eef_frame": "genesis_runtime_world",
             "action_eef_frame_calibration": {
                 "source": "reset_pose_to_training_initial_reference",
                 "translation": self.policy_action_frame_translation.tolist(),
@@ -2175,8 +2229,6 @@ class RightArmPolicyExecutor:
             "target_world_rot6d": _rotmat_to_rot6d(target_world[:3, :3]).tolist(),
             "target_policy_xyz": target_policy[:3, 3].tolist(),
             "target_policy_rot6d": _rotmat_to_rot6d(target_policy[:3, :3]).tolist(),
-            "reference_action_policy_xyz": self.reference_eef_9d[:3].tolist(),
-            "reference_action_policy_rot6d": self.reference_eef_9d[3:9].tolist(),
             "arm_ik_mode": self.arm_ik_mode,
             "differential_ik": self.last_differential_ik_debug,
             "workspace_clamp": self.workspace_clamp,
@@ -2288,9 +2340,7 @@ class RightArmPolicyExecutor:
         policy_action_chunk: dict[str, np.ndarray],
         clipped_action_chunk: dict[str, np.ndarray],
         guarded_action_chunk: dict[str, np.ndarray],
-        reference_action: dict[str, np.ndarray],
         rtc_seed_action: dict[str, np.ndarray] | None,
-        reference_action_source: str,
         observation_hand_q: np.ndarray,
     ) -> dict[str, Any]:
         raw_hand = _first_batch_chunk(policy_action_chunk, "hand_joint_target") if "hand_joint_target" in policy_action_chunk else None
@@ -2307,20 +2357,17 @@ class RightArmPolicyExecutor:
             if "hand_joint_target" in guarded_action_chunk
             else None
         )
-        reference_hand = np.asarray(reference_action.get("hand_joint_target", self.reference_hand_q[None, :]), dtype=np.float32)
         rtc_seed_hand = None
         if rtc_seed_action is not None and "hand_joint_target" in rtc_seed_action:
             rtc_seed_hand = _first_batch_chunk(rtc_seed_action, "hand_joint_target")[:1]
-        reference_hand_flat = reference_hand.reshape(-1)[:10].astype(np.float32, copy=True)
+        executor_hand_flat = self.reference_hand_q.reshape(-1)[:10].astype(np.float32, copy=True)
         return {
-            "reference_hand_source": str(reference_action_source),
             "policy_raw_unclipped": _hand_chunk_debug(raw_hand),
-            "policy_raw_delta_from_reference": _hand_chunk_delta_debug(raw_hand, reference_hand_flat),
+            "policy_raw_delta_from_executor_hand": _hand_chunk_delta_debug(raw_hand, executor_hand_flat),
             "policy_clipped_probe_range": _hand_chunk_debug(clipped_hand),
             "guarded_command_range": _hand_chunk_debug(guarded_hand),
-            "guarded_delta_from_reference": _hand_chunk_delta_debug(guarded_hand, reference_hand_flat),
+            "guarded_delta_from_executor_hand": _hand_chunk_delta_debug(guarded_hand, executor_hand_flat),
             "sim_hand_projected_range": _hand_chunk_debug(sim_hand),
-            "reference_hand_first": _named_hand_values(reference_hand_flat),
             "rtc_seed_hand_first": None if rtc_seed_hand is None else _named_hand_values(rtc_seed_hand.reshape(-1)[:10]),
             "observation_hand_state": _named_hand_values(observation_hand_q),
             "actual_hand_state": _named_hand_values(self._current_linker_hand_q(fallback=self.sim_hand_q)),
@@ -2921,8 +2968,6 @@ def _write_policy_replan_trace(
     observation_arm_q: np.ndarray,
     observation_hand_q: np.ndarray,
     observation_eef_pose: np.ndarray,
-    reference_action: dict[str, np.ndarray],
-    reference_action_source: str,
     rtc_seed_action: dict[str, np.ndarray] | None,
     rtc_options: dict[str, Any] | None,
     rtc_metadata: dict[str, Any],
@@ -2948,7 +2993,6 @@ def _write_policy_replan_trace(
     _collect_npz_arrays("observation.arm_q", observation_arm_q, arrays)
     _collect_npz_arrays("observation.hand_q", observation_hand_q, arrays)
     _collect_npz_arrays("observation.eef_pose", observation_eef_pose, arrays)
-    _collect_npz_arrays("reference_action", reference_action, arrays)
     _collect_npz_arrays("rtc_seed_action", rtc_seed_action, arrays)
     _collect_npz_arrays("policy_raw_action", policy_action_chunk, arrays)
     _collect_npz_arrays("raw_stored_action", raw_stored_action, arrays)
@@ -2977,9 +3021,7 @@ def _write_policy_replan_trace(
                 "observation_eef_frame": "nero_can_feedback_base",
                 "observation_eef_source": "offline_mdh_fk_from_current_7_joint_q",
                 "action_eef_frame": "genesis_runtime_world",
-                "reference_action_eef_frame": "genesis_runtime_world",
             },
-            "reference_action_source": str(reference_action_source),
             "rtc": {
                 "options": rtc_options,
                 "metadata": rtc_metadata,
@@ -3015,19 +3057,25 @@ class DryRunPolicy:
 
     def get_action(self, observation: dict[str, Any], options: dict[str, Any] | None = None) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         self.count += 1
-        reference = (options or {}).get("reference_action") or {}
+        state = observation.get("state", {}) if isinstance(observation, dict) else {}
         out: dict[str, np.ndarray] = {}
         horizon = len(self.modality_config["action"].delta_indices)
         if "eef_9d" in self.modality_config["action"].modality_keys:
-            eef = np.asarray(reference.get("eef_9d", np.zeros((1, 9), dtype=np.float32)), dtype=np.float32)
+            eef = np.asarray(state.get("eef_9d", np.zeros((1, 1, 9), dtype=np.float32)), dtype=np.float32)
+            if eef.ndim == 3:
+                eef = eef[:, -1, :]
             chunk = np.repeat(eef[:, None, :], horizon, axis=1)
             chunk[:, :, 0] += 0.015 * math.sin(self.count * 0.15)
             out["eef_9d"] = chunk.astype(np.float32)
         if "hand_joint_target" in self.modality_config["action"].modality_keys:
-            hand = np.asarray(reference.get("hand_joint_target", np.zeros((1, 10), dtype=np.float32)), dtype=np.float32)
+            hand = np.asarray(state.get("hand_joint_pos", np.zeros((1, 1, 10), dtype=np.float32)), dtype=np.float32)
+            if hand.ndim == 3:
+                hand = hand[:, -1, :]
             out["hand_joint_target"] = np.repeat(hand[:, None, :], horizon, axis=1).astype(np.float32)
         if "arm_joint_target" in self.modality_config["action"].modality_keys:
-            arm = np.asarray(reference.get("arm_joint_target", np.zeros((1, 7), dtype=np.float32)), dtype=np.float32)
+            arm = np.asarray(state.get("arm_joint_pos", np.zeros((1, 1, 7), dtype=np.float32)), dtype=np.float32)
+            if arm.ndim == 3:
+                arm = arm[:, -1, :]
             out["arm_joint_target"] = np.repeat(arm[:, None, :], horizon, axis=1).astype(np.float32)
         return out, {"dry_run": True}
 
@@ -3077,39 +3125,95 @@ def _prepare_local_checkpoint(checkpoint: Path, cosmos_model: Path) -> tuple[Pat
     return tmp_path, tmp
 
 
-def _load_checkpoint_action_reference_configs(checkpoint: Path, embodiment_tag: str) -> dict[str, dict[str, Any]]:
-    processor_path = checkpoint / "processor_config.json"
-    try:
-        processor_cfg = json.loads(processor_path.read_text(encoding="utf-8"))
-        modality_cfg = processor_cfg["processor_kwargs"]["modality_configs"][embodiment_tag]
-        action_cfg = modality_cfg["action"]
-        keys = list(action_cfg["modality_keys"])
-        configs = list(action_cfg.get("action_configs") or [])
-    except Exception as exc:
-        print(
-            "[policy-reference] warning failed_to_load_action_reference_configs "
-            f"path={processor_path} error={exc}",
-            flush=True,
+def _processor_path(model_path: Path) -> Path:
+    if (model_path / "processor_config.json").exists():
+        return model_path
+    if (model_path / "processor" / "processor_config.json").exists():
+        return model_path / "processor"
+    parent_processor = model_path.parent / "processor"
+    if (parent_processor / "processor_config.json").exists():
+        return parent_processor
+    return model_path
+
+
+class ProbeCompatibleGrootPolicy:
+    """Policy wrapper matching Isaac-GR00T's L10 RTC probe inference path."""
+
+    def __init__(
+        self,
+        *,
+        model_path: Path,
+        device: str,
+        cosmos_model: Path | None,
+        strict: bool,
+    ) -> None:
+        import gr00t.model  # noqa: F401
+        import torch
+        from gr00t.data.embodiment_tags import EmbodimentTag
+        from gr00t.policy.gr00t_policy import Gr00tPolicy
+        from gr00t.policy.policy import BasePolicy
+        from transformers import AutoConfig, AutoModel, AutoProcessor
+
+        BasePolicy.__init__(self, strict=bool(strict))
+        self.embodiment_tag = EmbodimentTag.NEW_EMBODIMENT
+        model_path = model_path.expanduser().resolve()
+        model_config = AutoConfig.from_pretrained(model_path)
+        processor_overrides: dict[str, Any] = {}
+        if cosmos_model is not None and cosmos_model.expanduser().exists():
+            model_config.model_name = str(cosmos_model.expanduser().resolve())
+            processor_overrides["model_name"] = str(cosmos_model.expanduser().resolve())
+
+        self.model = AutoModel.from_pretrained(
+            model_path,
+            config=model_config,
+            local_files_only=True,
+            transformers_loading_kwargs={"local_files_only": True},
         )
+        self.model.eval()
+        self.model.to(device=device, dtype=torch.bfloat16)
+        _patch_pytorch_action_head_rtc(self.model)
+        self.device = str(device)
+
+        self.processor = AutoProcessor.from_pretrained(
+            _processor_path(model_path),
+            transformers_loading_kwargs={"local_files_only": True},
+            **processor_overrides,
+        )
+        self.processor.eval()
+
+        all_modality_configs = self.processor.get_modality_configs()
+        self.modality_configs = {
+            key: value
+            for key, value in all_modality_configs[self.embodiment_tag.value].items()
+            if key != "rl_info"
+        }
+        self.language_key = self.modality_configs["language"].modality_keys[0]
+        self.collate_fn = self.processor.collator
+        self._unbatch_observation = Gr00tPolicy._unbatch_observation.__get__(self)
+        self.check_observation = Gr00tPolicy.check_observation.__get__(self)
+        self.check_action = Gr00tPolicy.check_action.__get__(self)
+        self._harness_tempdir = None
+        self._harness_checkpoint_path = model_path
+
+    def get_modality_config(self) -> dict[str, Any]:
+        return self.modality_configs
+
+    def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         return {}
-    out: dict[str, dict[str, Any]] = {}
-    for key, cfg in zip(keys, configs, strict=False):
-        if isinstance(cfg, dict):
-            out[str(key)] = {
-                "rep": str(cfg.get("rep", "")),
-                "state_key": cfg.get("state_key"),
-                "reference_source": str(cfg.get("reference_source", "state")),
-                "reference_key": cfg.get("reference_key"),
-                "reference_delta_index": cfg.get("reference_delta_index"),
-            }
-    action_refs = {
-        key: cfg
-        for key, cfg in out.items()
-        if cfg.get("rep") == "RELATIVE" and cfg.get("reference_source") == "action"
-    }
-    if action_refs:
-        print(f"[policy-reference] action_relative_reference_configs={action_refs}", flush=True)
-    return out
+
+    def get_action(
+        self,
+        observation: dict[str, Any],
+        options: dict[str, Any] | None = None,
+        *,
+        previous_action: dict[str, np.ndarray] | None = None,
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        return _policy_get_action_cpu_processor(
+            self,
+            observation,
+            previous_action=previous_action,
+            options=options,
+        )
 
 
 def _load_groot_policy(args: argparse.Namespace):
@@ -3119,23 +3223,16 @@ def _load_groot_policy(args: argparse.Namespace):
         raise FileNotFoundError(f"Isaac-GR00T source not found: {ISAAC_GROOT_ROOT}")
 
     import gr00t  # noqa: F401
-    import gr00t.model  # noqa: F401
-    from gr00t.data.embodiment_tags import EmbodimentTag
-    from gr00t.policy import Gr00tPolicy
 
     checkpoint, tmp = _prepare_local_checkpoint(Path(args.policy_checkpoint), Path(args.cosmos_model))
-    policy = Gr00tPolicy(
-        embodiment_tag=EmbodimentTag.NEW_EMBODIMENT,
-        model_path=str(checkpoint),
+    policy = ProbeCompatibleGrootPolicy(
+        model_path=checkpoint,
         device=str(args.policy_device),
+        cosmos_model=Path(args.cosmos_model),
         strict=not bool(args.no_policy_strict),
     )
-    policy._harness_action_reference_configs = _load_checkpoint_action_reference_configs(
-        checkpoint,
-        EmbodimentTag.NEW_EMBODIMENT.value,
-    )
-    _patch_pytorch_action_head_rtc(getattr(policy, "model", None))
     policy._harness_tempdir = tmp  # keep symlink tree alive
+    policy._harness_checkpoint_path = checkpoint
     return policy
 
 
@@ -3254,20 +3351,6 @@ def _first_batch_chunk(action: dict[str, np.ndarray], key: str) -> np.ndarray:
     return value.astype(np.float32, copy=False)
 
 
-def _first_step_reference(action: dict[str, np.ndarray] | None) -> dict[str, np.ndarray] | None:
-    if action is None:
-        return None
-    reference: dict[str, np.ndarray] = {}
-    for key, value in action.items():
-        chunk = np.asarray(value, dtype=np.float32)
-        if chunk.ndim == 3:
-            chunk = chunk[0]
-        if chunk.ndim != 2 or chunk.shape[0] == 0:
-            continue
-        reference[key] = chunk[:1].astype(np.float32, copy=True)
-    return reference or None
-
-
 def _stored_rtc_action_chunk(
     *,
     policy_action: dict[str, np.ndarray],
@@ -3367,7 +3450,7 @@ class TeleopRtcSeedManager:
         horizon: int,
     ) -> tuple[dict[str, np.ndarray] | None, float | None, dict[str, Any]]:
         if not self._chunks:
-            return None, None, {"reason": "empty"}
+            return None, None, {}
         start_step = self.time_to_step(float(anchor_start_monotonic_s))
         indexed = self._latest_action_rows_by_step()
         rows = []
@@ -3391,11 +3474,14 @@ class TeleopRtcSeedManager:
         metadata = {
             "reason": "ok",
             "source": "teleop_trajectory_manager",
+            "anchor": False,
             "seed_steps": int(len(rows)),
             "seed_valid_steps": int(valid_steps),
             "seed_padded_steps": int(len(rows) - valid_steps),
             "seed_pad_mode": "repeat_last" if len(rows) > valid_steps else "none",
+            "seed_timing_rebased": True,
             "start_action_step": int(start_step),
+            "trajectory_epoch_s": self._epoch_s,
             "anchor_start_monotonic_s": float(anchor_start_monotonic_s),
             "anchor_start_frame_id": int(anchor_start_frame_id),
             "action_keys": sorted(seed_action.keys()),
@@ -3430,7 +3516,7 @@ def _teleop_rtc_options(
     max_overlap_steps: int | None,
     frozen_steps: int,
     ramp_rate: float,
-    guidance_beta: float,
+    guidance_beta: float | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     metadata: dict[str, Any] = {
         "enabled": bool(enabled),
@@ -3438,9 +3524,10 @@ def _teleop_rtc_options(
         "action_dt_s": float(action_dt_s),
         "fallback_replan_horizon": int(fallback_replan_horizon),
         "max_overlap_steps": max_overlap_steps,
-        "guidance_beta": float(guidance_beta),
         "previous_action_source": "teleop_trajectory_manager" if previous_action is not None else "none",
     }
+    if guidance_beta is not None:
+        metadata["guidance_beta"] = float(guidance_beta)
     if not enabled or str(rtc_mode) == "off" or previous_action is None:
         metadata["reason"] = "disabled_or_no_previous_action"
         return None, metadata
@@ -3479,7 +3566,6 @@ def _teleop_rtc_options(
         "rtc_overlap_steps": int(overlap_steps),
         "rtc_frozen_steps": max(0, min(int(frozen_steps), int(overlap_steps))),
         "rtc_ramp_rate": float(ramp_rate),
-        "rtc_guidance_beta": float(guidance_beta),
         "rtc_previous_start_step": int(previous_start_step),
     }
     metadata["options"] = dict(options)
@@ -3709,108 +3795,10 @@ def _rec_to_device_dtype(value: Any, *, device: str, dtype: Any) -> Any:
     return value
 
 
-def _decode_action_with_harness_references(
-    policy: object,
-    normalized_action: np.ndarray,
-    batched_states: dict[str, np.ndarray],
-    reference_action: dict[str, np.ndarray],
-) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """Decode GR00T actions using checkpoint action-reference metadata."""
-    from gr00t.configs.data.embodiment_configs import ActionRepresentation
-
-    processor = policy.processor
-    embodiment_tag = policy.embodiment_tag
-    embodiment_key = embodiment_tag.value
-    action_modality = processor.modality_configs[embodiment_key]["action"]
-    action_keys = list(action_modality.modality_keys)
-    action_configs = list(action_modality.action_configs or [])
-    action_horizon = len(action_modality.delta_indices)
-    reference_configs = getattr(policy, "_harness_action_reference_configs", {}) or {}
-
-    out_dict: dict[str, np.ndarray] = {}
-    start_idx = 0
-    for key in action_keys:
-        joint_dim = processor.state_action_processor.norm_params[embodiment_key]["action"][key]["dim"].item()
-        out_dict[key] = normalized_action[..., :action_horizon, start_idx : start_idx + joint_dim]
-        start_idx += joint_dim
-
-    relative_keys: set[str] = set()
-    for key, action_config in zip(action_keys, action_configs, strict=False):
-        if action_config.rep == ActionRepresentation.RELATIVE and processor.state_action_processor.use_relative_action:
-            relative_keys.add(str(key))
-
-    saved_use_relative = bool(processor.state_action_processor.use_relative_action)
-    processor.state_action_processor.use_relative_action = False
-    try:
-        unnormalized = processor.state_action_processor.unapply_action(
-            out_dict,
-            embodiment_key,
-            state=batched_states,
-        )
-    finally:
-        processor.state_action_processor.use_relative_action = saved_use_relative
-
-    decoded: dict[str, np.ndarray] = {}
-    metadata: dict[str, Any] = {"decode_reference_sources": {}}
-    batch_size = int(normalized_action.shape[0])
-    for key, action_config in zip(action_keys, action_configs, strict=False):
-        key = str(key)
-        value = np.asarray(unnormalized[key], dtype=np.float64)
-        if key not in relative_keys:
-            decoded[key] = value.astype(np.float32)
-            metadata["decode_reference_sources"][key] = "absolute"
-            continue
-
-        key_reference_cfg = reference_configs.get(key, {})
-        use_action_reference = str(key_reference_cfg.get("reference_source", "state")) == "action"
-        state_key = action_config.state_key if action_config.state_key else key
-        if use_action_reference:
-            reference_key = str(key_reference_cfg.get("reference_key") or key)
-            if reference_key not in reference_action:
-                raise KeyError(f"Action-relative decode for {key!r} requires reference_action[{reference_key!r}]")
-            reference_values = np.asarray(reference_action[reference_key], dtype=np.float64)
-            metadata["decode_reference_sources"][key] = {
-                "source": "action",
-                "reference_key": reference_key,
-                "reference_delta_index": key_reference_cfg.get("reference_delta_index"),
-            }
-        else:
-            if state_key not in batched_states:
-                raise KeyError(f"State-relative decode for {key!r} requires state[{state_key!r}]")
-            reference_values = np.asarray(batched_states[state_key], dtype=np.float64)
-            metadata["decode_reference_sources"][key] = {"source": "state", "state_key": state_key}
-
-        if reference_values.ndim == 1:
-            reference_values = reference_values.reshape(1, 1, -1)
-        elif reference_values.ndim == 2:
-            if reference_values.shape[0] == batch_size:
-                reference_values = reference_values[:, None, :]
-            else:
-                reference_values = reference_values[None, ...]
-        if reference_values.shape[0] != batch_size:
-            if reference_values.shape[0] == 1:
-                reference_values = np.repeat(reference_values, batch_size, axis=0)
-            else:
-                raise ValueError(f"Reference for {key!r} has shape {reference_values.shape}, expected batch={batch_size}")
-
-        absolute_batches = []
-        for ref, rel in zip(reference_values, value, strict=True):
-            absolute = processor.state_action_processor._convert_to_absolute_action(
-                action=rel,
-                reference_state=ref[-1],
-                action_type=action_config.type,
-                action_format=action_config.format,
-            )
-            absolute_batches.append(absolute)
-        decoded[key] = np.stack(absolute_batches, axis=0).astype(np.float32)
-    return decoded, metadata
-
-
 def _policy_get_action_cpu_processor(
     policy: object,
     observation: dict[str, Any],
     *,
-    reference_action: dict[str, np.ndarray],
     previous_action: dict[str, np.ndarray] | None = None,
     options: dict[str, Any] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
@@ -3819,21 +3807,17 @@ def _policy_get_action_cpu_processor(
     Genesis GPU mode can leave torch's default device as CUDA. GR00T's processor
     mixes torch.from_numpy(...) CPU tensors with torch.zeros(...) default-device
     tensors, so force the processor/collator phase back to CPU for consistency. This
-    mirrors the Isaac-GR00T evaluation path: previous absolute action chunks are
-    placed in VLAStepData.actions for RTC/action-context, while reference_action is
-    passed in metadata/options for action-relative decoding.
+    mirrors the current Isaac-GR00T RTC probe path: previous absolute action chunks
+    are placed in VLAStepData.actions, and decoded actions use the checkpoint
+    processor's state-based decode_action path.
     """
     try:
         import torch
     except Exception:
-        merged_options = dict(options or {})
-        merged_options["reference_action"] = reference_action
-        return policy.get_action(observation, options=merged_options)
+        return policy.get_action(observation, options=options)
 
     if not hasattr(torch, "set_default_device") or not hasattr(torch, "get_default_device"):
-        merged_options = dict(options or {})
-        merged_options["reference_action"] = reference_action
-        return policy.get_action(observation, options=merged_options)
+        return policy.get_action(observation, options=options)
 
     previous_device = torch.get_default_device()
     try:
@@ -3842,9 +3826,7 @@ def _policy_get_action_cpu_processor(
             hasattr(policy, name)
             for name in ("_unbatch_observation", "processor", "collate_fn", "model", "modality_configs")
         ):
-            merged_options = dict(options or {})
-            merged_options["reference_action"] = reference_action
-            return policy.get_action(observation, options=merged_options)
+            return policy.get_action(observation, options=options)
 
         if getattr(policy, "strict", False):
             policy.check_observation(observation)
@@ -3865,7 +3847,6 @@ def _policy_get_action_cpu_processor(
                 actions={} if previous_action is None else previous_action,
                 text=obs["language"][policy.language_key][0],
                 embodiment=policy.embodiment_tag,
-                metadata={"reference_action": reference_action},
             )
             messages = [{"type": MessageType.EPISODE_STEP.value, "content": vla_step_data}]
             processed_inputs.append(policy.processor(messages))
@@ -3873,11 +3854,9 @@ def _policy_get_action_cpu_processor(
         model_device = str(getattr(policy, "device", "cuda" if torch.cuda.is_available() else "cpu"))
         collated_inputs = _rec_to_device_dtype(collated_inputs, device=model_device, dtype=torch.bfloat16)
 
-        merged_options = dict(options or {})
-        merged_options["reference_action"] = reference_action
         with torch.inference_mode():
             try:
-                model_pred = policy.model.get_action(**collated_inputs, options=merged_options)
+                model_pred = policy.model.get_action(**collated_inputs, options=options)
             except TypeError:
                 model_pred = policy.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()
@@ -3886,16 +3865,15 @@ def _policy_get_action_cpu_processor(
             key: np.stack([state[key] for state in states], axis=0)
             for key in policy.modality_configs["state"].modality_keys
         }
-        unnormalized_action, decode_metadata = _decode_action_with_harness_references(
-            policy,
+        unnormalized_action = policy.processor.decode_action(
             normalized_action.cpu().numpy(),
+            policy.embodiment_tag,
             batched_states,
-            reference_action=reference_action,
         )
         casted_action = {key: value.astype(np.float32) for key, value in unnormalized_action.items()}
         if getattr(policy, "strict", False):
             policy.check_action(casted_action)
-        return casted_action, decode_metadata
+        return casted_action, {"decode_source": "state", "probe_compatible": True}
     finally:
         torch.set_default_device(previous_device)
 
@@ -3973,7 +3951,7 @@ def main() -> int:
     parser.add_argument(
         "--policy-video-smooth-dir",
         type=Path,
-        default=DEFAULT_SMOOTH_REFERENCE_DIR,
+        default=DEFAULT_SMOOTH_DATASET_DIR,
         help="Smooth dataset root used by --policy-video-source smooth_dataset.",
     )
     parser.add_argument(
@@ -3995,8 +3973,6 @@ def main() -> int:
         help="Loop smooth video frames when --policy-video-source smooth_dataset runs past the episode length.",
     )
     parser.add_argument("--d455-rgb-fov", type=float, default=None, help="Override D455 RGB Genesis vertical FOV in degrees.")
-    parser.add_argument("--d455-base-rel-pos", type=_vec3, default=harness.D455_BASE_REL_POS_M, help="D455 body pose relative to combined/root frame, xyz meters.")
-    parser.add_argument("--d455-base-rel-euler", type=_vec3, default=harness.D455_BASE_REL_EULER_DEG, help="D455 body pose relative to combined/root frame, euler degrees.")
     parser.add_argument("--d405-fov", type=float, default=None, help="Override right D405 Genesis vertical FOV in degrees.")
     parser.add_argument("--d405-mount-json", type=Path, default=None, help="Load right D405 connector-relative pose from calibration JSON.")
     parser.add_argument("--d405-connector-rel-pos", type=_vec3, default=None, help="Right D405 body pose relative to right connector, xyz meters. Overrides --d405-mount-json position.")
@@ -4013,8 +3989,8 @@ def main() -> int:
     parser.add_argument("--rtc-mode", choices=("compat", "seed_window", "off"), default="compat")
     parser.add_argument("--rtc-overlap-steps", type=int, default=None)
     parser.add_argument("--rtc-max-overlap-steps", type=int, default=24)
-    parser.add_argument("--rtc-frozen-steps", type=int, default=4)
-    parser.add_argument("--rtc-ramp-rate", type=float, default=20.0)
+    parser.add_argument("--rtc-frozen-steps", type=int, default=2)
+    parser.add_argument("--rtc-ramp-rate", type=float, default=4.0)
     parser.add_argument("--rtc-guidance-beta", type=float, default=0.5)
     parser.add_argument(
         "--arm-ik-mode",
@@ -4107,40 +4083,6 @@ def main() -> int:
         default=DEFAULT_INITIAL_REFERENCE_HAND_Q,
         help="Initial action-relative 10D hand command reference in GR00T canonical order.",
     )
-    parser.add_argument(
-        "--policy-hand-reference-source",
-        choices=("executor_current", "smooth_action_frame", "smooth_full_action_frame"),
-        default="executor_current",
-        help=(
-            "Hand-only action-relative reference source. executor_current is the normal online mode; "
-            "smooth_action_frame teacher-forces hand_joint_target from the smooth dataset for diagnosis; "
-            "smooth_full_action_frame also teacher-forces eef_9d and arm_joint_target reference fields."
-        ),
-    )
-    parser.add_argument(
-        "--policy-hand-reference-smooth-dir",
-        type=Path,
-        default=DEFAULT_SMOOTH_REFERENCE_DIR,
-        help="Smooth dataset root used by --policy-hand-reference-source smooth_action_frame.",
-    )
-    parser.add_argument(
-        "--policy-hand-reference-episode",
-        type=int,
-        default=0,
-        help="Smooth episode index used by --policy-hand-reference-source smooth_action_frame.",
-    )
-    parser.add_argument(
-        "--policy-hand-reference-frame-offset",
-        type=int,
-        default=0,
-        help="Frame offset added to the session-relative policy step for smooth hand references.",
-    )
-    parser.add_argument(
-        "--policy-hand-reference-loop",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Loop smooth hand reference frames instead of clamping at the last frame.",
-    )
     parser.add_argument("--initial-right-arm-q", type=_vec7, default=DEFAULT_INITIAL_RIGHT_ARM_Q)
     parser.add_argument("--initial-left-arm-q", type=_vec7, default=DEFAULT_INITIAL_LEFT_ARM_Q)
     parser.add_argument(
@@ -4208,9 +4150,10 @@ def main() -> int:
         "--camera-preview",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Show ego_view and wrist_view model input windows while policy inference is running.",
+        help="Show ego_view and wrist_view model input windows from startup.",
     )
     parser.add_argument("--camera-preview-scale", type=int, default=2, help="Integer scale for camera preview windows.")
+    parser.add_argument("--camera-preview-hz", type=float, default=10.0, help="Refresh rate for startup camera preview windows.")
     parser.add_argument(
         "--eef-trajectory-overlay",
         action=argparse.BooleanOptionalAction,
@@ -4296,8 +4239,6 @@ def main() -> int:
         initial_base_euler=(0.0, 0.0, 0.0),
         d455_rgb_gui=False,
         d455_rgb_fov=args.d455_rgb_fov,
-        d455_base_rel_pos=args.d455_base_rel_pos,
-        d455_base_rel_euler=args.d455_base_rel_euler,
         d405_camera_gui=False,
         d405_fov=args.d405_fov,
         d405_connector_rel_pos=d405_connector_rel_pos,
@@ -4370,23 +4311,6 @@ def main() -> int:
         policy_orientation_max_speed_rad_s=float(args.policy_orientation_max_speed_rad_s),
         action_dt_s=action_dt_s,
     )
-    smooth_reference_provider: SmoothReferenceProvider | None = None
-    if str(args.policy_hand_reference_source) in {"smooth_action_frame", "smooth_full_action_frame"}:
-        smooth_reference_provider = SmoothReferenceProvider(
-            smooth_dir=args.policy_hand_reference_smooth_dir,
-            episode_index=int(args.policy_hand_reference_episode),
-            frame_offset=int(args.policy_hand_reference_frame_offset),
-            loop=bool(args.policy_hand_reference_loop),
-        )
-        print(
-            f"[policy-hand-reference] {args.policy_hand_reference_source} "
-            f"episode={smooth_reference_provider.episode_index} "
-            f"frames={smooth_reference_provider.length} "
-            f"offset={smooth_reference_provider.frame_offset} "
-            f"loop={smooth_reference_provider.loop} "
-            f"path={smooth_reference_provider.path}",
-            flush=True,
-        )
     obs_builder = Gr00tObservationBuilder(
         modality_config=modality_config,
         instruction=str(args.instruction),
@@ -4461,6 +4385,31 @@ def main() -> int:
     trace_replan_index = 0
     last_policy_running = False
     policy_session_start_step = 0
+    last_camera_preview_time = -float("inf")
+    preview_period_s = 1.0 / max(float(args.camera_preview_hz), 1.0e-6)
+
+    def capture_current_model_inputs() -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        relative_video_step = int(step_count) - int(policy_session_start_step)
+        return _capture_policy_model_inputs(
+            ego_camera=ego_camera,
+            wrist_camera=wrist_camera,
+            image_size=image_size,
+            ego_roi_zoom=float(args.ego_roi_zoom),
+            ego_roi_center_x=float(args.ego_roi_center_x),
+            ego_roi_center_y=float(args.ego_roi_center_y),
+            wrist_roi_zoom=float(args.wrist_roi_zoom),
+            wrist_roi_center_x=float(args.wrist_roi_center_x),
+            wrist_roi_center_y=float(args.wrist_roi_center_y),
+            ego_rotate_deg=int(args.ego_image_rotate_deg),
+            ego_flip_horizontal=bool(args.ego_image_flip_horizontal),
+            ego_flip_vertical=bool(args.ego_image_flip_vertical),
+            wrist_rotate_deg=int(args.wrist_image_rotate_deg),
+            wrist_flip_horizontal=bool(args.wrist_image_flip_horizontal),
+            wrist_flip_vertical=bool(args.wrist_image_flip_vertical),
+            smooth_video_provider=smooth_video_provider,
+            smooth_video_step=relative_video_step,
+        )
+
     if policy_trace_dir is not None:
         policy_trace_dir = policy_trace_dir.expanduser()
         policy_trace_dir.mkdir(parents=True, exist_ok=True)
@@ -4532,6 +4481,12 @@ def main() -> int:
                         flush=True,
                     )
 
+            preview_now = time.monotonic()
+            if camera_preview.enabled and preview_now - last_camera_preview_time >= preview_period_s:
+                last_camera_preview_time = preview_now
+                preview_ego, preview_wrist, _ = capture_current_model_inputs()
+                camera_preview.show(ego=preview_ego, wrist=preview_wrist)
+
             if console.policy_running:
                 now = time.monotonic()
                 should_replan = action_chunk is None or action_index >= int(args.replan_horizon)
@@ -4539,49 +4494,9 @@ def main() -> int:
                     should_replan = should_replan or now - last_policy_time >= 1.0 / max(float(args.policy_hz), 1e-6)
                 if should_replan:
                     last_policy_time = now
-                    ego = _render_camera_rgb(
-                        ego_camera,
-                        image_size=image_size,
-                        roi_zoom=float(args.ego_roi_zoom),
-                        roi_center_x=float(args.ego_roi_center_x),
-                        roi_center_y=float(args.ego_roi_center_y),
-                    )
-                    wrist = _render_camera_rgb(
-                        wrist_camera,
-                        image_size=image_size,
-                        roi_zoom=float(args.wrist_roi_zoom),
-                        roi_center_x=float(args.wrist_roi_center_x),
-                        roi_center_y=float(args.wrist_roi_center_y),
-                    )
-                    video_source_metadata: dict[str, Any] = {"source": "sim"}
-                    if smooth_video_provider is not None:
-                        relative_video_step = int(step_count) - int(policy_session_start_step)
-                        ego, wrist, video_source_metadata = smooth_video_provider.frame_at_step(relative_video_step)
-                    ego = _postprocess_policy_image(
-                        ego,
-                        rotate_deg=int(args.ego_image_rotate_deg),
-                        flip_horizontal=bool(args.ego_image_flip_horizontal),
-                        flip_vertical=bool(args.ego_image_flip_vertical),
-                    )
-                    wrist = _postprocess_policy_image(
-                        wrist,
-                        rotate_deg=int(args.wrist_image_rotate_deg),
-                        flip_horizontal=bool(args.wrist_image_flip_horizontal),
-                        flip_vertical=bool(args.wrist_image_flip_vertical),
-                    )
-                    video_source_metadata["ego_image_postprocess"] = {
-                        "rotate_deg": int(args.ego_image_rotate_deg),
-                        "flip_horizontal": bool(args.ego_image_flip_horizontal),
-                        "flip_vertical": bool(args.ego_image_flip_vertical),
-                    }
-                    video_source_metadata["wrist_image_postprocess"] = {
-                        "rotate_deg": int(args.wrist_image_rotate_deg),
-                        "flip_horizontal": bool(args.wrist_image_flip_horizontal),
-                        "flip_vertical": bool(args.wrist_image_flip_vertical),
-                    }
+                    ego, wrist, video_source_metadata = capture_current_model_inputs()
                     camera_preview.show(ego=ego, wrist=wrist)
                     obs_builder.append_frame(ego=ego, wrist=wrist)
-                    reference_action = executor.current_reference_action()
                     observation_arm_q = executor.current_arm_q()
                     observation_hand_q = executor.current_observation_hand_q()
                     observation_eef_pose = executor.current_observation_eef_pose()
@@ -4596,7 +4511,6 @@ def main() -> int:
                         eef_pose=observation_eef_pose,
                         policy_eef_9d=observation_eef_9d,
                         hand_q=observation_hand_q,
-                        reference_action=reference_action,
                     )
                     if step_count == 0 and action_index == 0:
                         _print_first_observation_video_shapes(observation)
@@ -4626,34 +4540,10 @@ def main() -> int:
                         ramp_rate=float(args.rtc_ramp_rate),
                         guidance_beta=float(args.rtc_guidance_beta),
                     )
-                    rtc_reference_action = _first_step_reference(rtc_seed_action) if rtc_options is not None else None
-                    reference_action_source = "rtc_seed" if rtc_reference_action is not None else "executor_current"
-                    if rtc_reference_action is not None:
-                        reference_action = rtc_reference_action
-                    reference_override_metadata: dict[str, Any] | None = None
-                    if smooth_reference_provider is not None:
-                        relative_step = int(step_count) - int(policy_session_start_step)
-                        reference_action = {
-                            key: np.asarray(value, dtype=np.float32, copy=True)
-                            for key, value in reference_action.items()
-                        }
-                        if str(args.policy_hand_reference_source) == "smooth_full_action_frame":
-                            smooth_reference, reference_override_metadata = (
-                                smooth_reference_provider.full_reference_at_step(relative_step)
-                            )
-                            reference_action.update(smooth_reference)
-                            reference_action_source = f"{reference_action_source}+smooth_full_reference"
-                        else:
-                            hand_reference, reference_override_metadata = (
-                                smooth_reference_provider.hand_reference_at_step(relative_step)
-                            )
-                            reference_action["hand_joint_target"] = hand_reference
-                            reference_action_source = f"{reference_action_source}+smooth_hand_reference"
                     tic = time.perf_counter()
                     policy_action_chunk, policy_info = _policy_get_action_cpu_processor(
                         policy,
                         observation,
-                        reference_action=reference_action,
                         previous_action=rtc_seed_action if rtc_options is not None else None,
                         options=rtc_options,
                     )
@@ -4673,13 +4563,9 @@ def main() -> int:
                         policy_action_chunk=policy_action_chunk,
                         clipped_action_chunk=clipped_action_chunk,
                         guarded_action_chunk=action_chunk,
-                        reference_action=reference_action,
                         rtc_seed_action=rtc_seed_action,
-                        reference_action_source=reference_action_source,
                         observation_hand_q=observation_hand_q,
                     )
-                    if reference_override_metadata is not None:
-                        hand_debug["reference_override_metadata"] = _jsonable(reference_override_metadata)
                     hand_debug["video_source"] = _jsonable(video_source_metadata)
                     rtc_store_action_chunk = executor.rtc_seed_action_from_command_chunk(
                         action_chunk,
@@ -4697,8 +4583,6 @@ def main() -> int:
                         observation_arm_q=observation_arm_q,
                         observation_hand_q=observation_hand_q,
                         observation_eef_pose=observation_eef_pose,
-                        reference_action=reference_action,
-                        reference_action_source=reference_action_source,
                         rtc_seed_action=rtc_seed_action,
                         rtc_options=rtc_options,
                         rtc_metadata=rtc_metadata,
@@ -4742,7 +4626,6 @@ def main() -> int:
                             "rtc_seed_action": None
                             if rtc_seed_action is None
                             else _jsonable_action(rtc_seed_action),
-                            "reference_action": _jsonable_action(reference_action),
                             "video_source": _jsonable(video_source_metadata),
                             "action_summary": _summarize_action_chunk(action_chunk),
                             "rtc_stored_seed_action_summary": _summarize_action_chunk(rtc_store_action_chunk),
@@ -4753,8 +4636,6 @@ def main() -> int:
                     if hand_debug.get("negative_floor_warning", {}).get("active"):
                         print(
                             "[policy-hand-debug] negative_floor "
-                            f"reference_source={reference_action_source} "
-                            f"reference={hand_debug.get('reference_hand_first')} "
                             f"observation={hand_debug.get('observation_hand_state')} "
                             f"rtc_seed={hand_debug.get('rtc_seed_hand_first')}",
                             flush=True,
@@ -4764,7 +4645,7 @@ def main() -> int:
                         f"rtc={'off' if rtc_options is None else 'on'} "
                         f"rtc_reason={rtc_metadata.get('reason')} "
                         f"seed_reason={rtc_seed_metadata.get('reason')} "
-                        f"reference={reference_action_source} "
+                        "decode=state "
                         f"stored_frozen={action_storage_metadata.get('frozen_seed_steps_applied', 0)} "
                         f"clip_delta={clip_delta:.4f} "
                         f"hand_debug={hand_debug.get('negative_floor_warning')} "
