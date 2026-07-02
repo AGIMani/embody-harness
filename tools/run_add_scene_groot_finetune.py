@@ -3795,6 +3795,13 @@ def _rec_to_device_dtype(value: Any, *, device: str, dtype: Any) -> Any:
     return value
 
 
+def _strip_decode_only_options(options: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not options:
+        return None
+    cleaned = {key: value for key, value in options.items() if key != "reference_action"}
+    return cleaned or None
+
+
 def _policy_get_action_cpu_processor(
     policy: object,
     observation: dict[str, Any],
@@ -3853,10 +3860,11 @@ def _policy_get_action_cpu_processor(
         collated_inputs = policy.collate_fn(processed_inputs)
         model_device = str(getattr(policy, "device", "cuda" if torch.cuda.is_available() else "cpu"))
         collated_inputs = _rec_to_device_dtype(collated_inputs, device=model_device, dtype=torch.bfloat16)
+        model_options = _strip_decode_only_options(options)
 
         with torch.inference_mode():
             try:
-                model_pred = policy.model.get_action(**collated_inputs, options=options)
+                model_pred = policy.model.get_action(**collated_inputs, options=model_options)
             except TypeError:
                 model_pred = policy.model.get_action(**collated_inputs)
         normalized_action = model_pred["action_pred"].float()

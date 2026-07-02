@@ -29,6 +29,13 @@ DEFAULT_STATE_SOURCE = "sim"
 DEFAULT_TRACE_DIR = ROOT_DIR / "logs" / "groot_smooth_control_policy_trace"
 DEFAULT_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_smooth_control_policy_debug.jsonl"
 DEFAULT_TELEOP_DEBUG_JSONL = ROOT_DIR / "logs" / "groot_smooth_control_teleop_bridge.jsonl"
+DEFAULT_SMOOTH_VIDEO_BACKEND = "ffmpeg"
+DEFAULT_POLICY_CHECKPOINT = (
+    ROOT_DIR
+    / "checkpoints"
+    / "finetune"
+    / "mission2-smooth-action-state-247-20260701-215311-checkpoint-126000"
+)
 
 
 @dataclass(frozen=True)
@@ -189,18 +196,50 @@ def _smooth_video_path(smooth_dir: Path, episode_index: int, key: str) -> Path:
     return smooth_dir / "videos" / f"chunk-{episode_index // 1000:03d}" / key / f"episode_{episode_index:06d}.mp4"
 
 
-def _read_smooth_frame(path: Path, frame_index: int, image_size: tuple[int, int]) -> np.ndarray:
+def _read_smooth_frame(
+    path: Path,
+    frame_index: int,
+    image_size: tuple[int, int] | None,
+    *,
+    video_backend: str,
+) -> np.ndarray:
+    idx = int(max(frame_index, 0))
+    if str(video_backend) != "opencv":
+        if str(rollout.ISAAC_GROOT_ROOT) not in sys.path and rollout.ISAAC_GROOT_ROOT.exists():
+            sys.path.insert(0, str(rollout.ISAAC_GROOT_ROOT))
+        try:
+            from gr00t.utils.video_utils import get_frames_by_indices
+        except Exception as exc:
+            raise RuntimeError("Reading smooth video frames with GR00T video backends requires Isaac-GR00T on PYTHONPATH.") from exc
+        frames = get_frames_by_indices(
+            str(path),
+            np.asarray([idx], dtype=np.int64),
+            video_backend=str(video_backend),
+            video_backend_kwargs={},
+        )
+        frame = np.asarray(frames, dtype=np.uint8)[0]
+        if image_size is None:
+            return np.ascontiguousarray(frame).astype(np.uint8, copy=False)
+        try:
+            import cv2
+        except Exception as exc:
+            raise RuntimeError("Resizing smooth video frames requires cv2 in this environment.") from exc
+        height, width = image_size
+        return cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA).astype(np.uint8)
+
     try:
         import cv2
     except Exception as exc:
-        raise RuntimeError("Reading smooth video frames requires cv2 in this environment.") from exc
+        raise RuntimeError("Reading smooth video frames with --smooth-video-backend opencv requires cv2.") from exc
     cap = cv2.VideoCapture(str(path))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, int(max(frame_index, 0)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
     ok, frame = cap.read()
     cap.release()
     if not ok or frame is None:
         raise RuntimeError(f"Failed to read frame={frame_index} from {path}")
     frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if image_size is None:
+        return frame.astype(np.uint8)
     height, width = image_size
     return cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_AREA).astype(np.uint8)
 
@@ -210,7 +249,8 @@ def _build_smooth_video_observation(
     smooth_dir: Path,
     episode: SmoothPolicyEpisode,
     frame_index: int,
-    image_size: tuple[int, int],
+    image_size: tuple[int, int] | None,
+    video_backend: str,
     modality_config: dict[str, Any],
     ego_rotate_deg: int,
     ego_flip_horizontal: bool,
@@ -228,7 +268,7 @@ def _build_smooth_video_observation(
         idx = int(np.clip(int(frame_index) + int(delta), 0, max(episode.length - 1, 0)))
         ego_frames.append(
             rollout._postprocess_policy_image(  # noqa: SLF001
-                _read_smooth_frame(ego_path, idx, image_size),
+                _read_smooth_frame(ego_path, idx, image_size, video_backend=str(video_backend)),
                 rotate_deg=int(ego_rotate_deg),
                 flip_horizontal=bool(ego_flip_horizontal),
                 flip_vertical=bool(ego_flip_vertical),
@@ -236,7 +276,7 @@ def _build_smooth_video_observation(
         )
         wrist_frames.append(
             rollout._postprocess_policy_image(  # noqa: SLF001
-                _read_smooth_frame(wrist_path, idx, image_size),
+                _read_smooth_frame(wrist_path, idx, image_size, video_backend=str(video_backend)),
                 rotate_deg=int(wrist_rotate_deg),
                 flip_horizontal=bool(wrist_flip_horizontal),
                 flip_vertical=bool(wrist_flip_vertical),
@@ -257,6 +297,7 @@ def _build_smooth_video_observation(
         "episode_index": int(episode.episode_index),
         "frame_index": int(frame_index),
         "delta_indices": deltas,
+        "video_backend": str(video_backend),
         "ego_path": str(ego_path),
         "wrist_path": str(wrist_path),
     }
@@ -339,6 +380,177 @@ def _build_smooth_state(
             raise KeyError(f"Cannot build smooth state key {key!r}; available={sorted(ranges['state'])}")
         out[key] = np.asarray(value, dtype=np.float32)[None, None, ...]
     return out
+
+
+def _pose_from_eef_9d(eef_9d: np.ndarray) -> np.ndarray:
+    eef = np.asarray(eef_9d, dtype=np.float64).reshape(-1)
+    if eef.size < 9:
+        raise ValueError(f"Expected eef_9d with at least 9 values, got shape={eef.shape}")
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, 3] = eef[:3]
+    pose[:3, :3] = rollout._rot6d_to_rotmat(eef[3:9])  # noqa: SLF001
+    return pose
+
+
+def _eef_9d_from_observation(observation: dict[str, Any]) -> np.ndarray:
+    state = observation.get("state", {})
+    if not isinstance(state, dict) or "eef_9d" not in state:
+        raise KeyError("Deployment bridge requires observation.state.eef_9d")
+    arr = np.asarray(state["eef_9d"], dtype=np.float32)
+    return arr.reshape(-1, arr.shape[-1])[-1, :9].astype(np.float32, copy=True)
+
+
+def _reported_hand_value_to_command(joint_index: int, target_value: float) -> float:
+    names = rollout.POLICY_HAND_JOINT_NAMES
+    limits = rollout._l10_command_limits_by_name()  # noqa: SLF001
+    name = names[int(joint_index)]
+    lower, upper = limits[name]
+
+    def reported_at(command_value: float) -> float:
+        command = np.zeros(len(names), dtype=np.float32)
+        command[int(joint_index)] = float(command_value)
+        return float(rollout._l10_reported_hand_q_from_command(command)[int(joint_index)])  # noqa: SLF001
+
+    low_reported = reported_at(float(lower))
+    high_reported = reported_at(float(upper))
+    increasing = high_reported >= low_reported
+    lo, hi = (float(lower), float(upper)) if increasing else (float(upper), float(lower))
+    r_lo, r_hi = (low_reported, high_reported) if increasing else (high_reported, low_reported)
+    target = float(np.clip(float(target_value), min(r_lo, r_hi), max(r_lo, r_hi)))
+    if target <= r_lo:
+        return lo
+    if target >= r_hi:
+        return hi
+    for _ in range(18):
+        mid = 0.5 * (lo + hi)
+        r_mid = reported_at(mid)
+        if r_mid < target:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _reported_hand_q_to_command(hand_q: np.ndarray) -> np.ndarray:
+    values = np.asarray(hand_q, dtype=np.float32).reshape(-1)
+    out = values.astype(np.float32, copy=True)
+    count = min(out.size, len(rollout.POLICY_HAND_JOINT_NAMES))
+    for idx in range(count):
+        out[idx] = float(_reported_hand_value_to_command(idx, float(values[idx])))
+    return out
+
+
+class DeploymentActionBridge:
+    """Keep model actions in training-state semantics until the executor boundary."""
+
+    def __init__(
+        self,
+        executor: rollout.RightArmPolicyExecutor,
+        *,
+        mode: str,
+        eef_update: str,
+        hand_mode: str,
+    ) -> None:
+        self.executor = executor
+        self.mode = str(mode)
+        self.eef_update = str(eef_update)
+        self.hand_mode = str(hand_mode)
+        self.eef_calibrated = False
+        self.last_metadata: dict[str, Any] = {}
+
+    def reset(self) -> None:
+        self.eef_calibrated = False
+        self.last_metadata = {}
+
+    def bridge_action_chunk(
+        self,
+        action: dict[str, np.ndarray],
+        *,
+        observation: dict[str, Any],
+        reason: str,
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+        bridged = {key: np.array(value, dtype=np.float32, copy=True) for key, value in action.items()}
+        metadata: dict[str, Any] = {
+            "mode": self.mode,
+            "eef_update": self.eef_update,
+            "hand_mode": self.hand_mode,
+            "input_action_semantics": "training_state",
+            "executor_action_semantics": "state_eef_via_calibrated_frame_and_canonical_hand_command",
+        }
+        if self.mode == "state_to_robot":
+            state_eef_9d = _eef_9d_from_observation(observation)
+            metadata["eef"] = self._maybe_calibrate_eef_bridge(state_eef_9d, reason=reason)
+        else:
+            metadata["eef"] = {"enabled": False, "reason": "bridge_off"}
+        if self.hand_mode == "reported_to_command" and "hand_joint_target" in bridged:
+            bridged["hand_joint_target"], metadata["hand"] = self._bridge_hand_chunk(bridged["hand_joint_target"])
+        else:
+            metadata["hand"] = {"enabled": False, "reason": self.hand_mode}
+        self.last_metadata = metadata
+        return bridged, metadata
+
+    def _maybe_calibrate_eef_bridge(self, state_eef_9d: np.ndarray, *, reason: str) -> dict[str, Any]:
+        should_update = (not self.eef_calibrated) or self.eef_update == "replan"
+        if not should_update:
+            return {
+                "enabled": True,
+                "updated": False,
+                "reason": "fixed_bridge_already_calibrated",
+                "translation": np.asarray(self.executor.policy_action_frame_translation, dtype=np.float64).tolist(),
+                "rotation_rot6d": rollout._rotmat_to_rot6d(self.executor.policy_action_frame_rotation).tolist(),  # noqa: SLF001
+            }
+
+        current_world = self.executor.current_eef_pose()
+        current_uncalibrated = self.executor._world_pose_to_policy_pose_uncalibrated(current_world)  # noqa: SLF001
+        desired_state = _pose_from_eef_9d(state_eef_9d)
+        action_rotation = desired_state[:3, :3] @ current_uncalibrated[:3, :3].T
+        action_translation = desired_state[:3, 3] - action_rotation @ current_uncalibrated[:3, 3]
+        self.executor.policy_action_frame_rotation = action_rotation.astype(np.float64, copy=True)
+        self.executor.policy_action_frame_translation = action_translation.astype(np.float64, copy=True)
+        self.executor.reference_eef_9d = np.asarray(state_eef_9d, dtype=np.float32).reshape(9).copy()
+        self.eef_calibrated = True
+
+        check = self.executor.world_pose_to_policy_pose(current_world)
+        residual = check[:3, 3] - desired_state[:3, 3]
+        print(
+            "[deployment-bridge] eef_state_to_robot_calibrated "
+            f"reason={reason} update={self.eef_update} "
+            f"state_xyz={tuple(round(float(v), 6) for v in desired_state[:3, 3])} "
+            f"world_xyz={tuple(round(float(v), 6) for v in current_world[:3, 3])} "
+            f"translation={tuple(round(float(v), 6) for v in action_translation)} "
+            f"residual={tuple(round(float(v), 6) for v in residual)}",
+            flush=True,
+        )
+        return {
+            "enabled": True,
+            "updated": True,
+            "reason": reason,
+            "state_xyz": desired_state[:3, 3].tolist(),
+            "world_xyz": current_world[:3, 3].tolist(),
+            "translation": action_translation.tolist(),
+            "rotation_rot6d": rollout._rotmat_to_rot6d(action_rotation).tolist(),  # noqa: SLF001
+            "residual_xyz": residual.tolist(),
+        }
+
+    def _bridge_hand_chunk(self, value: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+        arr = np.array(value, dtype=np.float32, copy=True)
+        if arr.ndim < 2 or arr.shape[-1] < len(rollout.POLICY_HAND_JOINT_NAMES):
+            return arr, {"enabled": False, "reason": f"unexpected_shape={arr.shape}"}
+        before = arr.copy()
+        flat = arr.reshape(-1, arr.shape[-1])
+        for row_idx in range(flat.shape[0]):
+            flat[row_idx, : len(rollout.POLICY_HAND_JOINT_NAMES)] = _reported_hand_q_to_command(
+                flat[row_idx, : len(rollout.POLICY_HAND_JOINT_NAMES)]
+            )
+        delta = arr - before
+        return arr, {
+            "enabled": True,
+            "source": "l10_reported_state",
+            "target": "l10_canonical_command",
+            "max_abs_delta": float(np.max(np.abs(delta))) if delta.size else 0.0,
+            "first_reported": before.reshape(-1, before.shape[-1])[0, : len(rollout.POLICY_HAND_JOINT_NAMES)].tolist(),
+            "first_command": arr.reshape(-1, arr.shape[-1])[0, : len(rollout.POLICY_HAND_JOINT_NAMES)].tolist(),
+        }
 
 
 def _build_observation(
@@ -722,12 +934,23 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-control-panel", action="store_true")
     parser.add_argument("--no-viewer", action="store_true")
     parser.add_argument("--max-steps", type=int, default=0)
-    parser.add_argument("--policy-checkpoint", type=Path, default=rollout.DEFAULT_POLICY_CHECKPOINT)
+    parser.add_argument("--policy-checkpoint", type=Path, default=DEFAULT_POLICY_CHECKPOINT)
     parser.add_argument("--cosmos-model", type=Path, default=rollout.DEFAULT_COSMOS_MODEL)
     parser.add_argument("--policy-device", default="cuda:0")
     parser.add_argument("--dry-run-policy", action="store_true")
     parser.add_argument("--no-policy-strict", action="store_true")
     parser.add_argument("--image-size", type=rollout._image_size, default=rollout.DEFAULT_IMAGE_SIZE)  # noqa: SLF001
+    parser.add_argument(
+        "--smooth-video-resize",
+        action="store_true",
+        help="Resize smooth dataset videos to --image-size before GR00T preprocessing. Default preserves recorded resolution like the Isaac-GR00T probes.",
+    )
+    parser.add_argument(
+        "--smooth-video-backend",
+        choices=("ffmpeg", "torchcodec", "decord", "opencv"),
+        default=DEFAULT_SMOOTH_VIDEO_BACKEND,
+        help="Backend for reading smooth dataset videos. Default matches the Isaac-GR00T probes.",
+    )
     parser.add_argument("--ego-roi-zoom", type=float, default=rollout.DEFAULT_EGO_ROI_ZOOM)
     parser.add_argument("--ego-roi-center-x", type=float, default=rollout.DEFAULT_EGO_ROI_CENTER_X)
     parser.add_argument("--ego-roi-center-y", type=float, default=rollout.DEFAULT_EGO_ROI_CENTER_Y)
@@ -752,9 +975,9 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--action-fps", type=float, default=10.0)
     parser.add_argument("--rtc-mode", choices=("compat", "seed_window", "off"), default="compat")
     parser.add_argument("--rtc-overlap-steps", type=int, default=None)
-    parser.add_argument("--rtc-max-overlap-steps", type=int, default=24)
+    parser.add_argument("--rtc-max-overlap-steps", type=int, default=5)
     parser.add_argument("--rtc-frozen-steps", type=int, default=2)
-    parser.add_argument("--rtc-ramp-rate", type=float, default=4.0)
+    parser.add_argument("--rtc-ramp-rate", type=float, default=3.0)
     parser.add_argument("--rtc-guidance-beta", type=float, default=0.5)
     parser.add_argument("--arm-ik-mode", choices=("genesis_pose", "differential_full_pose"), default="differential_full_pose")
     parser.add_argument("--max-joint-step", type=float, default=0.045)
@@ -789,6 +1012,24 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--initial-reference-hand-q", type=rollout._vec10, default=rollout.DEFAULT_INITIAL_REFERENCE_HAND_Q)  # noqa: SLF001
     parser.add_argument("--initial-right-arm-q", type=rollout._vec7, default=rollout.DEFAULT_INITIAL_RIGHT_ARM_Q)  # noqa: SLF001
     parser.add_argument("--initial-left-arm-q", type=rollout._vec7, default=rollout.DEFAULT_INITIAL_LEFT_ARM_Q)  # noqa: SLF001
+    parser.add_argument(
+        "--deployment-action-bridge",
+        choices=("state_to_robot", "off"),
+        default="state_to_robot",
+        help="Bridge decoded action-state checkpoint outputs to robot execution at the executor boundary.",
+    )
+    parser.add_argument(
+        "--deployment-eef-bridge-update",
+        choices=("once", "replan"),
+        default="once",
+        help="Calibrate the fixed state-frame to robot-frame EEF bridge once per policy/reset session or every replan.",
+    )
+    parser.add_argument(
+        "--deployment-hand-bridge",
+        choices=("reported_to_command", "identity"),
+        default="reported_to_command",
+        help="Map decoded L10 reported-state hand targets into canonical command targets before execution.",
+    )
     parser.add_argument("--policy-eef-link", choices=("revo2_flange", "link7"), default=harness.DEFAULT_EEF_LINK)
     parser.add_argument("--policy-execution-mode", choices=("teleop_source", "robot_target"), default="robot_target")
     parser.add_argument("--policy-openxr-coordinate-adapter", choices=("openxr_genesis", "none"), default="openxr_genesis")
@@ -876,6 +1117,19 @@ def main() -> int:
     if arm is None:
         raise RuntimeError("add_scene_glb scene does not contain a right Nero arm")
     arm_dofs = executor.arm_dofs
+    deployment_bridge = DeploymentActionBridge(
+        executor,
+        mode=str(args.deployment_action_bridge),
+        eef_update=str(args.deployment_eef_bridge_update),
+        hand_mode=str(args.deployment_hand_bridge),
+    )
+    print(
+        "[deployment-bridge] "
+        f"mode={args.deployment_action_bridge} "
+        f"eef_update={args.deployment_eef_bridge_update} "
+        f"hand={args.deployment_hand_bridge}",
+        flush=True,
+    )
 
     panel = None
     if not bool(args.no_control_panel):
@@ -950,6 +1204,7 @@ def main() -> int:
         sim_video_history.clear()
         eef_trajectory_overlay.clear()
         executor.reset_policy_source_anchor()
+        deployment_bridge.reset()
 
     def instruction_for_current_episode() -> str:
         return str(args.instruction or episode.task or rollout.DEFAULT_TASK)
@@ -973,7 +1228,8 @@ def main() -> int:
                 smooth_dir=smooth_dir,
                 episode=episode,
                 frame_index=frame,
-                image_size=image_size,
+                image_size=image_size if bool(args.smooth_video_resize) else None,
+                video_backend=str(args.smooth_video_backend),
                 modality_config=modality_config,
                 ego_rotate_deg=int(args.ego_image_rotate_deg),
                 ego_flip_horizontal=bool(args.ego_image_flip_horizontal),
@@ -982,6 +1238,7 @@ def main() -> int:
                 wrist_flip_horizontal=bool(args.wrist_image_flip_horizontal),
                 wrist_flip_vertical=bool(args.wrist_image_flip_vertical),
             )
+            video_metadata["resize"] = None if not bool(args.smooth_video_resize) else tuple(int(v) for v in image_size)
             preview_ego = np.asarray(video["ego_view"][0, -1], dtype=np.uint8) if "ego_view" in video else None
             preview_wrist = np.asarray(video["wrist_view"][0, -1], dtype=np.uint8) if "wrist_view" in video else None
             if preview_ego is not None and preview_wrist is not None:
@@ -1137,7 +1394,6 @@ def main() -> int:
                         previous_action=rtc_seed_action if rtc_options is not None else None,
                         options=rtc_options,
                     )
-                    clip_delta = executor.hand_policy_clip_delta(policy_action_chunk)
                     frozen_steps = 0 if rtc_options is None else int(rtc_options["rtc_frozen_steps"])
                     raw_stored_action, action_storage_metadata = rollout._stored_rtc_action_chunk(  # noqa: SLF001
                         policy_action=policy_action_chunk,
@@ -1145,7 +1401,14 @@ def main() -> int:
                         action_keys=action_keys,
                         frozen_steps=frozen_steps,
                     )
-                    clipped_action_chunk = executor.probe_clip_action_chunk(raw_stored_action)
+                    executor_input_action, bridge_metadata = deployment_bridge.bridge_action_chunk(
+                        raw_stored_action,
+                        observation=observation,
+                        reason=f"replan_{trace_replan_index}",
+                    )
+                    action_storage_metadata["deployment_bridge"] = bridge_metadata
+                    clip_delta = executor.hand_policy_clip_delta(executor_input_action)
+                    clipped_action_chunk = executor.probe_clip_action_chunk(executor_input_action)
                     action_chunk = executor.guard_action_chunk_for_execution(clipped_action_chunk)
                     overlay_action_chunk = executor.preview_action_chunk_for_overlay(action_chunk)
                     eef_trajectory_overlay.draw_chunk(overlay_action_chunk)
@@ -1157,7 +1420,15 @@ def main() -> int:
                         observation_hand_q=observation_hand_q,
                     )
                     hand_debug["input_source"] = source_metadata
-                    rtc_store_action_chunk = executor.rtc_seed_action_from_command_chunk(action_chunk, observation_arm_q=observation_arm_q)
+                    hand_debug["deployment_bridge"] = bridge_metadata.get("hand", {})
+                    if str(args.deployment_action_bridge) == "state_to_robot":
+                        rtc_store_action_chunk = {
+                            key: np.array(value, dtype=np.float32, copy=True)
+                            for key, value in raw_stored_action.items()
+                            if key in action_keys
+                        }
+                    else:
+                        rtc_store_action_chunk = executor.rtc_seed_action_from_command_chunk(action_chunk, observation_arm_q=observation_arm_q)
                     inference_dt_s = time.perf_counter() - tic
                     rollout._write_policy_replan_trace(  # noqa: SLF001
                         policy_trace_dir,
@@ -1197,9 +1468,11 @@ def main() -> int:
                             "frame_index": int(current_frame),
                             "input_source": source_metadata,
                             "rtc": {"options": rtc_options, "metadata": rtc_metadata, "seed_metadata": rtc_seed_metadata},
+                            "deployment_bridge": bridge_metadata,
                             "hand": hand_debug,
                             "eef_frame": executor.eef_frame_debug_snapshot(),
                             "action_summary": rollout._summarize_action_chunk(action_chunk),  # noqa: SLF001
+                            "model_state_action_summary": rollout._summarize_action_chunk(raw_stored_action),  # noqa: SLF001
                             "policy_raw_action_summary": rollout._summarize_action_chunk(policy_action_chunk),  # noqa: SLF001
                         },
                     )
@@ -1208,6 +1481,7 @@ def main() -> int:
                         f"episode={episode.episode_index:06d} frame={current_frame} "
                         f"video={active_video_source()} state={active_state_source()} "
                         f"rtc={'off' if rtc_options is None else 'on'} rtc_reason={rtc_metadata.get('reason')} "
+                        f"bridge={bridge_metadata.get('mode')} hand_bridge_delta={bridge_metadata.get('hand', {}).get('max_abs_delta', 0.0):.4f} "
                         f"clip_delta={clip_delta:.4f} {rollout._summarize_action_chunk(action_chunk)}",
                         flush=True,
                     )

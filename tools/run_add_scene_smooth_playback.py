@@ -15,7 +15,7 @@ import numpy as np
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_SMOOTH_DIR = ROOT_DIR.parent / "Isaac-GR00T" / "outputs" / "IsaacLab" / "nero" / "mission2" / "smooth"
-DEFAULT_BOTTLE_POS = (-0.395556, -0.093333, 0.794444)
+DEFAULT_BOTTLE_POS = (-0.415556, -0.073333, 0.794444)
 DEFAULT_BOTTLE_EULER = (0.0, 0.0, 37.448)
 DEFAULT_SCENE_SUPPORT_COLLIDER_POS = (-0.616071, -0.064286, 0.620536)
 DEFAULT_SCENE_SUPPORT_COLLIDER_SIZE = (0.700000, 0.700000, 0.040000)
@@ -246,6 +246,7 @@ def _load_episode_data(
 def _control_panel_main(
     labels: list[str],
     lengths: list[int],
+    initial_bottle_pos: tuple[float, float, float],
     selected_episode: object,
     current_frame: object,
     selected_frame: object,
@@ -254,6 +255,8 @@ def _control_panel_main(
     playing: object,
     speed: object,
     loop: object,
+    bottle_pos_values: object,
+    bottle_pose_counter: object,
     stop_flag: object,
 ) -> None:
     import tkinter as tk
@@ -261,14 +264,16 @@ def _control_panel_main(
 
     root = tk.Tk()
     root.title("Smooth Episode Playback")
-    root.geometry("780x360")
-    root.minsize(680, 320)
+    root.geometry("820x520")
+    root.minsize(720, 460)
 
     selected_var = tk.StringVar(value=labels[int(selected_episode.value)] if labels else "")
     status_var = tk.StringVar(value="Paused")
     frame_var = tk.IntVar(value=0)
     speed_var = tk.DoubleVar(value=float(speed.value))
     loop_var = tk.BooleanVar(value=bool(loop.value))
+    bottle_vars = [tk.DoubleVar(value=float(initial_bottle_pos[idx])) for idx in range(3)]
+    bottle_label_vars = [tk.StringVar(value=f"{float(initial_bottle_pos[idx]): .5f}") for idx in range(3)]
     internal_frame_update = {"active": False}
 
     def length_for_selection() -> int:
@@ -296,13 +301,17 @@ def _control_panel_main(
         frame_var.set(0)
 
     def toggle_play() -> None:
-        playing.value = not bool(playing.value)
+        should_play = not bool(playing.value)
+        if should_play:
+            bottle_pose_counter.value += 1
+        playing.value = should_play
         refresh()
 
     def reset() -> None:
         selected_frame.value = 0
         current_frame.value = 0
         seek_counter.value += 1
+        bottle_pose_counter.value += 1
         frame_var.set(0)
 
     def close() -> None:
@@ -329,6 +338,20 @@ def _control_panel_main(
 
     def on_loop() -> None:
         loop.value = bool(loop_var.get())
+
+    def set_bottle_pos(idx: int, value: float | str, *, update_var: bool = False) -> None:
+        try:
+            current = float(value)
+        except ValueError:
+            return
+        bottle_pos_values[idx] = current
+        bottle_label_vars[idx].set(f"{current: .5f}")
+        if update_var:
+            bottle_vars[idx].set(current)
+        bottle_pose_counter.value += 1
+
+    def nudge_bottle_pos(idx: int, delta: float) -> None:
+        set_bottle_pos(idx, float(bottle_pos_values[idx]) + float(delta), update_var=True)
 
     def refresh() -> None:
         internal_frame_update["active"] = True
@@ -379,6 +402,30 @@ def _control_panel_main(
     ttk.Checkbutton(buttons, text="Loop", variable=loop_var, command=on_loop).pack(side=tk.LEFT)
     ttk.Button(buttons, text="Close", command=close).pack(side=tk.RIGHT)
 
+    bottle_frame = ttk.LabelFrame(root, text="Bottle initial position")
+    bottle_frame.pack(fill=tk.X, padx=12, pady=(4, 8))
+    bottle_specs = (
+        ("x (m)", -1.0, 1.0, 0.001),
+        ("y (m)", -1.5, 1.5, 0.001),
+        ("z (m)", -1.0, 1.5, 0.001),
+    )
+    for idx, (label, lower, upper, step) in enumerate(bottle_specs):
+        row = ttk.Frame(bottle_frame)
+        row.pack(fill=tk.X, padx=8, pady=5)
+        ttk.Label(row, text=label, width=10).pack(side=tk.LEFT)
+        ttk.Button(row, text="-", width=3, command=lambda i=idx, s=step: nudge_bottle_pos(i, -s)).pack(side=tk.LEFT)
+        slider = ttk.Scale(
+            row,
+            from_=lower,
+            to=upper,
+            orient=tk.HORIZONTAL,
+            variable=bottle_vars[idx],
+            command=lambda value, i=idx: set_bottle_pos(i, value),
+        )
+        slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Button(row, text="+", width=3, command=lambda i=idx, s=step: nudge_bottle_pos(i, s)).pack(side=tk.LEFT)
+        ttk.Label(row, textvariable=bottle_label_vars[idx], width=12).pack(side=tk.RIGHT)
+
     ttk.Label(root, textvariable=status_var).pack(fill=tk.X, padx=12, pady=(4, 12))
 
     refresh()
@@ -386,7 +433,15 @@ def _control_panel_main(
     root.mainloop()
 
 
-def _create_control_panel(episodes: list[EpisodeInfo], *, episode_index: int, start: bool, speed_value: float, loop_value: bool) -> dict[str, object]:
+def _create_control_panel(
+    episodes: list[EpisodeInfo],
+    *,
+    episode_index: int,
+    start: bool,
+    speed_value: float,
+    loop_value: bool,
+    bottle_pos: tuple[float, float, float],
+) -> dict[str, object]:
     selected_episode = multiprocessing.RawValue("i", int(episode_index))
     current_frame = multiprocessing.RawValue("i", 0)
     selected_frame = multiprocessing.RawValue("i", 0)
@@ -395,6 +450,8 @@ def _create_control_panel(episodes: list[EpisodeInfo], *, episode_index: int, st
     playing = multiprocessing.RawValue("b", bool(start))
     speed = multiprocessing.RawValue("d", float(speed_value))
     loop = multiprocessing.RawValue("b", bool(loop_value))
+    bottle_pos_values = multiprocessing.RawArray("d", tuple(float(v) for v in bottle_pos))
+    bottle_pose_counter = multiprocessing.RawValue("i", 0)
     stop_flag = multiprocessing.RawValue("b", False)
     labels = [item.label for item in episodes]
     lengths = [int(item.length) for item in episodes]
@@ -403,6 +460,7 @@ def _create_control_panel(episodes: list[EpisodeInfo], *, episode_index: int, st
         args=(
             labels,
             lengths,
+            tuple(float(v) for v in bottle_pos),
             selected_episode,
             current_frame,
             selected_frame,
@@ -411,6 +469,8 @@ def _create_control_panel(episodes: list[EpisodeInfo], *, episode_index: int, st
             playing,
             speed,
             loop,
+            bottle_pos_values,
+            bottle_pose_counter,
             stop_flag,
         ),
         daemon=True,
@@ -425,6 +485,8 @@ def _create_control_panel(episodes: list[EpisodeInfo], *, episode_index: int, st
         "playing": playing,
         "speed": speed,
         "loop": loop,
+        "bottle_pos_values": bottle_pos_values,
+        "bottle_pose_counter": bottle_pose_counter,
         "stop_flag": stop_flag,
         "process": process,
     }
@@ -470,6 +532,13 @@ def _apply_hand_frame(assembly: dict[str, object], q: np.ndarray | None) -> None
     values = np.asarray([float(values_by_name.get(str(name), 0.0)) for name in joint_names], dtype=np.float32)
     linker_hand.set_dofs_position(values, dofs, zero_velocity=True)
     linker_hand.control_dofs_position(values, dofs)
+
+
+def _apply_bottle_initial_pose(scene: object, pos: tuple[float, float, float], euler: tuple[float, float, float]) -> None:
+    bottle_entity = getattr(scene, "bottle_entity", None)
+    if bottle_entity is None:
+        return
+    harness._apply_bottle_pose(bottle_entity, pos, euler)  # noqa: SLF001
 
 
 def _apply_episode_frame(scene: object, episode: EpisodeData, frame_index: int, arm: object, arm_dofs: list[int], assembly: dict[str, object]) -> None:
@@ -670,6 +739,7 @@ def main() -> int:
                 start=bool(args.start),
                 speed_value=float(args.speed),
                 loop_value=bool(args.loop),
+                bottle_pos=tuple(args.bottle_pos),
             )
 
         scene = _create_scene(args)
@@ -686,11 +756,15 @@ def main() -> int:
         current_frame = 0
         last_load_counter = 0
         last_seek_counter = 0
+        last_bottle_pose_counter = 0
+        current_bottle_pos = tuple(float(v) for v in args.bottle_pos)
+        current_bottle_euler = tuple(float(v) for v in args.bottle_euler)
         playing = bool(args.start)
         speed_value = float(args.speed)
         loop_value = bool(args.loop)
         next_frame_time = time.monotonic()
         base_dt = 1.0 / max(float(args.fps), 1.0e-6)
+        _apply_bottle_initial_pose(scene, current_bottle_pos, current_bottle_euler)
         _apply_episode_frame(scene, episode, current_frame, arm, arm_dofs, assembly)
         print(
             f"[smooth] loaded episode={episode.episode_index:06d} frames={episode.length} "
@@ -712,7 +786,11 @@ def main() -> int:
                 print(f"[done] episode={episode.episode_index:06d} frame={dump_frame}", flush=True)
                 return 0
         if panel is not None:
-            print("[smooth] controls: use the Tk window to select episode, seek, play/pause, speed, loop", flush=True)
+            print(
+                "[smooth] controls: use the Tk window to select episode, seek, tune bottle initial position, "
+                "play/pause, speed, loop",
+                flush=True,
+            )
 
         while bool(args.no_viewer) or scene.viewer.is_alive():
             if panel is not None:
@@ -732,6 +810,7 @@ def main() -> int:
                     last_load_counter = panel_load_counter
                     next_frame_time = time.monotonic()
                     _apply_episode_frame(scene, episode, current_frame, arm, arm_dofs, assembly)
+                    _apply_bottle_initial_pose(scene, current_bottle_pos, current_bottle_euler)
                     print(
                         f"[smooth] loaded episode={episode.episode_index:06d} frames={episode.length} "
                         f"path={episodes[selected_list_index].path}",
@@ -745,6 +824,14 @@ def main() -> int:
                     last_seek_counter = panel_seek_counter
                     next_frame_time = time.monotonic()
                     _apply_episode_frame(scene, episode, current_frame, arm, arm_dofs, assembly)
+
+                panel_bottle_pose_counter = int(panel["bottle_pose_counter"].value)
+                if panel_bottle_pose_counter != last_bottle_pose_counter:
+                    bottle_values = panel["bottle_pos_values"]
+                    current_bottle_pos = tuple(float(bottle_values[idx]) for idx in range(3))
+                    last_bottle_pose_counter = panel_bottle_pose_counter
+                    _apply_bottle_initial_pose(scene, current_bottle_pos, current_bottle_euler)
+                    scene.visualizer.update(force=True)
 
                 playing = bool(panel["playing"].value)
                 speed_value = float(panel["speed"].value)
